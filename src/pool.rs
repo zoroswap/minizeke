@@ -56,6 +56,9 @@ pub async fn deploy_pool(
             .id()
             .to_bech32(Endpoint::testnet().to_network_id())
     );
+
+    print_contract_procedures(&pool_contract);
+
     Ok((pool_contract, pool_component))
 }
 
@@ -107,6 +110,8 @@ pub fn build_pool_component(users: Vec<AccountId>, cb: CodeBuilder) -> Result<Ac
         }
     }
 
+    print_library_exports(&lib.clone().into_library());
+
     let component = AccountComponent::new(
         lib,
         vec![
@@ -157,4 +162,23 @@ fn map_from(entries: &[(Word, u64)]) -> StorageMap {
         .expect("insert into map");
     }
     map
+}
+
+pub fn print_contract_procedures(pool_contract: &Account) {
+    println!("+++++Pool contract procedures");
+    pool_contract.code().procedures().iter().for_each(|proc| {
+        println!("Proc root: {:?} ", proc.mast_root().to_hex());
+    });
+}
+
+pub fn print_library_exports(masm_lib: &miden_assembly::Library) {
+    println!("+++++Masm lib exports:");
+    masm_lib.exports().for_each(|export| {
+        let path = export.path();
+        if let Some(root) = masm_lib.get_procedure_root_by_path(&path) {
+            println!("Export: {:?} {:?} {:?}", path, root, root.to_hex());
+        } else {
+            println!("Export: {:?} (no procedure root)", path);
+        }
+    });
 }
