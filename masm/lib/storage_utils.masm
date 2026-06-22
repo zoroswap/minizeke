@@ -1,0 +1,149 @@
+use miden::protocol::active_account
+use miden::protocol::native_account
+use miden::core::sys
+
+use zoro_miden::lib::math
+
+
+const ATSI_SLOT_ID_PREFIX_LOCAL = 0
+const ATSI_SLOT_ID_SUFFIX_LOCAL = 1
+const ATSI_NEW_VALUE_LOCAL = 2
+@locals(3)
+pub proc add_to_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, increment_by: felt) -> felt
+    loc_store.ATSI_SLOT_ID_PREFIX_LOCAL loc_store.ATSI_SLOT_ID_SUFFIX_LOCAL
+    # => [increment_by]
+    loc_load.ATSI_SLOT_ID_SUFFIX_LOCAL loc_load.ATSI_SLOT_ID_PREFIX_LOCAL exec.active_account::get_item
+    movdn.3 drop drop drop
+    # => [current_value, increment_by]
+    exec.math::safe_add
+    # => [new_value]
+    loc_store.ATSI_NEW_VALUE_LOCAL
+    ### get current value
+    push.0.0.0 loc_load.ATSI_NEW_VALUE_LOCAL 
+    # => [NEW_VALUE]
+    loc_load.ATSI_SLOT_ID_SUFFIX_LOCAL loc_load.ATSI_SLOT_ID_PREFIX_LOCAL exec.native_account::set_item
+    dropw
+    # => []
+    loc_load.ATSI_NEW_VALUE_LOCAL
+    # => [new_value]
+    exec.sys::truncate_stack
+end
+
+const SFSI_SLOT_ID_PREFIX_LOCAL = 0
+const SFSI_SLOT_ID_SUFFIX_LOCAL = 1
+const SFSI_NEW_VALUE_LOCAL = 2
+@locals(3)
+pub proc sub_from_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, decrement_by: felt) -> felt
+    loc_store.SFSI_SLOT_ID_PREFIX_LOCAL loc_store.SFSI_SLOT_ID_SUFFIX_LOCAL
+    # => [sub_by]
+    loc_load.SFSI_SLOT_ID_SUFFIX_LOCAL loc_load.SFSI_SLOT_ID_PREFIX_LOCAL exec.active_account::get_item
+    movdn.3 drop drop drop
+    # => [current_value, sub_by]
+    swap
+    exec.math::safe_sub
+    # => [new_value]
+    loc_store.SFSI_NEW_VALUE_LOCAL
+    ### get current value
+    push.0.0.0 loc_load.SFSI_NEW_VALUE_LOCAL 
+    # => [NEW_VALUE]
+    loc_load.SFSI_SLOT_ID_SUFFIX_LOCAL loc_load.SFSI_SLOT_ID_PREFIX_LOCAL exec.native_account::set_item
+    dropw
+    # => []
+    loc_load.SFSI_NEW_VALUE_LOCAL
+    # => [new_value]
+    exec.sys::truncate_stack
+end
+
+
+
+
+#! Atomically increments a storage map entry: map[KEY] += VALUE.
+#! Reads the current value via get_map_item, adds VALUE, writes back via set_map_item.
+#!
+#! Inputs: [slot_id_prefix, slot_id_suffix, KEY, VALUE]
+#! Outputs: []
+const SFMI_SLOT_ID_PREFIX_LOCAL = 0
+const SFMI_SLOT_ID_SUFFIX_LOCAL = 1
+const SFMI_KEY_LOCAL = 4
+const SFMI_SUB_BY_LOCAL = 8
+@locals(9)
+pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word, sub_by: felt) -> felt
+    ### save inputs 
+    loc_store.SFMI_SLOT_ID_PREFIX_LOCAL loc_store.SFMI_SLOT_ID_SUFFIX_LOCAL loc_storew_be.SFMI_KEY_LOCAL movup.4 loc_store.SFMI_SUB_BY_LOCAL
+    # => [KEY]
+    loc_load.SFMI_SLOT_ID_SUFFIX_LOCAL loc_load.SFMI_SLOT_ID_PREFIX_LOCAL 
+    # => [slot_id_prefix, slot_id_suffix, KEY]
+    exec.active_account::get_map_item
+    movdn.3 drop drop drop
+    # => [old_value]
+    loc_load.SFMI_SUB_BY_LOCAL
+    # => [sub_by,old_value]
+    exec.math::safe_sub
+    # => [new_value]
+    loc_store.SFMI_SUB_BY_LOCAL
+
+    ### set
+    loc_load.SFMI_SUB_BY_LOCAL padw loc_loadw_be.SFMI_KEY_LOCAL loc_load.SFMI_SLOT_ID_SUFFIX_LOCAL loc_load.SFMI_SLOT_ID_PREFIX_LOCAL exec.set_map_item
+    exec.sys::truncate_stack
+    # => [old_value]
+end
+
+const ATMI_SLOT_ID_PREFIX_LOCAL = 0
+const ATMI_SLOT_ID_SUFFIX_LOCAL = 1
+const ATMI_KEY_LOCAL = 4
+const ATMI_NEW_VALUE_LOCAL = 8
+@locals(9)
+pub proc add_to_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, increment_by: felt) -> felt
+    ### save inputs 
+    loc_store.ATMI_SLOT_ID_PREFIX_LOCAL loc_store.ATMI_SLOT_ID_SUFFIX_LOCAL loc_storew_be.ATMI_KEY_LOCAL movup.4 loc_store.ATMI_NEW_VALUE_LOCAL
+    # => [KEY]
+    loc_load.ATMI_SLOT_ID_SUFFIX_LOCAL loc_load.ATMI_SLOT_ID_PREFIX_LOCAL 
+    # => [slot_id_prefix, slot_id_suffix, KEY]
+    exec.active_account::get_map_item
+    movdn.3 drop drop drop
+    # => [old_value]
+    loc_load.ATMI_NEW_VALUE_LOCAL
+    # => [old_value]
+    exec.math::safe_add
+    # => [new_value]
+    loc_store.ATMI_NEW_VALUE_LOCAL
+
+    ### set
+    loc_load.ATMI_NEW_VALUE_LOCAL padw loc_loadw_be.ATMI_KEY_LOCAL loc_load.ATMI_SLOT_ID_SUFFIX_LOCAL loc_load.ATMI_SLOT_ID_PREFIX_LOCAL exec.set_map_item
+    exec.sys::truncate_stack
+    # => [old_value]
+end
+
+
+const SMI_SLOT_ID_PREFIX_LOCAL = 0
+const SMI_SLOT_ID_SUFFIX_LOCAL = 1
+const SMI_KEY_LOCAL = 4
+const SMI_VALUE_LOCAL = 8
+@locals(9)
+pub proc set_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, value: felt) -> felt
+    loc_store.SMI_SLOT_ID_PREFIX_LOCAL loc_store.SMI_SLOT_ID_SUFFIX_LOCAL loc_storew_be.SMI_KEY_LOCAL dropw loc_store.SMI_VALUE_LOCAL
+    ### fill out value with 0 to full word
+    push.0.0.0 loc_load.SMI_VALUE_LOCAL
+    ### load slot id and key
+    padw loc_loadw_be.SMI_KEY_LOCAL loc_load.SMI_SLOT_ID_SUFFIX_LOCAL loc_load.SMI_SLOT_ID_PREFIX_LOCAL
+    exec.native_account::set_map_item 
+    ### remove trailing zeros
+    dropw
+    loc_load.SMI_VALUE_LOCAL
+end
+
+# ----------------------------------------------------------------------------------------------
+# GETTERS
+# ----------------------------------------------------------------------------------------------
+
+pub proc get_storage_item (slot_id_prefix: felt, slot_id_suffix: felt) -> felt
+    exec.active_account::get_item
+    movdn.3 drop drop drop
+    # => [value]
+end
+
+pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) -> felt
+    exec.active_account::get_map_item
+    movdn.3 drop drop drop
+    # => [value]
+end
