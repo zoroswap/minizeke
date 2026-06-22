@@ -16,14 +16,12 @@ pub struct PoolStateDelta {
 }
 
 pub fn make_exec_script(trades: Vec<Trade>, pool_state_deltas: Vec<PoolStateDelta>) -> String {
-    let mut script = format!(
-        r#"
+    let mut script = r#"
         use miden::protocol::active_account
         use miden::core::sys
         use zoro_miden::pool::execute_swap
         use zoro_miden::pool::update_pool_state
         "#
-    )
     .to_string();
 
     for trade in trades {

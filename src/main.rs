@@ -3,14 +3,22 @@ use std::sync::Arc;
 use anyhow::Result;
 use miden_client::{
     RemoteTransactionProver,
+    account::AccountId,
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
     rpc::{Endpoint, GrpcClient},
+    testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
+    },
     transaction::TransactionRequestBuilder,
 };
 use miden_client_sqlite_store::SqliteStore;
 
-use crate::{execution::make_exec_script, pool::deploy_pool, user::get_users};
+use crate::{
+    execution::{PoolStateDelta, Trade, make_exec_script},
+    pool::deploy_pool,
+    user::get_users,
+};
 
 mod execution;
 mod pool;
@@ -40,14 +48,40 @@ async fn main() -> Result<()> {
     let users = get_users(10, &mut client).await?;
 
     // spawn the pool account
-
-    let (pool, pool_component) = deploy_pool(&mut client, users)?;
+    let (pool, pool_component) = deploy_pool(&mut client, users.clone())?;
 
     let sim_runs = 10;
+    let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+    let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
 
-    for _ in 0..sim_runs {
-        let trades = Vec::new();
-        let pool_state_deltas = Vec::new();
+    for n in 0..sim_runs {
+        let mut trades = Vec::new();
+        let sell_asset = if n % 2 == 0 { asset0 } else { asset1 };
+        let buy_asset = if n % 2 == 0 { asset1 } else { asset0 };
+        let trade_amount = 100;
+        let pool_state_deltas = vec![
+            PoolStateDelta {
+                asset: sell_asset,
+                add_amount: 0,
+                sub_amount: users.len() as u64 * trade_amount,
+            },
+            PoolStateDelta {
+                asset: buy_asset,
+                add_amount: users.len() as u64 * trade_amount,
+                sub_amount: 0,
+            },
+        ];
+        for user in &users {
+            let trade = Trade {
+                user: *user,
+                sell_asset,
+                buy_asset,
+                sell_amount: trade_amount,
+                buy_amount: trade_amount,
+            };
+            trades.push(trade);
+        }
+
         let tx_script = make_exec_script(trades, pool_state_deltas);
 
         println!("SCRIPT \n\n{tx_script}\n\n");
