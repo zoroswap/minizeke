@@ -39,17 +39,23 @@ async fn main() -> Result<()> {
     let users = get_users(10, &mut client).await?;
 
     // spawn the pool account
+
     let (pool, pool_component) = deploy_pool(&mut client, users)?;
 
-    // run simulation
-    let tx_script = client
-        .code_builder()
-        .with_dynamically_linked_library(pool_component.component_code())?
-        .compile_tx_script(code)?;
+    let sim_runs = 10;
 
-    let tx_req = TransactionRequestBuilder::new()
-        .custom_script(tx_script)
-        .build()?;
+    for _ in 0..sim_runs {
+        // run simulation
+        let tx_script = client
+            .code_builder()
+            .with_dynamically_linked_library(pool_component.component_code())?
+            .compile_tx_script(code)?;
+
+        let tx_req = TransactionRequestBuilder::new()
+            .custom_script(tx_script)
+            .build()?;
+    }
+
     client.submit_new_transaction(pool.id(), tx_req).await?;
 
     Ok(())
