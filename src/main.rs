@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     let remote_prover = Arc::new(RemoteTransactionProver::new(
         "https://tx-prover.testnet.miden.io",
     ));
-    let sqlite_store = SqliteStore::new("path/to/store".try_into()?).await?;
+    let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
     let store = Arc::new(sqlite_store);
     let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
     let keystore = Arc::new(FilesystemKeyStore::new("store.sqlite3".into())?);

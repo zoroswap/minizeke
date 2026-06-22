@@ -5,13 +5,17 @@ use miden_client::{
     Client,
     account::{
         Account, AccountBuilder, AccountComponent, AccountId, AccountStorageMode, AccountType,
-        StorageSlot, StorageSlotName, component::BasicWallet,
+        StorageMap, StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
     },
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::FilesystemKeyStore,
     rpc::Endpoint,
+    testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
+    },
 };
+use miden_core::{Felt, Word, ZERO};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 
@@ -53,10 +57,43 @@ pub fn build_pool_component() -> Result<AccountComponent> {
     let code = read_masm_file(&["masm", "pool.masm"])?;
     let cb = link_storage_utils(link_math(CodeBuilder::new())?)?;
     let lib = cb.compile_component_code("zoroswap::vault", &code)?;
+
+    let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+    let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
+
+    // key for POOL_BALANCES_SLOT = [0,0, asset_suf, asset_pre]
+    // key for USER_ASSET_BALANCES_SLOT = [user_suffix, user_prefix, asset_suffix, asset_prefix]
+    // pub proc execute_swap(sellAmount, buyAmount SELLKEY, BUYKEY)
+    // SELLKEY = user_suffix, user_prefix, asset_suffix, asset_prefix
+
+    let amount_0 = 10_000_000;
+    let amount_1 = 10_000_000;
+
+    let pool_balances_key_0: Word = [
+        Felt::new(0),
+        Felt::new(0),
+        asset0.suffix(),
+        asset0.prefix().into(),
+    ]
+    .into();
+    let pool_balances_key_1: Word = [
+        Felt::new(0),
+        Felt::new(0),
+        asset1.suffix(),
+        asset1.prefix().into(),
+    ]
+    .into();
+    let pool_balances = [
+        (pool_balances_key_0, amount_0),
+        (pool_balances_key_1, amount_1),
+    ];
+
+    let user_balances = [];
+
     let component = AccountComponent::new(
         lib,
         vec![
-            StorageSlot::with_empty_map(n("pool::pool_assets")),
+            StorageSlot::with_map(n("pool::pool_assets"), map_from(&pool_balances)),
             StorageSlot::with_empty_map(n("pool::user_asset_balances")),
             StorageSlot::with_empty_map(n("pool::pool_state")),
         ],
@@ -91,4 +128,26 @@ pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
     let math_code = read_masm_file(&["lib", "math.masm"])?;
     code_builder.link_module("zoro_miden::lib::math", &math_code)?;
     Ok(code_builder)
+}
+
+fn single_entry_map(key: Word, value: u64) -> StorageMap {
+    let mut map = StorageMap::new();
+    map.insert(
+        StorageMapKey::new(key),
+        [Felt::new(value), ZERO, ZERO, ZERO].into(),
+    )
+    .expect("insert into map");
+    map
+}
+
+fn map_from(entries: &[(Word, u64)]) -> StorageMap {
+    let mut map = StorageMap::new();
+    for (k, v) in entries {
+        map.insert(
+            StorageMapKey::new(*k),
+            [Felt::new(*v), ZERO, ZERO, ZERO].into(),
+        )
+        .expect("insert into map");
+    }
+    map
 }
