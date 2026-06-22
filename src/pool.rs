@@ -57,8 +57,6 @@ pub async fn deploy_pool(
             .to_bech32(Endpoint::testnet().to_network_id())
     );
 
-    print_contract_procedures(&pool_contract);
-
     Ok((pool_contract, pool_component))
 }
 
@@ -139,8 +137,8 @@ fn n(name: &str) -> StorageSlotName {
     StorageSlotName::new(name).expect("valid slot name")
 }
 
-pub fn link_pool(code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let mut code_builder = link_storage_utils(code_builder)?;
+pub fn link_pool(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    //let mut code_builder = link_storage_utils(code_builder)?;
     let pool_code = read_masm_file(&["accounts", "pool.masm"])?;
     code_builder.link_module("zoro_miden::pool", &pool_code)?;
     Ok(code_builder)
