@@ -22,7 +22,7 @@ use rand::RngCore;
 pub fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
     users: Vec<AccountId>,
-) -> Result<Account> {
+) -> Result<(Account, AccountComponent)> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
@@ -50,7 +50,7 @@ pub fn deploy_pool(
             .id()
             .to_bech32(Endpoint::testnet().to_network_id())
     );
-    Ok(pool_contract)
+    Ok((pool_contract, pool_component))
 }
 
 pub fn build_pool_component(users: Vec<AccountId>) -> Result<AccountComponent> {
@@ -108,7 +108,7 @@ pub fn build_pool_component(users: Vec<AccountId>) -> Result<AccountComponent> {
             StorageSlot::with_map(n("pool::user_asset_balances"), map_from(&user_balances)),
             StorageSlot::with_map(n("pool::pool_state"), map_from(&pool_balances)),
         ],
-        AccountComponentMetadata::new("minizeke::pool", AccountType::all()),
+        AccountComponentMetadata::new("zoro_miden::pool", AccountType::all()),
     )?;
 
     Ok(component)
