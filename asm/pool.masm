@@ -129,20 +129,20 @@ const SWAP_BUY_KEY_LOCAL = 8
 pub proc execute_swap
     loc_store.SWAP_SELL_AMOUNT_LOCAL loc_store.SWAP_BUY_AMOUNT_LOCAL
     # => [SELL_KEY, BUY_KEY]
-    loc_storew_be.SWAP_SELL_KEY_LOCAL
-    # => [BUY_KEY]
-    loc_storew_be.SWAP_BUY_KEY_LOCAL
-    # => []
+    loc_storew_be.SWAP_SELL_KEY_LOCAL swapw
+    # => [BUY_KEY, SELL_KEY]
+    loc_storew_be.SWAP_BUY_KEY_LOCAL swapw
+    # => [SELL_KEY, BUY_KEY]
     ### Ensure the seller has enough local sell balance.
-    padw loc_loadw_be.SWAP_SELL_KEY_LOCAL exec.get_user_asset_balance 
-    # => [sell_balance]
+    exec.get_user_asset_balance
+    # => [sell_balance, BUY_KEY]
     loc_load.SWAP_SELL_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
-    # => []
+    # => [BUY_KEY]
     # Ensure the buyer-side local balance can cover the buy amount.
     # move balances
     padw loc_loadw_be.SWAP_SELL_KEY_LOCAL loc_load.SWAP_SELL_AMOUNT_LOCAL exec.sub_from_user_balance
-    # => []
-    padw loc_loadw_be.SWAP_BUY_KEY_LOCAL loc_load.SWAP_BUY_AMOUNT_LOCAL exec.add_to_user_balance
+    # => [BUY_KEY]
+    loc_load.SWAP_BUY_AMOUNT_LOCAL exec.add_to_user_balance
     # => []
 end
 
