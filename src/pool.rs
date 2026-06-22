@@ -53,8 +53,8 @@ pub fn deploy_pool(
     Ok(pool_contract)
 }
 
-pub fn build_pool_component() -> Result<AccountComponent> {
-    let code = read_masm_file(&["masm", "pool.masm"])?;
+pub fn build_pool_component(users: Vec<AccountId>) -> Result<AccountComponent> {
+    let code = read_masm_file(&["masm", "account", "pool.masm"])?;
     let cb = link_storage_utils(link_math(CodeBuilder::new())?)?;
     let lib = cb.compile_component_code("zoroswap::vault", &code)?;
 
@@ -88,7 +88,10 @@ pub fn build_pool_component() -> Result<AccountComponent> {
         (pool_balances_key_1, amount_1),
     ];
 
-    let user_balances = [];
+    let user_balances = Vec::with_capacity(users.len());
+    for user in users {
+        user_balances.push(());
+    }
 
     let component = AccountComponent::new(
         lib,
@@ -119,13 +122,13 @@ fn n(name: &str) -> StorageSlotName {
 
 pub fn link_storage_utils(code_builder: CodeBuilder) -> Result<CodeBuilder> {
     let mut code_builder = link_math(code_builder)?;
-    let storage_utils_code = read_masm_file(&["lib", "storage_utils.masm"])?;
+    let storage_utils_code = read_masm_file(&["masm", "lib", "storage_utils.masm"])?;
     code_builder.link_module("zoro_miden::lib::storage_utils", &storage_utils_code)?;
     Ok(code_builder)
 }
 
 pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let math_code = read_masm_file(&["lib", "math.masm"])?;
+    let math_code = read_masm_file(&["masm", "lib", "math.masm"])?;
     code_builder.link_module("zoro_miden::lib::math", &math_code)?;
     Ok(code_builder)
 }
