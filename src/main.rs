@@ -1,4 +1,8 @@
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{
+    sync::Arc,
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use miden_client::{
@@ -75,6 +79,7 @@ async fn main() -> Result<()> {
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
 
     for n in 0..sim_runs {
+        let instant = Instant::now();
         println!("SIM RUN {n}");
 
         let mut trades = Vec::new();
@@ -106,7 +111,7 @@ async fn main() -> Result<()> {
 
         let tx_script = make_exec_script(trades, pool_state_deltas);
 
-        println!("SCRIPT \n\n{tx_script}\n\n");
+        // println!("SCRIPT \n\n{tx_script}\n\n");
         // run simulation
 
         let cb = link_pool(client.code_builder())?;
@@ -118,7 +123,28 @@ async fn main() -> Result<()> {
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
             .build()?;
-        client.submit_new_transaction(pool.id(), tx_req).await?;
+
+        // let tx = client.submit_new_transaction(pool.id(), tx_req).await?;
+
+        let tx_result = client.execute_transaction(pool.id(), tx_req).await?;
+        let measurements = tx_result.executed_transaction().measurements();
+        println!(
+            "Cycle count: {}, auth: {}",
+            measurements.total_cycles(),
+            measurements.auth_procedure
+        );
+        let prove_started = Instant::now();
+        let proven_transaction = client
+            .prove_transaction_with(&tx_result, client.prover())
+            .await?;
+        let prove_elapsed = prove_started.elapsed();
+        let submission_height = client
+            .submit_proven_transaction(proven_transaction, &tx_result)
+            .await?;
+        client
+            .apply_transaction(&tx_result, submission_height)
+            .await?;
+        println!("Elapsed: {prove_elapsed:?}");
         client.sync_state().await?;
     }
 

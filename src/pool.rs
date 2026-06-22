@@ -26,7 +26,7 @@ pub async fn deploy_pool(
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
-    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
     let pool_component = build_pool_component(users, client.code_builder())?;
 
     let pool_contract = AccountBuilder::new(init_seed)
@@ -35,7 +35,7 @@ pub async fn deploy_pool(
         .with_component(pool_component.clone())
         .with_auth_component(AuthSingleSig::new(
             key_pair.public_key().to_commitment(),
-            AuthScheme::Falcon512Poseidon2,
+            AuthScheme::EcdsaK256Keccak,
         ))
         .with_component(BasicWallet)
         .build()?;
