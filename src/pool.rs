@@ -22,12 +22,15 @@ use rand::RngCore;
 pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
     users: Vec<AccountId>,
+    pool_0_balance: u64,
+    pool_1_balance: u64,
 ) -> Result<(Account, AccountComponent)> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
     let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
-    let pool_component = build_pool_component(users, client.code_builder())?;
+    let pool_component =
+        build_pool_component(pool_0_balance, pool_1_balance, users, client.code_builder())?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
@@ -60,7 +63,12 @@ pub async fn deploy_pool(
     Ok((pool_contract, pool_component))
 }
 
-pub fn build_pool_component(users: Vec<AccountId>, cb: CodeBuilder) -> Result<AccountComponent> {
+pub fn build_pool_component(
+    pool_0_balance: u64,
+    pool_1_balance: u64,
+    users: Vec<AccountId>,
+    cb: CodeBuilder,
+) -> Result<AccountComponent> {
     let code = read_masm_file(&["accounts", "pool.masm"])?;
     let cb = link_storage_utils(cb)?;
     let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
@@ -68,29 +76,23 @@ pub fn build_pool_component(users: Vec<AccountId>, cb: CodeBuilder) -> Result<Ac
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
     let faucets = [asset0, asset1];
-
-    let amount_0 = 10_000_000;
-    let amount_1 = 10_000_000;
     let user_amount = 1_000;
 
-    let pool_balances_key_0: Word = [
+    let pool_balance_0: Word = [
+        Felt::new(pool_0_balance),
         Felt::new(0),
         Felt::new(0),
-        asset0.suffix(),
-        asset0.prefix().into(),
+        Felt::new(0),
     ]
     .into();
-    let pool_balances_key_1: Word = [
+
+    let pool_balance_1: Word = [
+        Felt::new(pool_1_balance),
         Felt::new(0),
         Felt::new(0),
-        asset1.suffix(),
-        asset1.prefix().into(),
+        Felt::new(0),
     ]
     .into();
-    let pool_balances = [
-        (pool_balances_key_0, amount_0),
-        (pool_balances_key_1, amount_1),
-    ];
 
     let mut user_balances: Vec<(Word, u64)> = Vec::with_capacity(users.len());
     for user in users {
@@ -113,9 +115,9 @@ pub fn build_pool_component(users: Vec<AccountId>, cb: CodeBuilder) -> Result<Ac
     let component = AccountComponent::new(
         lib,
         vec![
-            StorageSlot::with_map(n("pool::pool_assets"), map_from(&pool_balances)),
             StorageSlot::with_map(n("pool::user_asset_balances"), map_from(&user_balances)),
-            StorageSlot::with_map(n("pool::pool_state"), map_from(&pool_balances)),
+            StorageSlot::with_value(n("pool::pool_0_state"), pool_balance_0.into()),
+            StorageSlot::with_value(n("pool::pool_1_state"), pool_balance_1.into()),
         ],
         AccountComponentMetadata::new("zoro_miden::pool", AccountType::all()),
     )?;

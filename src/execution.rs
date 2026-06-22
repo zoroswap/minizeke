@@ -10,15 +10,15 @@ pub struct Trade {
 }
 
 pub struct PoolStateDelta {
-    pub asset: AccountId,
-    pub add_amount: u64,
-    pub sub_amount: u64,
+    pub pool_index: u64,
+    pub set_amount: u64,
 }
 
 pub fn make_exec_script(trades: Vec<Trade>, pool_state_deltas: Vec<PoolStateDelta>) -> String {
     let mut script = r#"
 use zoro_miden::pool::execute_swap
-use zoro_miden::pool::update_pool_state
+use zoro_miden::pool::set_pool_0_balance
+use zoro_miden::pool::set_pool_1_balance
 use miden::core::sys
 
 begin
@@ -49,14 +49,12 @@ begin
 
     for pool_state_delta in pool_state_deltas {
         let PoolStateDelta {
-            asset,
-            add_amount,
-            sub_amount,
+            pool_index,
+            set_amount,
         } = pool_state_delta;
-        let suffix: u64 = asset.suffix().as_canonical_u64();
-        let prefix: u64 = asset.prefix().into();
+
         let pool_state_delta_str =
-            format!("push.{prefix}.{suffix}.{add_amount}.{sub_amount} call.update_pool_state\n");
+            format!("push.{set_amount} call.set_pool_{pool_index}_balance\n");
         script.push_str(&pool_state_delta_str);
     }
 
