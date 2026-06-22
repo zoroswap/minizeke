@@ -115,33 +115,14 @@ end
 # ----------------------------------------------------------------------------------------------
 
 
-const SWAP_SELL_AMOUNT_LOCAL = 0
-const SWAP_BUY_AMOUNT_LOCAL = 1
-const SWAP_SELL_KEY_LOCAL = 4
-const SWAP_BUY_KEY_LOCAL = 8
-@locals(12)
 pub proc execute_swap
-    
-    loc_store.SWAP_SELL_AMOUNT_LOCAL loc_store.SWAP_BUY_AMOUNT_LOCAL
-    
+    # => [sell_amount, buy_amount, SELL_KEY, BUY_KEY]
+    swap movdn.5
+    # => [sell_amount, SELL_KEY, buy_amount, BUY_KEY, ]
     # => [SELL_KEY, BUY_KEY]
-    loc_storew_be.SWAP_SELL_KEY_LOCAL swapw
-    
-    # => [BUY_KEY, SELL_KEY]
-    loc_storew_be.SWAP_BUY_KEY_LOCAL swapw
-    
-    # => [SELL_KEY, BUY_KEY]
-    ### Ensure the seller has enough local sell balance.
-    exec.get_user_asset_balance
-     
-    # => [sell_balance, BUY_KEY]
-    loc_load.SWAP_SELL_AMOUNT_LOCAL  gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+    exec.sub_from_user_balance
     # => [BUY_KEY]
-    # Ensure the buyer-side local balance can cover the buy amount.
-    # move balances
-    padw loc_loadw_be.SWAP_SELL_KEY_LOCAL loc_load.SWAP_SELL_AMOUNT_LOCAL exec.sub_from_user_balance
-    # => [BUY_KEY]
-    loc_load.SWAP_BUY_AMOUNT_LOCAL exec.add_to_user_balance
+    exec.add_to_user_balance
     # => []
 end
 
@@ -164,7 +145,7 @@ pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: wor
     exec.active_account::get_map_item
     movup.10
     # => [sub_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-    exec.safe_sub
+    sub
     # => [new_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
     movdn.9 movdn.9 movdn.9 movdn.9
     ## set
@@ -180,7 +161,7 @@ pub proc add_to_map_item #(increment_by: felt, slot_id_prefix: felt, slot_id_suf
     #movdn.4 drop drop drop
     movup.4
     # => [increment_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-    exec.safe_add
+    add
     ## set
     # => [new_value, 0,0,0,lot_id_prefix, slot_id_suffix, KEY]
     #movdn.7 push.0 movdn.8 push.0 movdn.8 push.0 movdn.8
@@ -204,7 +185,7 @@ end
 pub proc add_to_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, increment_by: felt) -> felt
     dup.1 dup.1 exec.active_account::get_item
     # => [current_value, 0,0,0, prefix, suffix, increment_by]
-    movup.6 exec.safe_add
+    movup.6 add
     # => [new_value, 0,0,0, prefix, suffix]
     movdn.5 movdn.5 movdn.5 movdn.5
     # => [ prefix, suffix, new_value, 0,0,0]
@@ -216,7 +197,7 @@ end
 pub proc sub_from_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, decrement_by: felt) -> felt
     dup.1 dup.1 exec.active_account::get_item
     # => [current_value, 0,0,0, prefix, suffix, decrement_by]
-    movup.6 exec.safe_sub
+    movup.6 sub
     # => [new_value, 0,0,0, prefix, suffix]
     movdn.5 movdn.5 movdn.5 movdn.5
     # => [ prefix, suffix, new_value, 0,0,0]
@@ -238,24 +219,6 @@ pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) ->
 end
 
 
-pub proc safe_sub(b: felt, a: felt) -> felt
-    # => [b, a] 
-    swap dup 
-    # => [a, a, b]
-    movup.2
-    sub 
-    # => [res, a]
-    dup movup.2
-    # => [a, res, res]
-    lte assert.err=ERR_UNDERFLOW
-end
 
 
-pub proc safe_add(b: felt, a: felt) -> felt
-    # => [b, a] 
-    dup movup.2 add
-    # => [res, b]
-    dup movup.2
-    # => [b, res, res]
-    gte assert.err=ERR_OVERFLOW
-end
+

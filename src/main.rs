@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
 
     println!("Pool touched.");
 
-    let sim_runs = 1;
+    let sim_runs = 5;
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
 
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         let mut trades = Vec::new();
         let (sell_asset, sell_pool_index) = if n % 2 == 0 { (asset0, 0) } else { (asset1, 1) };
         let (buy_asset, buy_pool_index) = if n % 2 == 0 { (asset1, 1) } else { (asset0, 0) };
-        let trade_amount = 100;
+        let trade_amount = 10;
 
         let mut sell_pool_balance = 0;
         let mut buy_pool_balance = 0;

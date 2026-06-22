@@ -47,16 +47,16 @@ begin
         script.push_str(&trade_string);
     }
 
-    for pool_state_delta in pool_state_deltas {
-        let PoolStateDelta {
-            pool_index,
-            set_amount,
-        } = pool_state_delta;
+    // for pool_state_delta in pool_state_deltas {
+    //     let PoolStateDelta {
+    //         pool_index,
+    //         set_amount,
+    //     } = pool_state_delta;
 
-        let pool_state_delta_str =
-            format!("push.{set_amount} call.set_pool_{pool_index}_balance\n");
-        script.push_str(&pool_state_delta_str);
-    }
+    //     let pool_state_delta_str =
+    //         format!("push.{set_amount} call.set_pool_{pool_index}_balance\n");
+    //     script.push_str(&pool_state_delta_str);
+    // }
 
     script.push_str("\nexec.sys::truncate_stack\nend");
     script
