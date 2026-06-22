@@ -11,6 +11,7 @@ use miden_client_sqlite_store::SqliteStore;
 
 use crate::{pool::deploy_pool, user::get_users};
 
+mod execution;
 mod pool;
 mod user;
 
