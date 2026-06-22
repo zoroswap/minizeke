@@ -9,7 +9,7 @@ use miden_client::{
     },
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
-    keystore::FilesystemKeyStore,
+    keystore::{FilesystemKeyStore, Keystore},
     rpc::Endpoint,
     testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
@@ -19,7 +19,7 @@ use miden_core::{Felt, Word, ZERO};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 
-pub fn deploy_pool(
+pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
     users: Vec<AccountId>,
 ) -> Result<(Account, AccountComponent)> {
@@ -40,6 +40,12 @@ pub fn deploy_pool(
         .with_component(BasicWallet)
         .build()?;
 
+    let keystore = FilesystemKeyStore::new("keystore".into())?;
+    keystore
+        .add_key(&key_pair, pool_contract.id())
+        .await
+        .map_err(|e| anyhow!("Failed to add key: {e:?}"))?;
+
     println!(
         "pool contract commitment hash: {:?}",
         pool_contract.to_commitment().to_hex()
@@ -56,7 +62,7 @@ pub fn deploy_pool(
 pub fn build_pool_component(users: Vec<AccountId>, cb: CodeBuilder) -> Result<AccountComponent> {
     let code = read_masm_file(&["accounts", "pool.masm"])?;
     let cb = link_storage_utils(cb)?;
-    let lib = cb.compile_component_code("zoroswap::vault", &code)?;
+    let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
 
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;

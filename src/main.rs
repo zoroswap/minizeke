@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, thread::sleep, time::Duration};
 
 use anyhow::Result;
 use miden_client::{
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
     let store = Arc::new(sqlite_store);
     let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
-    let keystore = Arc::new(FilesystemKeyStore::new("store.sqlite3".into())?);
+    let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
     // Build client with remote prover as default
     let mut client = ClientBuilder::new()
@@ -44,11 +44,31 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
+    client.ensure_genesis_in_place().await?;
+    client.sync_state().await?;
+
+    println!("Client ready.");
+
     // spawn the user accounts
     let users = get_users(10, &mut client).await?;
 
     // spawn the pool account
-    let (pool, pool_component) = deploy_pool(&mut client, users.clone())?;
+    let (pool, pool_component) = deploy_pool(&mut client, users.clone()).await?;
+
+    println!(
+        "Pool deployed. BECH32: {}, HEX: {}",
+        pool.id().to_bech32(Endpoint::testnet().to_network_id()),
+        pool.id().to_hex()
+    );
+
+    let tx = TransactionRequestBuilder::new().build()?;
+    client.add_account(&pool, true).await?;
+    client.submit_new_transaction(pool.id(), tx).await?;
+    client.sync_state().await?;
+
+    sleep(Duration::from_secs(4));
+
+    println!("Pool touched.");
 
     let sim_runs = 10;
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
