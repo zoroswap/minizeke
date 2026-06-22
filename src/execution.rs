@@ -19,6 +19,7 @@ pub fn make_exec_script(trades: Vec<Trade>, pool_state_deltas: Vec<PoolStateDelt
     let mut script = r#"
 use zoro_miden::pool::execute_swap
 use zoro_miden::pool::update_pool_state
+use miden::core::sys
 
 begin
 "#
@@ -40,7 +41,7 @@ begin
         let sell_asset_suffix: u64 = sell_asset.suffix().as_canonical_u64();
         let sell_asset_prefix: u64 = sell_asset.prefix().into();
         let trade_string = format!(
-            "push.{buy_asset_prefix}.{buy_asset_suffix}.{user_prefix}.{user_suffix}.{sell_asset_prefix}.{sell_asset_suffix}.{user_prefix}.{user_suffix}.{buy_amount}.{sell_amount} exec.execute_swap\n",
+            "push.{buy_asset_prefix}.{buy_asset_suffix}.{user_prefix}.{user_suffix}.{sell_asset_prefix}.{sell_asset_suffix}.{user_prefix}.{user_suffix}.{buy_amount}.{sell_amount} call.execute_swap\n",
         );
 
         script.push_str(&trade_string);
@@ -55,10 +56,10 @@ begin
         let suffix: u64 = asset.suffix().as_canonical_u64();
         let prefix: u64 = asset.prefix().into();
         let pool_state_delta_str =
-            format!("push.{prefix}.{suffix}.{add_amount}.{sub_amount} exec.update_pool_state\n");
+            format!("push.{prefix}.{suffix}.{add_amount}.{sub_amount} call.update_pool_state\n");
         script.push_str(&pool_state_delta_str);
     }
 
-    script.push_str("\nend");
+    script.push_str("\nexec.sys::truncate_stack\nend");
     script
 }

@@ -16,7 +16,7 @@ use miden_client_sqlite_store::SqliteStore;
 
 use crate::{
     execution::{PoolStateDelta, Trade, make_exec_script},
-    pool::deploy_pool,
+    pool::{deploy_pool, link_pool, link_storage_utils, read_masm_file},
     user::get_users,
 };
 
@@ -27,9 +27,9 @@ mod user;
 #[tokio::main]
 async fn main() -> Result<()> {
     // miden client
-    let remote_prover = Arc::new(RemoteTransactionProver::new(
-        "https://tx-prover.testnet.miden.io",
-    ));
+    // let remote_prover = Arc::new(RemoteTransactionProver::new(
+    //     "https://tx-prover.testnet.miden.io",
+    // ));
     let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
     let store = Arc::new(sqlite_store);
     let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     // Build client with remote prover as default
     let mut client = ClientBuilder::new()
-        .prover(remote_prover.clone())
+        // .prover(remote_prover.clone())
         .store(store)
         .rpc(rpc_client)
         .authenticator(keystore)
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     client.submit_new_transaction(pool.id(), tx).await?;
     client.sync_state().await?;
 
-    sleep(Duration::from_secs(4));
+    // sleep(Duration::from_secs(4));
 
     println!("Pool touched.");
 
@@ -108,9 +108,11 @@ async fn main() -> Result<()> {
 
         println!("SCRIPT \n\n{tx_script}\n\n");
         // run simulation
-        let tx_script = client
-            .code_builder()
-            .with_dynamically_linked_library(pool_component.component_code())?
+
+        let cb = link_pool(client.code_builder())?;
+        let tx_script = cb
+            // .with_linked_module("zoro_miden::pool", code)?
+            // .with_dynamically_linked_library(pool_component.component_code())?
             .compile_tx_script(tx_script)?;
 
         let tx_req = TransactionRequestBuilder::new()
