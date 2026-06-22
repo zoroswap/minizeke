@@ -27,7 +27,7 @@ pub fn deploy_pool(
     client.rng().fill_bytes(&mut init_seed);
 
     let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
-    let pool_component = build_pool_component()?;
+    let pool_component = build_pool_component(users)?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
@@ -60,14 +60,11 @@ pub fn build_pool_component(users: Vec<AccountId>) -> Result<AccountComponent> {
 
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
-
-    // key for POOL_BALANCES_SLOT = [0,0, asset_suf, asset_pre]
-    // key for USER_ASSET_BALANCES_SLOT = [user_suffix, user_prefix, asset_suffix, asset_prefix]
-    // pub proc execute_swap(sellAmount, buyAmount SELLKEY, BUYKEY)
-    // SELLKEY = user_suffix, user_prefix, asset_suffix, asset_prefix
+    let faucets = [asset0, asset1];
 
     let amount_0 = 10_000_000;
     let amount_1 = 10_000_000;
+    let user_amount = 1_000;
 
     let pool_balances_key_0: Word = [
         Felt::new(0),
@@ -88,17 +85,28 @@ pub fn build_pool_component(users: Vec<AccountId>) -> Result<AccountComponent> {
         (pool_balances_key_1, amount_1),
     ];
 
-    let user_balances = Vec::with_capacity(users.len());
+    let mut user_balances: Vec<(Word, u64)> = Vec::with_capacity(users.len());
     for user in users {
-        user_balances.push(());
+        for faucet in faucets {
+            user_balances.push((
+                [
+                    user.suffix(),
+                    user.prefix().into(),
+                    faucet.suffix(),
+                    faucet.prefix().into(),
+                ]
+                .into(),
+                user_amount,
+            ));
+        }
     }
 
     let component = AccountComponent::new(
         lib,
         vec![
             StorageSlot::with_map(n("pool::pool_assets"), map_from(&pool_balances)),
-            StorageSlot::with_empty_map(n("pool::user_asset_balances")),
-            StorageSlot::with_empty_map(n("pool::pool_state")),
+            StorageSlot::with_map(n("pool::user_asset_balances"), map_from(&user_balances)),
+            StorageSlot::with_map(n("pool::pool_state"), map_from(&pool_balances)),
         ],
         AccountComponentMetadata::new("minizeke::pool", AccountType::all()),
     )?;
@@ -131,16 +139,6 @@ pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
     let math_code = read_masm_file(&["masm", "lib", "math.masm"])?;
     code_builder.link_module("zoro_miden::lib::math", &math_code)?;
     Ok(code_builder)
-}
-
-fn single_entry_map(key: Word, value: u64) -> StorageMap {
-    let mut map = StorageMap::new();
-    map.insert(
-        StorageMapKey::new(key),
-        [Felt::new(value), ZERO, ZERO, ZERO].into(),
-    )
-    .expect("insert into map");
-    map
 }
 
 fn map_from(entries: &[(Word, u64)]) -> StorageMap {
