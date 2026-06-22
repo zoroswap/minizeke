@@ -4,6 +4,7 @@ use miden_client::{
     account::{AccountBuilder, AccountId, AccountStorageMode, AccountType, component::BasicWallet},
     keystore::FilesystemKeyStore,
 };
+use miden_protocol::testing::noop_auth_component::NoopAuthComponent;
 use rand::RngCore;
 
 pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Result<Vec<AccountId>> {
@@ -16,6 +17,7 @@ pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Resul
         let builder = AccountBuilder::new(init_seed)
             .account_type(AccountType::RegularAccountUpdatableCode)
             .storage_mode(AccountStorageMode::Public)
+            .with_auth_component(NoopAuthComponent)
             .with_component(BasicWallet);
         let account = builder.build()?;
         users.push(account.id());

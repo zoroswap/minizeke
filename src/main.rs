@@ -55,6 +55,8 @@ async fn main() -> Result<()> {
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
 
     for n in 0..sim_runs {
+        println!("SIM RUN {n}");
+
         let mut trades = Vec::new();
         let sell_asset = if n % 2 == 0 { asset0 } else { asset1 };
         let buy_asset = if n % 2 == 0 { asset1 } else { asset0 };

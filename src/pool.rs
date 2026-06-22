@@ -27,7 +27,7 @@ pub fn deploy_pool(
     client.rng().fill_bytes(&mut init_seed);
 
     let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
-    let pool_component = build_pool_component(users)?;
+    let pool_component = build_pool_component(users, client.code_builder())?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
@@ -53,9 +53,9 @@ pub fn deploy_pool(
     Ok((pool_contract, pool_component))
 }
 
-pub fn build_pool_component(users: Vec<AccountId>) -> Result<AccountComponent> {
-    let code = read_masm_file(&["masm", "account", "pool.masm"])?;
-    let cb = link_storage_utils(link_math(CodeBuilder::new())?)?;
+pub fn build_pool_component(users: Vec<AccountId>, cb: CodeBuilder) -> Result<AccountComponent> {
+    let code = read_masm_file(&["accounts", "pool.masm"])?;
+    let cb = link_storage_utils(cb)?;
     let lib = cb.compile_component_code("zoroswap::vault", &code)?;
 
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
@@ -130,13 +130,13 @@ fn n(name: &str) -> StorageSlotName {
 
 pub fn link_storage_utils(code_builder: CodeBuilder) -> Result<CodeBuilder> {
     let mut code_builder = link_math(code_builder)?;
-    let storage_utils_code = read_masm_file(&["masm", "lib", "storage_utils.masm"])?;
+    let storage_utils_code = read_masm_file(&["lib", "storage_utils.masm"])?;
     code_builder.link_module("zoro_miden::lib::storage_utils", &storage_utils_code)?;
     Ok(code_builder)
 }
 
 pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let math_code = read_masm_file(&["masm", "lib", "math.masm"])?;
+    let math_code = read_masm_file(&["lib", "math.masm"])?;
     code_builder.link_module("zoro_miden::lib::math", &math_code)?;
     Ok(code_builder)
 }
