@@ -1,6 +1,5 @@
 use miden::protocol::active_account
 use miden::protocol::native_account
-use miden::core::sys
 # ZORO POOL (barebones standalone POC)
 #
 # Holds NO custody. Tracks virtual per-user balances, total asset balances and
@@ -11,7 +10,6 @@ use miden::core::sys
 #   asset-only KEY = [asset_suffix, asset_prefix, 0, 0]
 
 # STORAGE SLOTS
-const POOL_ASSETS_SLOT = word("pool::pool_assets")
 const USER_ASSET_BALANCES_SLOT = word("pool::user_asset_balances")
 const POOL_BALANCES_SLOT = word("pool::pool_state")
 # ERRORS
@@ -71,7 +69,7 @@ pub proc add_to_pool_balance
     # => [poolBalance, asset_suffix, asset_prefix]
     push.0.0
     # => [0, 0, amount, asset_suffix, asset_prefix]
-    push.POOL_ASSETS_SLOT[0..2] movup.4
+    push.POOL_BALANCES_SLOT[0..2] movup.4
     # => [amount, slot_suffix, slot_prefix, KEY]
     exec.add_to_map_item
 end
@@ -80,7 +78,7 @@ pub proc sub_from_pool_balance
     # => [poolBalance, asset_suffix, asset_prefix]
     movdn.4 push.0.0
     # => [ KEY, amount]
-    push.POOL_ASSETS_SLOT[0..2]
+    push.POOL_BALANCES_SLOT[0..2]
     exec.sub_from_map_item
 end
 
