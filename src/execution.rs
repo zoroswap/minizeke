@@ -1,24 +1,22 @@
-use miden_client::account::AccountId;
+use miden_client::account::{AccountId, StorageSlotId};
 use miden_core::{Word, field::PrimeField64};
 
 pub struct Trade {
-    pub user: AccountId,
-    pub sell_asset: AccountId,
-    pub buy_asset: AccountId,
+    pub user: StorageSlotId,
+    pub sell_asset_index: u64,
+    pub buy_asset_index: u64,
     pub sell_amount: u64,
     pub buy_amount: u64,
 }
 
 pub struct PoolStateDelta {
-    pub asset: AccountId,
-    pub add_amount: u64,
-    pub sub_amount: u64,
+    pub pool_index: u64,
+    pub set_amount: u64,
 }
 
 pub fn make_exec_script(trades: Vec<Trade>, pool_state_deltas: Vec<PoolStateDelta>) -> String {
     let mut script = r#"
 use zoro_miden::pool::execute_swap
-use zoro_miden::pool::update_pool_state
 use miden::core::sys
 
 begin
@@ -28,37 +26,33 @@ begin
     for trade in trades {
         let Trade {
             user,
-            sell_asset,
-            buy_asset,
+            sell_asset_index,
+            buy_asset_index,
             sell_amount,
             buy_amount,
         } = trade;
 
         let user_suffix: u64 = user.suffix().as_canonical_u64();
-        let user_prefix: u64 = user.prefix().into();
-        let buy_asset_suffix: u64 = buy_asset.suffix().as_canonical_u64();
-        let buy_asset_prefix: u64 = buy_asset.prefix().into();
-        let sell_asset_suffix: u64 = sell_asset.suffix().as_canonical_u64();
-        let sell_asset_prefix: u64 = sell_asset.prefix().into();
+        let user_prefix: u64 = user.prefix().as_canonical_u64();
+
         let trade_string = format!(
-            "push.{buy_asset_prefix}.{buy_asset_suffix}.{user_prefix}.{user_suffix}.{sell_asset_prefix}.{sell_asset_suffix}.{user_prefix}.{user_suffix}.{buy_amount}.{sell_amount} call.execute_swap\n",
+            // "push.{buy_amount}.{buy_asset_index}.{user_suffix}.{user_prefix}.{sell_amount}.{sell_asset_index}.{user_suffix}.{user_prefix} call.execute_swap\n",
+            "push.{buy_amount}.{buy_asset_index}.{user_prefix}.{user_suffix}.{sell_amount}.{sell_asset_index}.{user_prefix}.{user_suffix} call.execute_swap\n",
         );
 
         script.push_str(&trade_string);
     }
 
-    for pool_state_delta in pool_state_deltas {
-        let PoolStateDelta {
-            asset,
-            add_amount,
-            sub_amount,
-        } = pool_state_delta;
-        let suffix: u64 = asset.suffix().as_canonical_u64();
-        let prefix: u64 = asset.prefix().into();
-        let pool_state_delta_str =
-            format!("push.{prefix}.{suffix}.{add_amount}.{sub_amount} call.update_pool_state\n");
-        script.push_str(&pool_state_delta_str);
-    }
+    // for pool_state_delta in pool_state_deltas {
+    //     let PoolStateDelta {
+    //         pool_index,
+    //         set_amount,
+    //     } = pool_state_delta;
+
+    //     let pool_state_delta_str =
+    //         format!("push.{set_amount} call.set_pool_{pool_index}_balance\n");
+    //     script.push_str(&pool_state_delta_str);
+    // }
 
     script.push_str("\nexec.sys::truncate_stack\nend");
     script

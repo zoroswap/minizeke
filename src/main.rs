@@ -1,4 +1,8 @@
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{
+    sync::Arc,
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use miden_client::{
@@ -16,7 +20,10 @@ use miden_client_sqlite_store::SqliteStore;
 
 use crate::{
     execution::{PoolStateDelta, Trade, make_exec_script},
-    pool::{deploy_pool, link_pool, link_storage_utils, read_masm_file},
+    pool::{
+        deploy_pool, get_user_balance_storage_slot_names, link_pool, link_storage_utils,
+        read_masm_file,
+    },
     user::get_users,
 };
 
@@ -26,18 +33,19 @@ mod user;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // miden client
-    // let remote_prover = Arc::new(RemoteTransactionProver::new(
-    //     "https://tx-prover.testnet.miden.io",
-    // ));
+    //miden client
+    let remote_prover = Arc::new(RemoteTransactionProver::new(
+        "https://tx-prover.devnet.miden.io",
+    ));
     let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
     let store = Arc::new(sqlite_store);
-    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
+    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::devnet(), 30_000));
     let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
     // Build client with remote prover as default
     let mut client = ClientBuilder::new()
-        // .prover(remote_prover.clone())
+        // .in_debug_mode(true.into())
+        .prover(remote_prover.clone())
         .store(store)
         .rpc(rpc_client)
         .authenticator(keystore)
@@ -52,12 +60,20 @@ async fn main() -> Result<()> {
     // spawn the user accounts
     let users = get_users(10, &mut client).await?;
 
+    let pool_0_balance = 10_000_000;
+    let pool_1_balance = 10_000_000;
     // spawn the pool account
-    let (pool, pool_component) = deploy_pool(&mut client, users.clone()).await?;
+    let (pool, pool_component) = deploy_pool(
+        &mut client,
+        users.clone(),
+        pool_0_balance.clone(),
+        pool_1_balance.clone(),
+    )
+    .await?;
 
     println!(
         "Pool deployed. BECH32: {}, HEX: {}",
-        pool.id().to_bech32(Endpoint::testnet().to_network_id()),
+        pool.id().to_bech32(Endpoint::devnet().to_network_id()),
         pool.id().to_hex()
     );
 
@@ -66,38 +82,65 @@ async fn main() -> Result<()> {
     client.submit_new_transaction(pool.id(), tx).await?;
     client.sync_state().await?;
 
+    let storage = client.get_account_storage(pool.id()).await?;
+    for slot in storage.slots() {
+        let id = slot.id();
+        println!("name: {}", slot.name().as_str());
+        println!("prefix: {}", id.prefix());
+        println!("suffix: {}", id.suffix());
+        println!("type: {:?}", slot.slot_type());
+        println!("value/root: {:?}", slot.value());
+    }
     // sleep(Duration::from_secs(4));
 
     println!("Pool touched.");
 
-    let sim_runs = 10;
+    let sim_runs = 5;
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
+    let slot_names = get_user_balance_storage_slot_names();
 
+    let mut current_pool_0_balance = pool_0_balance;
+    let mut current_pool_1_balance = pool_1_balance;
     for n in 0..sim_runs {
+        let instant = Instant::now();
         println!("SIM RUN {n}");
 
         let mut trades = Vec::new();
-        let sell_asset = if n % 2 == 0 { asset0 } else { asset1 };
-        let buy_asset = if n % 2 == 0 { asset1 } else { asset0 };
-        let trade_amount = 100;
+        let (sell_asset, sell_pool_index) = if n % 2 == 0 { (asset0, 0) } else { (asset1, 1) };
+        let (buy_asset, buy_pool_index) = if n % 2 == 0 { (asset1, 1) } else { (asset0, 0) };
+        let trade_amount = 10;
+
+        let mut sell_pool_balance = 0;
+        let mut buy_pool_balance = 0;
+        if sell_pool_index == 0 {
+            current_pool_0_balance -= users.len() as u64 * trade_amount;
+            sell_pool_balance = current_pool_0_balance;
+
+            current_pool_1_balance += users.len() as u64 * trade_amount;
+            buy_pool_balance = current_pool_1_balance;
+        } else {
+            current_pool_1_balance -= users.len() as u64 * trade_amount;
+            sell_pool_balance = current_pool_1_balance;
+
+            current_pool_0_balance += users.len() as u64 * trade_amount;
+            buy_pool_balance = current_pool_0_balance;
+        }
         let pool_state_deltas = vec![
             PoolStateDelta {
-                asset: sell_asset,
-                add_amount: 0,
-                sub_amount: users.len() as u64 * trade_amount,
+                pool_index: sell_pool_index,
+                set_amount: sell_pool_balance,
             },
             PoolStateDelta {
-                asset: buy_asset,
-                add_amount: users.len() as u64 * trade_amount,
-                sub_amount: 0,
+                pool_index: buy_pool_index,
+                set_amount: buy_pool_balance,
             },
         ];
-        for user in &users {
+        for (idx, user) in users.iter().enumerate() {
             let trade = Trade {
-                user: *user,
-                sell_asset,
-                buy_asset,
+                user: slot_names[idx].id().clone(),
+                sell_asset_index: sell_pool_index,
+                buy_asset_index: buy_pool_index,
                 sell_amount: trade_amount,
                 buy_amount: trade_amount,
             };
@@ -106,7 +149,7 @@ async fn main() -> Result<()> {
 
         let tx_script = make_exec_script(trades, pool_state_deltas);
 
-        println!("SCRIPT \n\n{tx_script}\n\n");
+        // println!("SCRIPT \n\n{tx_script}\n\n");
         // run simulation
 
         let cb = link_pool(client.code_builder())?;
@@ -118,7 +161,28 @@ async fn main() -> Result<()> {
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
             .build()?;
-        client.submit_new_transaction(pool.id(), tx_req).await?;
+
+        // let tx = client.submit_new_transaction(pool.id(), tx_req).await?;
+
+        let tx_result = client.execute_transaction(pool.id(), tx_req).await?;
+        let measurements = tx_result.executed_transaction().measurements();
+        println!(
+            "Cycle count: {}, auth: {}",
+            measurements.total_cycles(),
+            measurements.auth_procedure
+        );
+        let prove_started = Instant::now();
+        let proven_transaction = client
+            .prove_transaction_with(&tx_result, client.prover())
+            .await?;
+        let prove_elapsed = prove_started.elapsed();
+        let submission_height = client
+            .submit_proven_transaction(proven_transaction, &tx_result)
+            .await?;
+        client
+            .apply_transaction(&tx_result, submission_height)
+            .await?;
+        println!("Elapsed: {prove_elapsed:?}");
         client.sync_state().await?;
     }
 

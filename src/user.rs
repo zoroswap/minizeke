@@ -1,7 +1,7 @@
 use anyhow::Result;
 use miden_client::{
     Client,
-    account::{AccountBuilder, AccountId, AccountStorageMode, AccountType, component::BasicWallet},
+    account::{AccountBuilder, AccountId, AccountType, component::BasicWallet},
     keystore::FilesystemKeyStore,
 };
 use miden_protocol::testing::noop_auth_component::NoopAuthComponent;
@@ -11,12 +11,10 @@ pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Resul
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
     let mut users = Vec::with_capacity(n as usize);
-
+    println!("Making up {n} users");
     for _ in 0..n {
-        println!("Deploying user {n}");
         let builder = AccountBuilder::new(init_seed)
-            .account_type(AccountType::RegularAccountUpdatableCode)
-            .storage_mode(AccountStorageMode::Public)
+            .account_type(AccountType::Public)
             .with_auth_component(NoopAuthComponent)
             .with_component(BasicWallet);
         let account = builder.build()?;

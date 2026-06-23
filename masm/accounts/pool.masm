@@ -1,5 +1,5 @@
-use zoro_miden::lib::storage_utils
-
+use miden::protocol::active_account
+use miden::protocol::native_account
 # ZORO POOL (barebones standalone POC)
 #
 # Holds NO custody. Tracks virtual per-user balances, total asset balances and
@@ -10,49 +10,51 @@ use zoro_miden::lib::storage_utils
 #   asset-only KEY = [asset_suffix, asset_prefix, 0, 0]
 
 # STORAGE SLOTS
-const POOL_ASSETS_SLOT = word("pool::pool_assets")
-const USER_ASSET_BALANCES_SLOT = word("pool::user_asset_balances")
-const POOL_BALANCES_SLOT = word("pool::pool_state")
+
+
+const USER_0_BALANCE_SLOT = word("pool::user_0_balance")
+const USER_1_BALANCE_SLOT = word("pool::user_1_balance")
+
+# USER BALANCE SLOTS
+#const USER_0_BALANCE_SLOT = word("pool::user_0_balance")
+#const USER_1_BALANCE_SLOT = word("pool::user_1_balance")
+# const USER_9_BALANCE_SLOT = word("pool::user_1=9_balance")
+
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "POOL: insufficient available balance for swap"
 const ERR_INVALID_POOL_STATE_TRYING_TO_SUB_AND_ADD = "POOL: invalid pool state trying to sub AND add"
+
+
+const ERR_UNDERFLOW = "Underflow"
+const ERR_OVERFLOW = "Overflow"
 
 
 # ----------------------------------------------------------------------------------------------
 # USER ASSET BALANCE
 # ----------------------------------------------------------------------------------------------
 
+    
 #! USER_ASSET_BALANCES(assetId, userId) += amount
-#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Inputs:  [ slot_prefix, slot_suffix, idx, amount]
 #! Outputs: []
 pub proc add_to_user_balance
-    movdn.4
-    # => [KEY, amount]
-    push.USER_ASSET_BALANCES_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, KEY, amount]
-    exec.storage_utils::add_to_map_item drop
+    exec.add_to_storage_item_at_idx
     # => []
 end
 
 #! USER_ASSET_BALANCES(assetId, userId) -= amount
-#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Inputs:  [slot_prefix, slot_suffix, idx, amount]
 #! Outputs: []
 pub proc sub_from_user_balance
-    movdn.4
-    # => [KEY, amount]
-    push.USER_ASSET_BALANCES_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, KEY, amount]
-    exec.storage_utils::sub_from_map_item drop
+    exec.sub_from_storage_item_at_idx
     # => []
 end
 
 #! Raw local map value.
-#! Inputs:  [KEY]
-#! Outputs: [amount]
+#! Inputs:  [index]
+#! Outputs: [slot_prefix, slot_suffix, idx]
 pub proc get_user_asset_balance
-    push.USER_ASSET_BALANCES_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, KEY]
-    exec.storage_utils::get_map_item
+    exec.get_storage_item_at_idx
     # => [amount]
 end
 
@@ -61,85 +63,63 @@ end
 # POOL BALANCE  (POOL_BALANCES value word = [poolBalance, 0, 0, 0])
 # ----------------------------------------------------------------------------------------------
 
-#! Inputs:  [poolBalance, asset_suffix, asset_prefix]
+#! Inputs:  [amount]
 #! Outputs: []
 
-pub proc set_pool_balance
-    # => [poolBalance, asset_suffix, asset_prefix]
-    movdn.4
-    # => [KEY, amount]
-    push.POOL_ASSETS_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, KEY, amount]
-    exec.storage_utils::set_map_item drop
-    
-end
 
-pub proc add_to_pool_balance
-    # => [poolBalance, asset_suffix, asset_prefix]
-    movdn.4 push.0.0
-    # => [KEY, amount]
-    push.POOL_ASSETS_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, KEY, amount]
-    exec.storage_utils::add_to_map_item drop
-end
-
-pub proc sub_from_pool_balance
-    # => [poolBalance, asset_suffix, asset_prefix]
-    movdn.4 push.0.0
-    # => [ KEY, amount]
-    push.POOL_ASSETS_SLOT[0..2]
-    exec.storage_utils::sub_from_map_item drop
-end
-
-#! Inputs:  [asset_suffix, asset_prefix]
-#! Outputs: [poolBalance]
-const GPB_ASSET_SUFFIX_LOCAL = 0
-const GPB_ASSET_PREFIX_LOCAL = 1
-@locals(2)
-pub proc get_pool_balance
-    loc_store.GPB_ASSET_SUFFIX_LOCAL loc_store.GPB_ASSET_PREFIX_LOCAL
-    # => []
-    push.0.0 loc_load.GPB_ASSET_PREFIX_LOCAL loc_load.GPB_ASSET_SUFFIX_LOCAL
-    # => [asset_suffix, asset_prefix, 0, 0]
-    push.POOL_BALANCES_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, asset_suffix, asset_prefix, 0, 0]
-    exec.storage_utils::get_map_item
-    # => [poolBalance]
-end
-
-
+#pub proc add_to_pool_0_balance
+#    push.POOL_0_BALANCE_SLOT[0..2] exec.add_to_storage_item
+#end
+#
+#pub proc sub_from_pool_0_balance
+#    push.POOL_0_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+#end
+#
+#pub proc set_pool_0_balance(amount: felt)
+#    push.0.0.0 movup.3
+#    push.POOL_0_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
+#end
+#
+#pub proc set_pool_1_balance(amount: felt)
+#    push.0.0.0 movup.3
+#    push.POOL_1_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
+#end
+#
+#pub proc add_to_pool_1_balance
+#    push.POOL_1_BALANCE_SLOT[0..2] exec.add_to_storage_item
+#end
+#
+#pub proc sub_from_pool_1_balance
+#    push.POOL_1_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+#end
+#
+#
+#
+#pub proc get_pool_0_balance
+#    push.POOL_0_BALANCE_SLOT[0..2]
+#    exec.active_account::get_item
+#    movdn.3 drop drop drop
+#    # => [poolBalance]
+#end
+#
+#
+#pub proc get_pool_1_balance
+#    push.POOL_1_BALANCE_SLOT[0..2]
+#    exec.active_account::get_item
+#    movdn.3 drop drop drop
+#    # => [poolBalance]
+#end
 
 # ----------------------------------------------------------------------------------------------
 # SWAP
 # ----------------------------------------------------------------------------------------------
 
-#! Executes a swap against local virtual balances only.
-#!
-#! Inputs:  [sellAmount, buyAmount
-#!           SELLKEY, BUYKEY]
-#! Outputs: []
-const SWAP_SELL_AMOUNT_LOCAL = 0
-const SWAP_BUY_AMOUNT_LOCAL = 1
-const SWAP_SELL_KEY_LOCAL = 4
-const SWAP_BUY_KEY_LOCAL = 8
-@locals(12)
+
 pub proc execute_swap
-    loc_store.SWAP_SELL_AMOUNT_LOCAL loc_store.SWAP_BUY_AMOUNT_LOCAL
-    # => [SELL_KEY, BUY_KEY]
-    loc_storew_be.SWAP_SELL_KEY_LOCAL swapw
-    # => [BUY_KEY, SELL_KEY]
-    loc_storew_be.SWAP_BUY_KEY_LOCAL swapw
-    # => [SELL_KEY, BUY_KEY]
-    ### Ensure the seller has enough local sell balance.
-    exec.get_user_asset_balance
-    # => [sell_balance, BUY_KEY]
-    loc_load.SWAP_SELL_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+    # => [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount]
+    exec.sub_from_user_balance
     # => [BUY_KEY]
-    # Ensure the buyer-side local balance can cover the buy amount.
-    # move balances
-    padw loc_loadw_be.SWAP_SELL_KEY_LOCAL loc_load.SWAP_SELL_AMOUNT_LOCAL exec.sub_from_user_balance
-    # => [BUY_KEY]
-    loc_load.SWAP_BUY_AMOUNT_LOCAL exec.add_to_user_balance
+    exec.add_to_user_balance
     # => []
 end
 
@@ -147,38 +127,143 @@ end
 # POOL BALANCE ACCOUNTING
 # ----------------------------------------------------------------------------------------------
 
-#! update_pool_balance: rebases TOTAL_ASSET_BALANCES by the pool balance delta and stores the
-#! new balance.
+
+
+
+#! Atomically increments a storage map entry: map[KEY] += VALUE.
+#! Reads the current value via get_map_item, adds VALUE, writes back via set_map_item.
 #!
-#! Inputs:  [sub_amount, add_amount, asset_suffix, asset_prefix]
+#! Inputs: [slot_id_prefix, slot_id_suffix, KEY, VALUE]
 #! Outputs: []
-#const UPB_SUB_AMOUNT_LOCAL = 0
-#const UPB_ADD_AMOUNT_LOCAL = 1
-#const UPB_ASSET_SUFFIX_LOCAL = 2
-#const UPB_ASSET_PREFIX_LOCAL = 3
-#const UPB_OLD_BALANCE_LOCAL = 4
-#@locals(4)
-pub proc update_pool_state
-    #loc_storew_be.0
-    # => [sub_amount, add_amount, asset_suffix, asset_prefix]
-    ###  if sub_amount is greater than 0 and add_amount is 0 then do sub_from_pool_balance
-    dup gt.0 
-    # => [sub > 0, sub_amount, add_amount, asset_suffix, asset_prefix]
-    if.true # sub > 0
-        # => [sub_amount, add_amount, asset_suffix, asset_prefix]
-        swap gt.0
-        ## both sub and add are greater than 0 then assert error
-        if.true
-            assert.err=ERR_INVALID_POOL_STATE_TRYING_TO_SUB_AND_ADD
-        else  ## sub >0  AND add ==0
-            # => [sub_amount, asset_suffix, asset_prefix]
-            exec.sub_from_pool_balance
-            # => []
-        end
-    else  ## sub == 0, just execute add 
-        # => [sub_amount, add_amount, asset_suffix, asset_prefix]
-        drop
-        # => [add_amount, asset_suffix, asset_prefix]
-        exec.add_to_pool_balance
-    end
+pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word, sub_by: felt)
+    # duplicate the map accessor inputs
+    dup.5 dup.5 dup.5 dup.5 dup.5 dup.5
+    # => [slot_id_prefix, slot_id_suffix, KEY, slot_id_prefix, slot_id_suffix, KEY,sub_by, ]
+    exec.active_account::get_map_item
+    movup.10
+    # => [sub_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
+    sub
+    # => [new_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
+    movdn.9 movdn.9 movdn.9 movdn.9
+    ## set
+    exec.native_account::set_map_item dropw
 end
+
+
+pub proc add_to_map_item #(increment_by: felt, slot_id_prefix: felt, slot_id_suffix: felt, key: Word)
+    # duplicate the map accessor inputs
+    dup.6 dup.6 dup.6 dup.6 dup.6 dup.6
+    exec.active_account::get_map_item
+    # => [old_value, 0, 0, 0, increment_by, slot_id_prefix, slot_id_suffix, KEY]
+    #movdn.4 drop drop drop
+    movup.4
+    # => [increment_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
+    add
+    ## set
+    # => [new_value, 0,0,0,lot_id_prefix, slot_id_suffix, KEY]
+    #movdn.7 push.0 movdn.8 push.0 movdn.8 push.0 movdn.8
+    movdn.9 movdn.9 movdn.9 movdn.9
+    # => [new_value, 0, 0, 0, lot_id_prefix, slot_id_suffix, KEY, new_value, 0, 0, 0]
+    
+    exec.native_account::set_map_item  dropw
+end
+
+
+# @todo: inline
+pub proc set_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, value: felt) -> felt
+    ### fill out value with 0 to full word
+    push.0 movdn.7 push.0 movdn.7 push.0 movdn.7
+    ### load slot id and key
+    exec.native_account::set_map_item 
+    dropw
+end
+
+
+pub proc add_to_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, increment_by: felt) -> felt
+    dup.1 dup.1 exec.active_account::get_item
+    # => [current_value, 0,0,0, prefix, suffix, increment_by]
+    movup.6 add
+    # => [new_value, 0,0,0, prefix, suffix]
+    movdn.5 movdn.5 movdn.5 movdn.5
+    # => [ prefix, suffix, new_value, 0,0,0]
+    exec.native_account::set_item dropw
+    ### get current value
+end
+
+
+pub proc sub_from_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, decrement_by: felt) -> felt
+    dup.1 dup.1 exec.active_account::get_item
+    # => [current_value, 0,0,0, prefix, suffix, decrement_by]
+    movup.6 sub
+    # => [new_value, 0,0,0, prefix, suffix]
+    movdn.5 movdn.5 movdn.5 movdn.5
+    # => [ prefix, suffix, new_value, 0,0,0]
+    exec.native_account::set_item dropw
+end
+
+const BALANCES_TEMP_VALUE = 0
+#const BAL_1 = 0;
+#const BAL_2 = 1;
+#const BAL_3 = 2;
+#const BAL_4 = 3;
+
+pub proc sub_from_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt, decrement_by: felt) -> felt
+    dup.1 dup.1 exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE dropw
+    # => [ prefix, suffix, idx, decrement_by]
+    movup.2 dup
+    # => [idx, idx, prefix, suffix, decrement_by]
+    mem_load
+    # => [value_at_idx, idx, prefix, suffix, decrement_by]
+    movup.4 sub
+    # => [new_val_at_idx, idx, prefix, suffix, ]
+    swap mem_store
+    # => [ prefix, suffix]
+    padw mem_loadw_le.BALANCES_TEMP_VALUE
+    # => [UPDATED_VALUE, prefix, suffix, ]
+    movup.5 movup.5
+     # => [prefix, suffix, UPDATED_VALUE]
+    exec.native_account::set_item dropw
+end
+
+pub proc add_to_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt, increment_by: felt) -> felt
+    dup.1 dup.1 exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE dropw
+    # => [ prefix, suffix, idx, increment_by]
+    movup.2 dup
+    # => [idx, idx, prefix, suffix, increment_by]
+    mem_load
+    # => [value_at_idx, idx, prefix, suffix, increment_by]
+    movup.4 add
+    # => [new_val_at_idx, idx, prefix, suffix, ]
+    swap mem_store
+    # => [ prefix, suffix]
+    padw mem_loadw_le.BALANCES_TEMP_VALUE
+    # => [UPDATED_VALUE, prefix, suffix, ]
+    movup.5 movup.5
+     # => [prefix, suffix, UPDATED_VALUE]
+    exec.native_account::set_item dropw
+end
+
+pub proc get_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt,) -> felt
+    exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE
+    # => [idx]
+    mem_load
+end
+
+
+# ----------------------------------------------------------------------------------------------
+# GETTERS
+# ----------------------------------------------------------------------------------------------
+
+
+
+pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) -> felt
+    exec.active_account::get_map_item
+    
+    movdn.3 drop drop drop
+    # => [value]
+end
+
+
+
+
+
