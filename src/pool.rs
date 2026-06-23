@@ -18,6 +18,12 @@ use miden_client::{
 use miden_core::{Felt, Word, ZERO};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
+use serde::Serialize;
+
+#[derive(Debug, Copy, Clone, Serialize)]
+pub struct PoolState {
+    pub balance: u64,
+}
 
 pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,

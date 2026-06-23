@@ -1,3 +1,4 @@
 /target
 /keystore
 store.sqlite3
+.env
