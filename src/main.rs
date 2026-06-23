@@ -35,11 +35,13 @@ mod user;
 async fn main() -> Result<()> {
     //miden client
     let remote_prover = Arc::new(RemoteTransactionProver::new(
-        "https://tx-prover.devnet.miden.io",
+        // "https://tx-prover.devnet.miden.io",
+        "https://tx-prover.testnet.miden.io",
     ));
     let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
     let store = Arc::new(sqlite_store);
-    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::devnet(), 30_000));
+    // let rpc_client = Arc::new(GrpcClient::new(&Endpoint::devnet(), 30_000));
+    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
     let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
     // Build client with remote prover as default
@@ -83,14 +85,7 @@ async fn main() -> Result<()> {
     client.sync_state().await?;
 
     let storage = client.get_account_storage(pool.id()).await?;
-    for slot in storage.slots() {
-        let id = slot.id();
-        println!("name: {}", slot.name().as_str());
-        println!("prefix: {}", id.prefix());
-        println!("suffix: {}", id.suffix());
-        println!("type: {:?}", slot.slot_type());
-        println!("value/root: {:?}", slot.value());
-    }
+
     // sleep(Duration::from_secs(4));
 
     println!("Pool touched.");
