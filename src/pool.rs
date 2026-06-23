@@ -63,18 +63,11 @@ pub async fn deploy_pool(
 }
 
 pub fn get_user_balance_storage_slot_names() -> Vec<StorageSlotName> {
-    vec![
-        n("pool::user_0_balance"),
-        n("pool::user_1_balance"),
-        n("pool::user_2_balance"),
-        n("pool::user_3_balance"),
-        n("pool::user_4_balance"),
-        n("pool::user_5_balance"),
-        n("pool::user_6_balance"),
-        n("pool::user_7_balance"),
-        n("pool::user_8_balance"),
-        n("pool::user_9_balance"),
-    ]
+    let mut slot_names: Vec<StorageSlotName> = Vec::with_capacity(100);
+    for i in 0..100 {
+        slot_names.push(n(format!("pool::user_{i}_balance").as_str()));
+    }
+    slot_names
 }
 
 pub fn build_pool_component(
@@ -116,38 +109,14 @@ pub fn build_pool_component(
     ]
     .into();
 
-    let mut user_balances: Vec<(Word, u64)> = Vec::with_capacity(users.len());
-    for user in users {
-        for faucet in faucets {
-            user_balances.push((
-                [
-                    user.suffix(),
-                    user.prefix().into(),
-                    faucet.suffix(),
-                    faucet.prefix().into(),
-                ]
-                .into(),
-                user_amount,
-            ));
-        }
-    }
-
     let slot_names = get_user_balance_storage_slot_names();
 
     let component = AccountComponent::new(
         lib,
-        vec![
-            StorageSlot::with_value(slot_names[0].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[1].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[2].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[3].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[4].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[5].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[6].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[7].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[8].clone(), user_balance.into()),
-            StorageSlot::with_value(slot_names[9].clone(), user_balance.into()),
-        ],
+        slot_names[..users.len()]
+            .iter()
+            .map(|name| StorageSlot::with_value(name.clone(), user_balance.into()))
+            .collect(),
         AccountComponentMetadata::new("zoro_miden::pool"),
     )?;
 
@@ -166,7 +135,7 @@ pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
 
 fn n(name: &str) -> StorageSlotName {
     let name = StorageSlotName::new(name).expect("valid slot name");
-    println!("Slot name: {:?}, id: {:?}", name, name.id());
+    // println!("Slot name: {:?}, id: {:?}", name, name.id());
     name
 }
 
