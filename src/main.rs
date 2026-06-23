@@ -1,8 +1,4 @@
-use std::{
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use anyhow::Result;
 use miden_client::{
@@ -20,7 +16,7 @@ use miden_client_sqlite_store::SqliteStore;
 
 use crate::{
     execution::{PoolStateDelta, Trade, make_exec_script},
-    pool::{deploy_pool, link_pool, link_storage_utils, read_masm_file},
+    pool::{deploy_pool, link_pool},
     user::get_users,
 };
 
@@ -32,11 +28,11 @@ mod user;
 async fn main() -> Result<()> {
     //miden client
     let remote_prover = Arc::new(RemoteTransactionProver::new(
-        "https://tx-prover.testnet.miden.io",
+        "https://tx-prover.devnet.miden.io",
     ));
     let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
     let store = Arc::new(sqlite_store);
-    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
+    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::devnet(), 30_000));
     let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
     // Build client with remote prover as default
@@ -60,17 +56,12 @@ async fn main() -> Result<()> {
     let pool_0_balance = 10_000_000;
     let pool_1_balance = 10_000_000;
     // spawn the pool account
-    let (pool, pool_component) = deploy_pool(
-        &mut client,
-        users.clone(),
-        pool_0_balance.clone(),
-        pool_1_balance.clone(),
-    )
-    .await?;
+    let (pool, pool_component) =
+        deploy_pool(&mut client, users.clone(), pool_0_balance, pool_1_balance).await?;
 
     println!(
         "Pool deployed. BECH32: {}, HEX: {}",
-        pool.id().to_bech32(Endpoint::testnet().to_network_id()),
+        pool.id().to_bech32(Endpoint::devnet().to_network_id()),
         pool.id().to_hex()
     );
 
@@ -97,9 +88,8 @@ async fn main() -> Result<()> {
         let (sell_asset, sell_pool_index) = if n % 2 == 0 { (asset0, 0) } else { (asset1, 1) };
         let (buy_asset, buy_pool_index) = if n % 2 == 0 { (asset1, 1) } else { (asset0, 0) };
         let trade_amount = 10;
-
-        let mut sell_pool_balance = 0;
-        let mut buy_pool_balance = 0;
+        let sell_pool_balance;
+        let buy_pool_balance;
         if sell_pool_index == 0 {
             current_pool_0_balance -= users.len() as u64 * trade_amount;
             sell_pool_balance = current_pool_0_balance;
@@ -126,8 +116,8 @@ async fn main() -> Result<()> {
         for (user_index, _) in users.iter().enumerate() {
             let trade = Trade {
                 user_index: user_index as u64,
-                sell_asset_index: sell_pool_index as u64,
-                buy_asset_index: buy_pool_index as u64,
+                sell_asset_index: sell_pool_index,
+                buy_asset_index: buy_pool_index,
                 sell_amount: trade_amount,
                 buy_amount: trade_amount,
             };

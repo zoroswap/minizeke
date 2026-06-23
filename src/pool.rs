@@ -4,8 +4,8 @@ use anyhow::{Result, anyhow};
 use miden_client::{
     Client,
     account::{
-        Account, AccountBuilder, AccountComponent, AccountId, AccountStorageMode, AccountType,
-        StorageMap, StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
+        Account, AccountBuilder, AccountComponent, AccountId, AccountType, StorageMap,
+        StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
     },
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
@@ -33,8 +33,7 @@ pub async fn deploy_pool(
         build_pool_component(pool_0_balance, pool_1_balance, users, client.code_builder())?;
 
     let pool_contract = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(pool_component.clone())
         .with_auth_component(AuthSingleSig::new(
             key_pair.public_key().to_commitment(),
@@ -57,7 +56,7 @@ pub async fn deploy_pool(
         "contract id: {:?}",
         pool_contract
             .id()
-            .to_bech32(Endpoint::testnet().to_network_id())
+            .to_bech32(Endpoint::devnet().to_network_id())
     );
 
     Ok((pool_contract, pool_component))
@@ -79,26 +78,26 @@ pub fn build_pool_component(
     let user_amount = 1_000;
 
     let pool_balance_0: Word = [
-        Felt::new(pool_0_balance),
-        Felt::new(0),
-        Felt::new(0),
-        Felt::new(0),
+        Felt::new(pool_0_balance).unwrap(),
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
     ]
     .into();
 
     let pool_balance_1: Word = [
-        Felt::new(pool_1_balance),
-        Felt::new(0),
-        Felt::new(0),
-        Felt::new(0),
+        Felt::new(pool_1_balance).unwrap(),
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
     ]
     .into();
 
     let user_balance: Word = [
-        Felt::new(user_amount),
-        Felt::new(0),
-        Felt::new(0),
-        Felt::new(0),
+        Felt::new(user_amount).unwrap(),
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
     ]
     .into();
 
@@ -116,7 +115,7 @@ pub fn build_pool_component(
             StorageSlot::with_value(n("pool::user_30_balance"), user_balance.into()),
             StorageSlot::with_value(n("pool::user_31_balance"), user_balance.into()),
         ],
-        AccountComponentMetadata::new("zoro_miden::pool", AccountType::all()),
+        AccountComponentMetadata::new("zoro_miden::pool"),
     )?;
 
     Ok(component)
@@ -161,7 +160,7 @@ fn map_from(entries: &[(Word, u64)]) -> StorageMap {
     for (k, v) in entries {
         map.insert(
             StorageMapKey::new(*k),
-            [Felt::new(*v), ZERO, ZERO, ZERO].into(),
+            [Felt::new(*v).unwrap(), ZERO, ZERO, ZERO].into(),
         )
         .expect("insert into map");
     }
