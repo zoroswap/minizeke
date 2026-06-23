@@ -1,0 +1,193 @@
+use std::{fs::read_to_string, path::PathBuf};
+
+use anyhow::{Result, anyhow};
+use miden_client::{
+    Client,
+    account::{
+        Account, AccountBuilder, AccountComponent, AccountId, AccountType, StorageMap,
+        StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
+    },
+    assembly::CodeBuilder,
+    auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
+    keystore::{FilesystemKeyStore, Keystore},
+    rpc::Endpoint,
+    testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
+    },
+};
+use miden_core::{Felt, Word, ZERO};
+use miden_protocol::account::AccountComponentMetadata;
+use rand::RngCore;
+use serde::Serialize;
+
+#[derive(Debug, Copy, Clone, Serialize)]
+pub struct PoolState {
+    pub balance: u64,
+}
+
+pub async fn deploy_pool(
+    client: &mut Client<FilesystemKeyStore>,
+    users: Vec<AccountId>,
+    pool_0_balance: u64,
+    pool_1_balance: u64,
+) -> Result<(Account, AccountComponent)> {
+    let mut init_seed = [0_u8; 32];
+    client.rng().fill_bytes(&mut init_seed);
+
+    let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
+    let pool_component =
+        build_pool_component(pool_0_balance, pool_1_balance, users, client.code_builder())?;
+
+    let pool_contract = AccountBuilder::new(init_seed)
+        .account_type(AccountType::Public)
+        .with_component(pool_component.clone())
+        .with_auth_component(AuthSingleSig::new(
+            key_pair.public_key().to_commitment(),
+            AuthScheme::EcdsaK256Keccak,
+        ))
+        .with_component(BasicWallet)
+        .build()?;
+
+    let keystore = FilesystemKeyStore::new("keystore".into())?;
+    keystore
+        .add_key(&key_pair, pool_contract.id())
+        .await
+        .map_err(|e| anyhow!("Failed to add key: {e:?}"))?;
+
+    println!(
+        "pool contract commitment hash: {:?}",
+        pool_contract.to_commitment().to_hex()
+    );
+    println!(
+        "contract id: {:?}",
+        pool_contract
+            .id()
+            .to_bech32(Endpoint::testnet().to_network_id())
+    );
+
+    Ok((pool_contract, pool_component))
+}
+
+pub fn build_pool_component(
+    pool_0_balance: u64,
+    pool_1_balance: u64,
+    users: Vec<AccountId>,
+    cb: CodeBuilder,
+) -> Result<AccountComponent> {
+    let code = read_masm_file(&["accounts", "pool.masm"])?;
+    let cb = link_storage_utils(cb)?;
+    let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
+
+    let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+    let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
+    let faucets = [asset0, asset1];
+    let user_amount = 1_000_000_000;
+
+    let pool_balance_0: Word = [
+        Felt::new(pool_0_balance).unwrap(),
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+    ]
+    .into();
+
+    let pool_balance_1: Word = [
+        Felt::new(pool_1_balance).unwrap(),
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+    ]
+    .into();
+
+    let user_balance: Word = [
+        Felt::new(user_amount).unwrap(),
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+    ]
+    .into();
+
+    let component = AccountComponent::new(
+        lib,
+        vec![
+            StorageSlot::with_value(n("pool::pool_0_state"), pool_balance_0.into()),
+            StorageSlot::with_value(n("pool::pool_1_state"), pool_balance_1.into()),
+            StorageSlot::with_value(n("pool::user_00_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_01_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_10_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_11_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_20_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_21_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_30_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_31_balance"), user_balance.into()),
+        ],
+        AccountComponentMetadata::new("zoro_miden::pool"),
+    )?;
+
+    Ok(component)
+}
+
+pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let path = PathBuf::from_iter(
+        [manifest_dir, "masm"]
+            .into_iter()
+            .chain(path_steps.iter().copied()),
+    );
+    read_to_string(&path).map_err(|e| anyhow!("Error reading MASM file at path {path:?}: {e:?}"))
+}
+
+fn n(name: &str) -> StorageSlotName {
+    StorageSlotName::new(name).expect("valid slot name")
+}
+
+pub fn link_pool(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    //let mut code_builder = link_storage_utils(code_builder)?;
+    let pool_code = read_masm_file(&["accounts", "pool.masm"])?;
+    code_builder.link_module("zoro_miden::pool", &pool_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_storage_utils(code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let mut code_builder = link_math(code_builder)?;
+    let storage_utils_code = read_masm_file(&["lib", "storage_utils.masm"])?;
+    code_builder.link_module("zoro_miden::lib::storage_utils", &storage_utils_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let math_code = read_masm_file(&["lib", "math.masm"])?;
+    code_builder.link_module("zoro_miden::lib::math", &math_code)?;
+    Ok(code_builder)
+}
+
+fn map_from(entries: &[(Word, u64)]) -> StorageMap {
+    let mut map = StorageMap::new();
+    for (k, v) in entries {
+        map.insert(
+            StorageMapKey::new(*k),
+            [Felt::new(*v).unwrap(), ZERO, ZERO, ZERO].into(),
+        )
+        .expect("insert into map");
+    }
+    map
+}
+
+pub fn print_contract_procedures(pool_contract: &Account) {
+    println!("+++++Pool contract procedures");
+    pool_contract.code().procedures().iter().for_each(|proc| {
+        println!("Proc root: {:?} ", proc.mast_root().to_hex());
+    });
+}
+
+pub fn print_library_exports(masm_lib: &miden_assembly::Library) {
+    println!("+++++Masm lib exports:");
+    masm_lib.exports().for_each(|export| {
+        let path = export.path();
+        if let Some(root) = masm_lib.get_procedure_root_by_path(&path) {
+            println!("Export: {:?} {:?} {:?}", path, root, root.to_hex());
+        } else {
+            println!("Export: {:?} (no procedure root)", path);
+        }
+    });
+}
