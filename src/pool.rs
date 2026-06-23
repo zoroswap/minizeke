@@ -62,6 +62,21 @@ pub async fn deploy_pool(
     Ok((pool_contract, pool_component))
 }
 
+pub fn get_user_balance_storage_slot_names() -> Vec<StorageSlotName> {
+    vec![
+        n("pool::user_0_balance"),
+        n("pool::user_1_balance"),
+        n("pool::user_2_balance"),
+        n("pool::user_3_balance"),
+        n("pool::user_4_balance"),
+        n("pool::user_5_balance"),
+        n("pool::user_6_balance"),
+        n("pool::user_7_balance"),
+        n("pool::user_8_balance"),
+        n("pool::user_9_balance"),
+    ]
+}
+
 pub fn build_pool_component(
     pool_0_balance: u64,
     pool_1_balance: u64,
@@ -95,7 +110,7 @@ pub fn build_pool_component(
 
     let user_balance: Word = [
         Felt::new(user_amount).unwrap(),
-        Felt::ZERO,
+        Felt::new(user_amount).unwrap(),
         Felt::ZERO,
         Felt::ZERO,
     ]
@@ -117,12 +132,21 @@ pub fn build_pool_component(
         }
     }
 
-    print_library_exports(&lib.clone().into_library());
+    let slot_names = get_user_balance_storage_slot_names();
 
     let component = AccountComponent::new(
         lib,
         vec![
-            StorageSlot::with_map(n("pool::user_asset_balances"), map_from(&user_balances)),
+            StorageSlot::with_value(slot_names[0].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[1].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[2].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[3].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[4].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[5].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[6].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[7].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[8].clone(), user_balance.into()),
+            StorageSlot::with_value(slot_names[9].clone(), user_balance.into()),
             StorageSlot::with_value(n("pool::pool_0_state"), pool_balance_0.into()),
             StorageSlot::with_value(n("pool::pool_1_state"), pool_balance_1.into()),
         ],
@@ -143,7 +167,9 @@ pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
 }
 
 fn n(name: &str) -> StorageSlotName {
-    StorageSlotName::new(name).expect("valid slot name")
+    let name = StorageSlotName::new(name).expect("valid slot name");
+    println!("Slot name: {:?}, id: {:?}", name, name.id());
+    name
 }
 
 pub fn link_pool(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {

@@ -20,7 +20,10 @@ use miden_client_sqlite_store::SqliteStore;
 
 use crate::{
     execution::{PoolStateDelta, Trade, make_exec_script},
-    pool::{deploy_pool, link_pool, link_storage_utils, read_masm_file},
+    pool::{
+        deploy_pool, get_user_balance_storage_slot_names, link_pool, link_storage_utils,
+        read_masm_file,
+    },
     user::get_users,
 };
 
@@ -86,6 +89,7 @@ async fn main() -> Result<()> {
     let sim_runs = 5;
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
+    let slot_names = get_user_balance_storage_slot_names();
 
     let mut current_pool_0_balance = pool_0_balance;
     let mut current_pool_1_balance = pool_1_balance;
@@ -123,11 +127,11 @@ async fn main() -> Result<()> {
                 set_amount: buy_pool_balance,
             },
         ];
-        for user in &users {
+        for (idx, user) in users.iter().enumerate() {
             let trade = Trade {
-                user: *user,
-                sell_asset,
-                buy_asset,
+                user: slot_names[idx].id().clone(),
+                sell_asset_index: sell_pool_index,
+                buy_asset_index: buy_pool_index,
                 sell_amount: trade_amount,
                 buy_amount: trade_amount,
             };
