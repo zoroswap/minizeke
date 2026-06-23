@@ -81,7 +81,7 @@ pub fn build_pool_component(
     let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
     let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
     let faucets = [asset0, asset1];
-    let user_amount = 1_000;
+    let user_amount = 1_000_000_000;
 
     let pool_balance_0: Word = [
         Felt::new(pool_0_balance).unwrap(),

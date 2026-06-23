@@ -86,8 +86,8 @@ impl MidenExecution {
         // spawn the user accounts
         let users = get_users(10, &mut client).await?;
 
-        let pool_0_balance = 10_000_000;
-        let pool_1_balance = 10_000_000;
+        let pool_0_balance = 10_000_000_000;
+        let pool_1_balance = 10_000_000_000;
         // spawn the pool account
         let (pool, pool_component) =
             deploy_pool(&mut client, users.clone(), pool_0_balance, pool_1_balance).await?;
