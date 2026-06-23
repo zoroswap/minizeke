@@ -105,16 +105,8 @@ pub fn build_pool_component(
     let component = AccountComponent::new(
         lib,
         vec![
-            StorageSlot::with_value(n("pool::pool_0_state"), pool_balance_0.into()),
-            StorageSlot::with_value(n("pool::pool_1_state"), pool_balance_1.into()),
-            StorageSlot::with_value(n("pool::user_00_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_01_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_10_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_11_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_20_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_21_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_30_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_31_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_0_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_1_balance"), user_balance.into()),
         ],
         AccountComponentMetadata::new("zoro_miden::pool", AccountType::all()),
     )?;

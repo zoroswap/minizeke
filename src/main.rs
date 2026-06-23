@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     println!("Client ready.");
 
     // spawn the user accounts
-    let users = get_users(10, &mut client).await?;
+    let users = get_users(1, &mut client).await?;
 
     let pool_0_balance = 10_000_000;
     let pool_1_balance = 10_000_000;
@@ -124,14 +124,16 @@ async fn main() -> Result<()> {
             },
         ];
         for (user_index, _) in users.iter().enumerate() {
-            let trade = Trade {
-                user_index: user_index as u64,
-                sell_asset_index: sell_pool_index as u64,
-                buy_asset_index: buy_pool_index as u64,
-                sell_amount: trade_amount,
-                buy_amount: trade_amount,
-            };
-            trades.push(trade);
+            for n in 0..1 {
+                let trade = Trade {
+                    user_index: user_index as u64,
+                    sell_asset_index: sell_pool_index as u64,
+                    buy_asset_index: buy_pool_index as u64,
+                    sell_amount: trade_amount,
+                    buy_amount: trade_amount,
+                };
+                trades.push(trade);
+            }
         }
 
         let tx_script = make_exec_script(trades, pool_state_deltas);
