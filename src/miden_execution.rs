@@ -110,7 +110,8 @@ impl MidenExecution {
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
         let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
 
-        let user_amount = 1000u64;
+        let user_amount = 1_000_000_000u64;
+
         let users = Users::new(users, user_amount, vec![asset0, asset1]);
 
         let mut pool_states = HashMap::with_capacity(2);
