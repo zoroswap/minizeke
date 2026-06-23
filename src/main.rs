@@ -32,11 +32,11 @@ mod user;
 async fn main() -> Result<()> {
     //miden client
     let remote_prover = Arc::new(RemoteTransactionProver::new(
-        "https://tx-prover.testnet.miden.io",
+        "https://tx-prover.devnet.miden.io",
     ));
     let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
     let store = Arc::new(sqlite_store);
-    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
+    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::devnet(), 30_000));
     let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
     // Build client with remote prover as default
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
 
     println!(
         "Pool deployed. BECH32: {}, HEX: {}",
-        pool.id().to_bech32(Endpoint::testnet().to_network_id()),
+        pool.id().to_bech32(Endpoint::devnet().to_network_id()),
         pool.id().to_hex()
     );
 
