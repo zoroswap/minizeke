@@ -123,11 +123,11 @@ async fn main() -> Result<()> {
                 set_amount: buy_pool_balance,
             },
         ];
-        for user in &users {
+        for (user_index, _) in users.iter().enumerate() {
             let trade = Trade {
-                user: *user,
-                sell_asset,
-                buy_asset,
+                user_index: user_index as u64,
+                sell_asset_index: sell_pool_index as u64,
+                buy_asset_index: buy_pool_index as u64,
                 sell_amount: trade_amount,
                 buy_amount: trade_amount,
             };
@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
 
         let tx_script = make_exec_script(trades, pool_state_deltas);
 
+        println!("SCRIPT \n\n{tx_script}\n\n");
         // println!("SCRIPT \n\n{tx_script}\n\n");
         // run simulation
 

@@ -2,9 +2,9 @@ use miden_client::account::AccountId;
 use miden_core::{Word, field::PrimeField64};
 
 pub struct Trade {
-    pub user: AccountId,
-    pub sell_asset: AccountId,
-    pub buy_asset: AccountId,
+    pub user_index: u64,
+    pub sell_asset_index: u64,
+    pub buy_asset_index: u64,
     pub sell_amount: u64,
     pub buy_amount: u64,
 }
@@ -27,21 +27,17 @@ begin
 
     for trade in trades {
         let Trade {
-            user,
-            sell_asset,
-            buy_asset,
+            user_index,
+            sell_asset_index,
+            buy_asset_index,
             sell_amount,
             buy_amount,
         } = trade;
 
-        let user_suffix: u64 = user.suffix().as_canonical_u64();
-        let user_prefix: u64 = user.prefix().into();
-        let buy_asset_suffix: u64 = buy_asset.suffix().as_canonical_u64();
-        let buy_asset_prefix: u64 = buy_asset.prefix().into();
-        let sell_asset_suffix: u64 = sell_asset.suffix().as_canonical_u64();
-        let sell_asset_prefix: u64 = sell_asset.prefix().into();
+        let sell_index = user_index * 10 + sell_asset_index;
+        let buy_index = user_index * 10 + buy_asset_index;
         let trade_string = format!(
-            "push.{buy_asset_prefix}.{buy_asset_suffix}.{user_prefix}.{user_suffix}.{sell_asset_prefix}.{sell_asset_suffix}.{user_prefix}.{user_suffix}.{buy_amount}.{sell_amount} call.execute_swap\n",
+            "push.{buy_amount}.{buy_index}.{sell_amount}.{sell_index} call.execute_swap\n",
         );
 
         script.push_str(&trade_string);

@@ -94,30 +94,27 @@ pub fn build_pool_component(
     ]
     .into();
 
-    let mut user_balances: Vec<(Word, u64)> = Vec::with_capacity(users.len());
-    for user in users {
-        for faucet in faucets {
-            user_balances.push((
-                [
-                    user.suffix(),
-                    user.prefix().into(),
-                    faucet.suffix(),
-                    faucet.prefix().into(),
-                ]
-                .into(),
-                user_amount,
-            ));
-        }
-    }
-
-    print_library_exports(&lib.clone().into_library());
+    let user_balance: Word = [
+        Felt::new(user_amount),
+        Felt::new(0),
+        Felt::new(0),
+        Felt::new(0),
+    ]
+    .into();
 
     let component = AccountComponent::new(
         lib,
         vec![
-            StorageSlot::with_map(n("pool::user_asset_balances"), map_from(&user_balances)),
             StorageSlot::with_value(n("pool::pool_0_state"), pool_balance_0.into()),
             StorageSlot::with_value(n("pool::pool_1_state"), pool_balance_1.into()),
+            StorageSlot::with_value(n("pool::user_00_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_01_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_10_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_11_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_20_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_21_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_30_balance"), user_balance.into()),
+            StorageSlot::with_value(n("pool::user_31_balance"), user_balance.into()),
         ],
         AccountComponentMetadata::new("zoro_miden::pool", AccountType::all()),
     )?;

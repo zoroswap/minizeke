@@ -11,6 +11,15 @@ use miden::protocol::native_account
 
 # STORAGE SLOTS
 const USER_ASSET_BALANCES_SLOT = word("pool::user_asset_balances")
+const USER_00_BALANCE_SLOT = word("pool::user_00_balance")
+const USER_01_BALANCE_SLOT = word("pool::user_01_balance")
+const USER_10_BALANCE_SLOT = word("pool::user_10_balance")
+const USER_11_BALANCE_SLOT = word("pool::user_11_balance")
+const USER_20_BALANCE_SLOT = word("pool::user_20_balance")
+const USER_21_BALANCE_SLOT = word("pool::user_21_balance")
+const USER_30_BALANCE_SLOT = word("pool::user_30_balance")
+const USER_31_BALANCE_SLOT = word("pool::user_31_balance")
+
 const POOL_0_BALANCE_SLOT = word("pool::pool_0_state")
 const POOL_1_BALANCE_SLOT = word("pool::pool_1_state")
 # ERRORS
@@ -27,37 +36,109 @@ const ERR_OVERFLOW = "Overflow"
 # ----------------------------------------------------------------------------------------------
 
 #! USER_ASSET_BALANCES(assetId, userId) += amount
-#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Inputs:  [amount]
 #! Outputs: []
-pub proc add_to_user_balance
-    push.USER_ASSET_BALANCES_SLOT[0..2] movup.2
-    # => [amount, slot_suffix, slot_prefix, KEY, ]
-    exec.add_to_map_item
+pub proc add_to_user00_balance
+    push.USER_00_BALANCE_SLOT[0..2]
+    # => [amount, slot_suffix, slot_prefix]
+    exec.add_to_storage_item
     # => []
 end
 
-#! USER_ASSET_BALANCES(assetId, userId) -= amount
-#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
-#! Outputs: []
-pub proc sub_from_user_balance
-    movdn.4
-    # => [KEY, amount]
-    push.USER_ASSET_BALANCES_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, KEY, amount]
-    exec.sub_from_map_item
+pub proc sub_from_user00_balance
+    push.USER_00_BALANCE_SLOT[0..2]
+    # => [amount, slot_suffix, slot_prefix]
+    exec.sub_from_storage_item
     # => []
 end
 
-#! Raw local map value.
-#! Inputs:  [KEY]
-#! Outputs: [amount]
-pub proc get_user_asset_balance
-    push.USER_ASSET_BALANCES_SLOT[0..2]
-    # => [slot_suffix, slot_prefix, KEY]
-    exec.get_map_item
-    # => [amount]
+pub proc add_to_user01_balance(amount: felt)
+    push.USER_01_BALANCE_SLOT[0..2] exec.add_to_storage_item
 end
 
+pub proc sub_from_user01_balance
+    push.USER_01_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+end
+
+pub proc add_to_user10_balance(amount: felt)
+    push.USER_10_BALANCE_SLOT[0..2] exec.add_to_storage_item
+end
+
+pub proc sub_from_user10_balance
+    push.USER_10_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+end
+
+pub proc add_to_user11_balance(amount: felt)
+    push.USER_11_BALANCE_SLOT[0..2] exec.add_to_storage_item
+end
+
+pub proc sub_from_user11_balance
+    push.USER_11_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+end
+
+pub proc add_to_user20_balance(amount: felt)
+    push.USER_20_BALANCE_SLOT[0..2] exec.add_to_storage_item
+end
+
+pub proc sub_from_user20_balance
+    push.USER_20_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+end
+
+pub proc add_to_user21_balance(amount: felt)
+    push.USER_21_BALANCE_SLOT[0..2] exec.add_to_storage_item
+end
+
+pub proc sub_from_user21_balance
+    push.USER_21_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+end
+
+pub proc add_to_user30_balance(amount: felt)
+    push.USER_30_BALANCE_SLOT[0..2] exec.add_to_storage_item
+end
+
+pub proc sub_from_user30_balance
+    push.USER_30_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+end
+
+pub proc add_to_user31_balance(amount: felt)
+    push.USER_31_BALANCE_SLOT[0..2] exec.add_to_storage_item
+end
+
+pub proc sub_from_user31_balance
+    push.USER_31_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+end
+
+pub proc get_user00_balance
+    push.USER_00_BALANCE_SLOT[0..2] exec.get_storage_item
+end
+
+pub proc get_user01_balance
+    push.USER_01_BALANCE_SLOT[0..2] exec.get_storage_item
+end
+
+pub proc get_user10_balance
+    push.USER_10_BALANCE_SLOT[0..2] exec.get_storage_item
+end
+
+pub proc get_user11_balance
+    push.USER_11_BALANCE_SLOT[0..2] exec.get_storage_item
+end
+
+pub proc get_user20_balance
+    push.USER_20_BALANCE_SLOT[0..2] exec.get_storage_item
+end
+
+pub proc get_user21_balance
+    push.USER_21_BALANCE_SLOT[0..2] exec.get_storage_item
+end
+
+pub proc get_user30_balance
+    push.USER_30_BALANCE_SLOT[0..2] exec.get_storage_item
+end
+
+pub proc get_user31_balance
+    push.USER_31_BALANCE_SLOT[0..2] exec.get_storage_item
+end
 
 # ----------------------------------------------------------------------------------------------
 # POOL BALANCE  (POOL_BALANCES value word = [poolBalance, 0, 0, 0])
@@ -116,13 +197,82 @@ end
 
 
 pub proc execute_swap
-    # => [sell_amount, buy_amount, SELL_KEY, BUY_KEY]
-    swap movdn.5
-    # => [sell_amount, SELL_KEY, buy_amount, BUY_KEY, ]
-    # => [SELL_KEY, BUY_KEY]
-    exec.sub_from_user_balance
-    # => [BUY_KEY]
-    exec.add_to_user_balance
+    # => [sell_index, sell_amount, buy_index, , buy_amount]
+    dup eq.0
+    if.true
+        drop exec.sub_from_user00_balance
+    else 
+        dup eq.1
+        if.true
+            drop exec.sub_from_user01_balance
+        else 
+            dup eq.10
+            if.true
+                drop exec.sub_from_user10_balance
+            else 
+                dup eq.11
+                if.true
+                    drop exec.sub_from_user11_balance
+                else
+                    dup eq.20
+                    if.true
+                        drop exec.sub_from_user20_balance
+                    else 
+                        dup eq.21
+                        if.true
+                            drop exec.sub_from_user21_balance
+                        else 
+                            ## dup here and drop in true branche and continue checking
+                            eq.30
+                            if.true
+                                exec.sub_from_user30_balance
+                            else 
+                                exec.sub_from_user31_balance
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    # => [sell_index, sell_amount]
+    dup eq.0
+    if.true
+        drop exec.add_to_user00_balance
+    else 
+        dup eq.1
+        if.true
+            drop exec.add_to_user01_balance
+        else 
+            dup eq.10  
+            if.true
+                drop exec.add_to_user10_balance
+            else 
+                dup eq.11
+                if.true
+                    drop exec.add_to_user11_balance
+                else 
+                    dup eq.20
+                    if.true
+                        drop exec.add_to_user20_balance
+                    else 
+                        dup eq.21
+                        if.true
+                            drop exec.add_to_user21_balance
+                        else 
+                            ## dup here and drop in true branche and continue checking
+                            eq.30
+                            if.true
+                                drop exec.add_to_user30_balance
+                            else 
+                                exec.add_to_user31_balance
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
     # => []
 end
 
@@ -209,7 +359,11 @@ end
 # GETTERS
 # ----------------------------------------------------------------------------------------------
 
-
+pub proc get_storage_item(slot_id_prefix: felt, slot_id_suffix: felt) -> felt
+    exec.active_account::get_item
+    movdn.3 drop drop drop
+    # => [value]
+end
 
 pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) -> felt
     exec.active_account::get_map_item
