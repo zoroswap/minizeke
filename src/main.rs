@@ -1,12 +1,14 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use dotenv::dotenv;
+use miden_client::account::AccountId;
+use tokio::runtime::Builder;
 
 use crate::{
     message_broker::message_broker::MessageBroker, miden_execution::MidenExecution,
-    oracle_sse::OracleSSEClient, processing::Processing, store::Store,
-    websocket::connection_manager::ConnectionManager,
+    oracle_sse::OracleSSEClient, pool::PoolState, processing::Processing, store::Store,
+    user::Users, websocket::connection_manager::ConnectionManager,
 };
 
 mod api;
@@ -23,20 +25,58 @@ mod store;
 mod user;
 mod websocket;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() {
     dotenv().ok();
 
     let message_broker = Arc::new(MessageBroker::new());
-    let connection_manager = Arc::new(ConnectionManager::with_message_broker(
-        message_broker.clone(),
-    ));
+
     println!("[INIT] Initializing Miden components");
-    let mut miden_execution = MidenExecution::initialize(message_broker.clone()).await?;
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|err| panic!("Failed building runtime for trading engine: {err:?}"));
+    let mut miden_execution = rt.block_on(async {
+        MidenExecution::initialize(message_broker.clone())
+            .await
+            .unwrap()
+    });
 
     let initial_users = miden_execution.users();
     let initial_pool_states = miden_execution.pool_states();
     let pool_id = miden_execution.pool_id();
+
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let rt = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|err| {
+                    panic!("Failed building runtime for trading engine: {err:?}")
+                });
+            rt.block_on(async {
+                println!("[RUN] Starting Miden execution");
+                if let Err(e) = miden_execution.start().await {
+                    eprintln!("Critical error on miden_execution: {e}. Exiting with status 1.");
+                    std::process::exit(1);
+                }
+            });
+        });
+
+        let _ = main_tokio(initial_users, initial_pool_states, pool_id, message_broker);
+    });
+}
+
+#[tokio::main]
+async fn main_tokio(
+    initial_users: Users,
+    initial_pool_states: HashMap<AccountId, PoolState>,
+    pool_id: AccountId,
+    message_broker: Arc<MessageBroker>,
+) -> Result<()> {
+    println!("[INIT] Connection manager");
+    let connection_manager = Arc::new(ConnectionManager::with_message_broker(
+        message_broker.clone(),
+    ));
 
     println!("[INIT] Initializing Store");
     let store = Arc::new(Store::new(
@@ -56,14 +96,6 @@ async fn main() -> Result<()> {
         initial_pool_states.clone(),
     )
     .await?;
-
-    println!("[RUN] Starting Miden Execution");
-    tokio::spawn(async move {
-        if let Err(e) = miden_execution.start().await {
-            eprintln!("Critical error on miden_execution: {e}. Exiting with status 1.");
-            std::process::exit(1);
-        }
-    });
 
     println!("[RUN] Starting Processing");
     tokio::spawn(async move {

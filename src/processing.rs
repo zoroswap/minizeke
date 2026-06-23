@@ -1,8 +1,9 @@
 use crate::{
-    message_broker::message_broker::{AmmEvent, MessageBroker, MessageBrokerEvent},
+    message_broker::message_broker::{AmmEvent, MessageBroker, MessageBrokerEvent, UserEvent},
     oracle_sse::OraclePricing,
-    order::{Order, OrderUpdate, Orders},
-    pool::PoolState, user::Users,
+    order::{OrderExecutionResult, OrderUpdate, Orders},
+    pool::PoolState,
+    user::Users,
 };
 
 use anyhow::Result;
@@ -20,7 +21,11 @@ pub struct Processing {
 }
 
 impl Processing {
-    pub async fn new(message_broker: Arc<MessageBroker>, users: Users, pool_states: HashMap<AccountId, PoolState>) -> Result<Self> {
+    pub async fn new(
+        message_broker: Arc<MessageBroker>,
+        users: Users,
+        pool_states: HashMap<AccountId, PoolState>,
+    ) -> Result<Self> {
         let oracle_pricing = OraclePricing::new();
         let orders = Orders::default();
 
@@ -29,7 +34,7 @@ impl Processing {
             message_broker,
             orders,
             pool_states,
-            users
+            users,
         })
     }
 
@@ -127,14 +132,39 @@ impl Processing {
                 .broadcast_order_update(OrderUpdate::StartedProcessing(order.clone()))?;
         }
 
-        let ok = Vec::new();
-        let failed = Vec::new();
-
         for order in orders {
             let details = order.details();
+            let buy_faucet = details.asset_out;
+            let sell_faucet = details.asset_in;
+            let user_id = order.user_id();
+            self.users
+                .sub_from_balance(order.user_id(), buy_faucet, details.min_amount_out);
+            self.users
+                .add_to_balance(order.user_id(), sell_faucet, details.amount_in);
 
-            let new_user_stats = Users
+            let balance0 = self.users.user_balance(user_id, buy_faucet)?;
+            let balance1 = self.users.user_balance(user_id, sell_faucet)?;
+
+            self.message_broker.broadcast_user(UserEvent {
+                user_id,
+                faucet_id: buy_faucet,
+                amount: balance0,
+            })?;
+            self.message_broker.broadcast_user(UserEvent {
+                user_id,
+                faucet_id: buy_faucet,
+                amount: balance1,
+            })?;
+            self.message_broker
+                .broadcast_order_update(OrderUpdate::Processed(order.processed(
+                    OrderExecutionResult {
+                        amount_out: details.min_amount_out,
+                    },
+                )))?;
         }
+
+        self.message_broker
+            .broadcast_amm(AmmEvent::OrdersProcessed)?;
 
         Ok(())
     }

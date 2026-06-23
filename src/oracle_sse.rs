@@ -238,6 +238,11 @@ impl OraclePricing {
     }
 
     pub fn get_price_for_asset(&self, asset: AccountId) -> Option<PriceData> {
-        self.oracle_prices.get(&asset)
+        let price = self.oracle_prices.get(&asset);
+        if let Some(price) = price {
+            Some(*price)
+        } else {
+            None
+        }
     }
 }

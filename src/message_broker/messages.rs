@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{order::OrderStatus, pool::PoolState};
+use crate::{message_broker::message_broker::AmmEvent, order::OrderStatus, pool::PoolState};
 
 /// Messages sent from client to server
 #[derive(Debug, Deserialize, Clone)]
@@ -45,6 +45,14 @@ pub enum ServerMessage {
         closed_orders: usize,
         timestamp: u64,
     },
+    UserUpdate {
+        user_id: String,
+        faucet_id: String,
+        amount: u64,
+    },
+    AmmUpdate {
+        status: AmmEvent,
+    },
 
     // Control messages
     Pong,
@@ -72,6 +80,13 @@ pub enum SubscriptionChannel {
         #[serde(default)]
         oracle_id: Option<String>,
     },
+    #[serde(rename = "user")]
+    UserEvent {
+        #[serde(default)]
+        user_id: Option<String>,
+    },
+    #[serde(rename = "amm")]
+    AmmEvent {},
     #[serde(rename = "stats")]
     Stats,
 }

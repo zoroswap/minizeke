@@ -382,6 +382,54 @@ impl ConnectionManager {
             });
         }
 
+        // Amm updates
+        {
+            let message_broker = message_broker.clone();
+            let conn_mgr = self.clone();
+            tokio::spawn(async move {
+                let mut rx = message_broker.subscribe_amm();
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let message = ServerMessage::AmmUpdate { status: event };
+                            conn_mgr.broadcast_to_channel(&SubscriptionChannel::Stats, message);
+                        }
+                        Err(RecvError::Lagged(n)) => warn!("Amm lagged, skipped {n}"),
+                        Err(RecvError::Closed) => {
+                            error!("Amm channel closed");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        // User updates
+        {
+            let message_broker = message_broker.clone();
+            let conn_mgr = self.clone();
+            tokio::spawn(async move {
+                let mut rx = message_broker.subscribe_user();
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let message = ServerMessage::UserUpdate {
+                                user_id: event.user_id.to_hex(),
+                                faucet_id: event.faucet_id.to_hex(),
+                                amount: event.amount, // new balance
+                            };
+                            conn_mgr.broadcast_to_channel(&SubscriptionChannel::Stats, message);
+                        }
+                        Err(RecvError::Lagged(n)) => warn!("Amm lagged, skipped {n}"),
+                        Err(RecvError::Closed) => {
+                            error!("Amm channel closed");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         debug!("Event forwarding tasks started");
     }
 

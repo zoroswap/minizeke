@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use anyhow::{Result, anyhow};
 use miden_client::{
@@ -16,9 +16,10 @@ use miden_client_sqlite_store::SqliteStore;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::{
+    execution::{Trade, make_exec_script},
     message_broker::message_broker::{AmmEvent, MessageBroker, MessageBrokerEvent},
-    order::Orders,
-    pool::{PoolState, deploy_pool},
+    order::{OrderExecutionResult, OrderUpdate, Orders},
+    pool::{PoolState, deploy_pool, link_pool},
     user::{Users, get_users},
 };
 
@@ -192,9 +193,10 @@ impl MidenExecution {
         println!("[MIDEN EXECUTION] cycle {}", self.cycle);
         self.cycle += 1;
 
-        // let instant = Instant::now();
+        let instant = Instant::now();
+        let orders = self.orders.orders_processed();
 
-        // let mut trades = Vec::new();
+        let mut trades = Vec::new();
         // let pool_state_deltas = vec![
         //     PoolStateDelta {
         //         pool_index: sell_pool_index,
@@ -205,53 +207,82 @@ impl MidenExecution {
         //         set_amount: buy_pool_balance,
         //     },
         // ];
-        // for (user_index, _) in self.users.iter().enumerate() {
-        //     let trade = Trade {
-        //         user_index: user_index as u64,
-        //         sell_asset_index: sell_pool_index,
-        //         buy_asset_index: buy_pool_index,
-        //         sell_amount: trade_amount,
-        //         buy_amount: trade_amount,
-        //     };
-        //     trades.push(trade);
-        // }
+        let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+        let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
 
-        // let tx_script = make_exec_script(trades, pool_state_deltas);
+        for order in &orders {
+            let user_index = self
+                .users
+                .get_user_index(&order.user_id())
+                .ok_or(anyhow!("user not found"))?;
+            let details = order.details();
+            let buy_asset_index = if details.asset_out.eq(&asset0) { 0 } else { 1 };
+            let sell_asset_index = if details.asset_out.eq(&asset1) { 0 } else { 1 };
+            let amount_out = order.execution_result().amount_out;
+            let trade = Trade {
+                user_index,
+                sell_asset_index,
+                buy_asset_index,
+                sell_amount: details.amount_in,
+                buy_amount: amount_out,
+            };
+            trades.push(trade);
+        }
 
-        // println!("SCRIPT \n\n{tx_script}\n\n");
+        let tx_script = make_exec_script(trades);
 
-        // let cb = link_pool(self.client.code_builder())?;
-        // let tx_script = cb.compile_tx_script(tx_script)?;
+        println!("SCRIPT \n\n{tx_script}\n\n");
 
-        // let tx_req = TransactionRequestBuilder::new()
-        //     .custom_script(tx_script)
-        //     .build()?;
+        let cb = link_pool(self.client.code_builder())?;
+        let tx_script = cb.compile_tx_script(tx_script)?;
 
-        // let tx_result = self
-        //     .client
-        //     .execute_transaction(self.pool_id, tx_req)
-        //     .await?;
-        // let measurements = tx_result.executed_transaction().measurements();
-        // println!(
-        //     "Cycle count: {}, auth: {}",
-        //     measurements.total_cycles(),
-        //     measurements.auth_procedure
-        // );
-        // let prove_started = Instant::now();
-        // let proven_transaction = self
-        //     .client
-        //     .prove_transaction_with(&tx_result, self.client.prover())
-        //     .await?;
-        // let prove_elapsed = prove_started.elapsed();
-        // let submission_height = self
-        //     .client
-        //     .submit_proven_transaction(proven_transaction, &tx_result)
-        //     .await?;
-        // self.client
-        //     .apply_transaction(&tx_result, submission_height)
-        //     .await?;
-        // println!("Elapsed: {prove_elapsed:?}");
-        // self.client.sync_state().await?;
+        let tx_req = TransactionRequestBuilder::new()
+            .custom_script(tx_script)
+            .build()?;
+
+        let tx_result = self
+            .client
+            .execute_transaction(self.pool_id, tx_req)
+            .await?;
+        let measurements = tx_result.executed_transaction().measurements();
+        println!(
+            "Cycle count: {}, auth: {}",
+            measurements.total_cycles(),
+            measurements.auth_procedure
+        );
+        let prove_started = Instant::now();
+        let proven_transaction = self
+            .client
+            .prove_transaction_with(&tx_result, self.client.prover())
+            .await?;
+        let prove_elapsed = prove_started.elapsed();
+        let submission_height = self
+            .client
+            .submit_proven_transaction(proven_transaction, &tx_result)
+            .await?;
+        self.client
+            .apply_transaction(&tx_result, submission_height)
+            .await?;
+        let tx_hash = tx_result.id().to_string();
+        println!("Elapsed: {prove_elapsed:?}");
+        self.client.sync_state().await?;
+
+        for order in orders {
+            let details = order.details();
+            self.message_broker
+                .broadcast_order_update(OrderUpdate::Executed(order.executed(
+                    tx_hash.clone(),
+                    OrderExecutionResult {
+                        amount_out: details.min_amount_out,
+                    },
+                )))?;
+        }
+
+        self.message_broker
+            .broadcast_amm(AmmEvent::OrdersExecuted)?;
+
+        self.message_broker
+            .broadcast_amm(AmmEvent::StartProcessing)?;
 
         Ok(())
     }

@@ -17,12 +17,12 @@ pub enum OrderType {
 pub struct OrderDetails {
     #[serde(serialize_with = "serialize_account_id")]
     #[serde(deserialize_with = "deserialize_account_id")]
-    asset_in: AccountId,
-    amount_in: u64,
+    pub asset_in: AccountId,
+    pub amount_in: u64,
     #[serde(serialize_with = "serialize_account_id")]
     #[serde(deserialize_with = "deserialize_account_id")]
-    asset_out: AccountId,
-    min_amount_out: u64,
+    pub asset_out: AccountId,
+    pub min_amount_out: u64,
 }
 
 impl OrderDetails {
@@ -154,7 +154,7 @@ pub struct Failed {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OrderExecutionResult {
-    amount_out: u64,
+    pub amount_out: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -229,6 +229,9 @@ impl Order<Created> {
             timing: self.timing.start_processing(),
         }
     }
+    pub fn user_id(&self) -> AccountId {
+        self.user_id
+    }
 }
 
 impl Order<Processing> {
@@ -246,6 +249,9 @@ impl Order<Processing> {
 
     pub fn details(&self) -> OrderDetails {
         self.details.clone()
+    }
+    pub fn user_id(&self) -> AccountId {
+        self.user_id
     }
 }
 
@@ -289,6 +295,12 @@ impl Order<Processed> {
     pub fn details(&self) -> OrderDetails {
         self.details.clone()
     }
+    pub fn user_id(&self) -> AccountId {
+        self.user_id
+    }
+    pub fn execution_result(&self) -> OrderExecutionResult {
+        self.state.execution_result.clone()
+    }
 }
 
 impl Order<Executed> {
@@ -308,6 +320,12 @@ impl Order<Executed> {
     }
     pub fn details(&self) -> OrderDetails {
         self.details.clone()
+    }
+    pub fn user_id(&self) -> AccountId {
+        self.user_id
+    }
+    pub fn execution_result(&self) -> OrderExecutionResult {
+        self.state.execution_result.clone()
     }
 }
 

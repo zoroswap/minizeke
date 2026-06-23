@@ -1,8 +1,5 @@
-use miden_client::account::AccountId;
-use miden_core::{Word, field::PrimeField64};
-
 pub struct Trade {
-    pub user_index: u64,
+    pub user_index: u16,
     pub sell_asset_index: u64,
     pub buy_asset_index: u64,
     pub sell_amount: u64,
@@ -14,7 +11,7 @@ pub struct PoolStateDelta {
     pub set_amount: u64,
 }
 
-pub fn make_exec_script(trades: Vec<Trade>, pool_state_deltas: Vec<PoolStateDelta>) -> String {
+pub fn make_exec_script(trades: Vec<Trade>) -> String {
     let mut script = r#"
 use zoro_miden::pool::execute_swap
 use zoro_miden::pool::set_pool_0_balance
@@ -34,8 +31,8 @@ begin
             buy_amount,
         } = trade;
 
-        let sell_index = user_index * 10 + sell_asset_index;
-        let buy_index = user_index * 10 + buy_asset_index;
+        let sell_index = user_index as u64 * 10 + sell_asset_index;
+        let buy_index = user_index as u64 * 10 + buy_asset_index;
         let trade_string = format!(
             "push.{buy_amount}.{buy_index}.{sell_amount}.{sell_index} call.execute_swap\n",
         );

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use miden_client::account::AccountId;
+use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -28,12 +29,19 @@ pub struct StatsEvent {
     pub timestamp: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AmmEvent {
     StartProcessing,
     OrdersProcessed,
     OrdersExecuted,
     OrdersSettled,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserEvent {
+    pub user_id: AccountId,
+    pub faucet_id: AccountId,
+    pub amount: u64,
 }
 
 pub enum MessageBrokerEvent {
@@ -42,6 +50,7 @@ pub enum MessageBrokerEvent {
     OraclePrice(OraclePriceEvent),
     Stats(StatsEvent),
     Amm(AmmEvent),
+    User(UserEvent),
 }
 
 #[derive(Clone)]
@@ -50,6 +59,7 @@ pub struct MessageBroker {
     pub pool_state_tx: broadcast::Sender<PoolStateEvent>,
     pub oracle_prices_tx: broadcast::Sender<OraclePriceEvent>,
     pub stats_tx: broadcast::Sender<StatsEvent>,
+    pub user_tx: broadcast::Sender<UserEvent>,
     pub amm_tx: broadcast::Sender<AmmEvent>,
 }
 
@@ -62,6 +72,7 @@ impl MessageBroker {
         let (oracle_prices_tx, _) = broadcast::channel(100);
         let (stats_tx, _) = broadcast::channel(10);
         let (amm_tx, _) = broadcast::channel(100);
+        let (user_tx, _) = broadcast::channel(100);
 
         Self {
             order_updates_tx,
@@ -69,6 +80,7 @@ impl MessageBroker {
             oracle_prices_tx,
             stats_tx,
             amm_tx,
+            user_tx,
         }
     }
 
@@ -132,6 +144,17 @@ impl MessageBroker {
         }
     }
 
+    /// Broadcast AMM state
+    pub fn broadcast_user(&self, event: UserEvent) -> Result<()> {
+        match self.user_tx.send(event) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!("Failed to broadcast amm event: {}", e);
+                Ok(())
+            }
+        }
+    }
+
     /// Subscribe to order updates
     pub fn subscribe_order_updates(&self) -> broadcast::Receiver<OrderUpdate> {
         self.order_updates_tx.subscribe()
@@ -155,6 +178,11 @@ impl MessageBroker {
     /// Subscribe to stats updates
     pub fn subscribe_amm(&self) -> broadcast::Receiver<AmmEvent> {
         self.amm_tx.subscribe()
+    }
+
+    /// Subscribe to stats updates
+    pub fn subscribe_user(&self) -> broadcast::Receiver<UserEvent> {
+        self.user_tx.subscribe()
     }
 }
 
