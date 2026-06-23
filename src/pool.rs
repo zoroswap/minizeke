@@ -62,7 +62,7 @@ pub async fn deploy_pool(
         "contract id: {:?}",
         pool_contract
             .id()
-            .to_bech32(Endpoint::devnet().to_network_id())
+            .to_bech32(Endpoint::testnet().to_network_id())
     );
 
     Ok((pool_contract, pool_component))

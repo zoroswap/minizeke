@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, State},
+    body::{Body, Bytes},
+    extract::State,
     http::{HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -13,7 +13,7 @@ use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -31,16 +31,6 @@ pub struct AppState {
     pub store: Arc<Store>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SubmitNoteRequest {
-    pub note_data: String, // Base64 encoded serialized note
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct MintRequest {
-    pub address: String,
-    pub faucet_id: String,
-}
 #[derive(Debug, Serialize, Deserialize)]
 struct NewOrderRequest {
     id: Uuid,
@@ -89,6 +79,7 @@ pub async fn start(
     println!("\n🚀 Zoro server is running!");
     println!("📡 Available endpoints:");
     println!("  GET  /health                    - Health check");
+    println!("  GET  /users                     - List engine user account IDs");
     println!("  POST /orders/new                - Submit a new order");
     println!("  POST /withdraw/submit           - Submit a new withdrawal");
     println!("  POST /faucets/mint              - Mint from a faucet");
@@ -111,6 +102,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/pools/info", get(pool_info))
+        .route("/users", get(users))
         .route("/ws", get(websocket_handler))
         .route("/orders/new", post(order_new))
         .layer(CorsLayer::permissive())
@@ -126,6 +118,27 @@ async fn health_check() -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     (headers, Json(response))
+}
+
+async fn users(State(state): State<AppState>) -> impl IntoResponse {
+    let users: Vec<_> = state
+        .store
+        .users_with_index()
+        .into_iter()
+        .map(|(user_id, index)| {
+            serde_json::json!({
+                "user_id": user_id.to_hex(),
+                "index": index,
+            })
+        })
+        .collect();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=60, must-revalidate"),
+    );
+    (headers, Json(serde_json::json!({ "users": users })))
 }
 
 async fn pool_info(State(state): State<AppState>) -> impl IntoResponse {
@@ -163,14 +176,39 @@ struct PoolSettingsResponse {
     protocol_fee: String,
 }
 
-async fn order_new(
-    State(state): State<AppState>,
-    Json(payload): Json<NewOrderRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+async fn order_new(State(state): State<AppState>, body: Bytes) -> Result<Response<Body>, ApiError> {
+    let raw = String::from_utf8_lossy(&body);
+    // info!(body = %raw, "POST /orders/new received");
+
+    let payload: NewOrderRequest = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!(error = %e, body = %raw, "Rejected new order: could not parse payload");
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                format!("invalid order payload: {e}"),
+            )
+                .into_response());
+        }
+    };
+
+    // info!(
+    //     order_id = %payload.id,
+    //     user_id = %payload.user_id.to_hex(),
+    //     order_type = ?payload.order_type,
+    //     asset_in = %payload.details.asset_in.to_hex(),
+    //     amount_in = payload.details.amount_in,
+    //     asset_out = %payload.details.asset_out.to_hex(),
+    //     min_amount_out = payload.details.min_amount_out,
+    //     "Accepted new order",
+    // );
+
     let order = Order::new(payload.pubkey, payload.user_id, payload.details);
     state
         .message_broker
-        .broadcast_order_update(order.clone().into());
+        .broadcast_order_update(order.clone().into())
+        .map_err(ApiError)?;
+
     let serialized_order: SerializableOrder = order.into();
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -178,7 +216,11 @@ async fn order_new(
         HeaderValue::from_static("max-age=1, must-revalidate"),
     );
 
-    Ok(Json(ApiResponse {
-        data: serialized_order,
-    }))
+    Ok((
+        headers,
+        Json(ApiResponse {
+            data: serialized_order,
+        }),
+    )
+        .into_response())
 }

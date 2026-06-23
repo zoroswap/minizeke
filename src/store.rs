@@ -55,4 +55,8 @@ impl Store {
             .into_iter()
             .collect::<HashMap<AccountId, PoolState>>()
     }
+
+    pub fn users_with_index(&self) -> Vec<(AccountId, u16)> {
+        self.users.users_with_index()
+    }
 }

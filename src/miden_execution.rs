@@ -1,4 +1,9 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    env,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, anyhow};
 use miden_client::{
@@ -6,7 +11,7 @@ use miden_client::{
     account::AccountId,
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient},
+    rpc::Endpoint,
     testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     },
@@ -14,11 +19,12 @@ use miden_client::{
 };
 use miden_client_sqlite_store::SqliteStore;
 use tokio::sync::broadcast::error::RecvError;
+use tracing::{error, info};
 
 use crate::{
     execution::{Trade, make_exec_script},
-    message_broker::message_broker::{AmmEvent, MessageBroker, MessageBrokerEvent},
-    order::{OrderExecutionResult, OrderUpdate, Orders},
+    message_broker::message_broker::{AmmEvent, MessageBroker},
+    order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
     pool::{PoolState, deploy_pool, link_pool},
     user::{Users, get_users},
 };
@@ -37,20 +43,34 @@ pub struct MidenExecution {
 
 impl MidenExecution {
     pub async fn initialize(message_broker: Arc<MessageBroker>) -> Result<Self> {
-        let remote_prover = Arc::new(RemoteTransactionProver::new(
-            "https://tx-prover.devnet.miden.io",
-        ));
-        let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
+        const DEFAULT_TX_PROVER_URL: &str = "https://tx-prover.testnet.miden.io";
+        const DEFAULT_TX_PROVER_TIMEOUT_SECS: u64 = 30;
+
+        let tx_prover_url =
+            env::var("TX_PROVER_URL").unwrap_or_else(|_| DEFAULT_TX_PROVER_URL.to_string());
+        let tx_prover_timeout_secs = env::var("TX_PROVER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_TX_PROVER_TIMEOUT_SECS);
+
+        let remote_prover = Arc::new(
+            RemoteTransactionProver::new(tx_prover_url.clone())
+                .with_timeout(Duration::from_secs(tx_prover_timeout_secs)),
+        );
+
+        info!(
+            prover = %tx_prover_url,
+            timeout_secs = tx_prover_timeout_secs,
+            "Using Miden testnet (rpc.testnet.miden.io)"
+        );
+
+        let sqlite_store = SqliteStore::new("store.testnet.sqlite3".into()).await?;
         let store = Arc::new(sqlite_store);
-        let rpc_client = Arc::new(GrpcClient::new(&Endpoint::devnet(), 30_000));
         let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
-        // Build client with remote prover as default
-        let mut client = ClientBuilder::new()
-            //.in_debug_mode(true.into())
-            .prover(remote_prover.clone())
+        let mut client = ClientBuilder::for_testnet()
+            .prover(remote_prover)
             .store(store)
-            .rpc(rpc_client)
             .authenticator(keystore)
             .build()
             .await?;
@@ -71,7 +91,7 @@ impl MidenExecution {
 
         println!(
             "Pool deployed. BECH32: {}, HEX: {}",
-            pool.id().to_bech32(Endpoint::devnet().to_network_id()),
+            pool.id().to_bech32(Endpoint::testnet().to_network_id()),
             pool.id().to_hex()
         );
 
@@ -120,81 +140,88 @@ impl MidenExecution {
     pub async fn start(&mut self) -> Result<()> {
         let mut orders_rx = self.message_broker.subscribe_order_updates();
         let mut pool_state_rx = self.message_broker.subscribe_pool_state();
-        let mut amm_rx = self.message_broker.subscribe_amm();
+        let mut processed_batch_rx = self.message_broker.subscribe_processed_batch();
 
         loop {
-            let event = tokio::select! {
+            tokio::select! {
                 orders = orders_rx.recv() => {
                     match orders {
-                        Ok(ev) => MessageBrokerEvent::Order(ev),
+                        Ok(ev) => self.orders.apply_order_update(ev),
                         Err(RecvError::Lagged(n)) => {
                             eprintln!("orders lagged behind by {n} messages");
-                            continue;
                         }
-                        Err(RecvError::Closed) => {
-                            break;
-                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
                 pool_states = pool_state_rx.recv() => {
                     match pool_states {
-                        Ok(ev) => MessageBrokerEvent::PoolState(ev),
+                        Ok(ev) => {
+                            for (faucet_id, new_pool_state) in ev.pool_states.iter() {
+                                self.pool_states.insert(*faucet_id, *new_pool_state);
+                            }
+                        }
                         Err(RecvError::Lagged(n)) => {
                             eprintln!("pool_states lagged behind by {n} messages");
-                            continue;
                         }
-                        Err(RecvError::Closed) => {
-                            break;
-                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
-                amm = amm_rx.recv() => {
-                    match amm {
-                        Ok(ev) => MessageBrokerEvent::Amm(ev),
+                batch = processed_batch_rx.recv() => {
+                    match batch {
+                        Ok(orders) => self.handle_batch(orders).await,
                         Err(RecvError::Lagged(n)) => {
-                            eprintln!("amm lagged behind by {n} messages");
-                            continue;
+                            eprintln!("processed batch lagged behind by {n} messages");
                         }
-                        Err(RecvError::Closed) => {
-                            break;
-                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
-
             };
-            self.handle_event(event).await;
         }
         Err(anyhow!("Termination of miden execution."))
     }
 
-    async fn handle_event(&mut self, event: MessageBrokerEvent) {
-        match event {
-            MessageBrokerEvent::Order(ev) => {
-                self.orders.apply_order_update(ev);
+    /// Execute a processed batch on the pool. On failure, mark every order in the
+    /// batch as failed and still release the processing gate so the engine never
+    /// deadlocks waiting for a settlement that will never come.
+    async fn handle_batch(&mut self, orders: Vec<Order<Processed>>) {
+        info!(
+            count = orders.len(),
+            "Received processed batch for execution"
+        );
+        let started = Instant::now();
+        if let Err(e) = self.execute_on_pool(orders.clone()).await {
+            error!(
+                elapsed = ?started.elapsed(),
+                "Batch execution failed: {e:?}"
+            );
+            for order in orders {
+                let failed = order.failed(OrderFailureReason::ExecutionError, None);
+                let _ = self
+                    .message_broker
+                    .broadcast_order_update(OrderUpdate::Failed(failed));
             }
-            MessageBrokerEvent::PoolState(ev) => {
-                for (faucet_id, new_pool_state) in ev.pool_states.iter() {
-                    self.pool_states.insert(*faucet_id, *new_pool_state);
-                }
-            }
-            MessageBrokerEvent::Amm(ev) => match ev {
-                AmmEvent::OrdersProcessed => {
-                    if let Err(e) = self.execute_on_pool().await {
-                        eprintln!("[MIDEN EXECUTION] Error: {e:?}");
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
+            // Always release the gate held by the Processing engine, even on failure,
+            // so the pipeline never deadlocks.
+            let _ = self.message_broker.broadcast_amm(AmmEvent::OrdersExecuted);
         }
     }
 
-    async fn execute_on_pool(&mut self) -> Result<()> {
-        println!("[MIDEN EXECUTION] cycle {}", self.cycle);
+    async fn execute_on_pool(&mut self, orders: Vec<Order<Processed>>) -> Result<()> {
+        info!(
+            cycle = self.cycle,
+            count = orders.len(),
+            "Executing batch on pool"
+        );
         self.cycle += 1;
 
+        if orders.is_empty() {
+            // Nothing to execute; release the processing gate immediately.
+            self.message_broker
+                .broadcast_amm(AmmEvent::OrdersExecuted)?;
+            return Ok(());
+        }
+
         let instant = Instant::now();
-        let orders = self.orders.orders_processed();
 
         let mut trades = Vec::new();
         // let pool_state_deltas = vec![
@@ -208,7 +235,6 @@ impl MidenExecution {
         //     },
         // ];
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-        let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
 
         for order in &orders {
             let user_index = self
@@ -217,7 +243,7 @@ impl MidenExecution {
                 .ok_or(anyhow!("user not found"))?;
             let details = order.details();
             let buy_asset_index = if details.asset_out.eq(&asset0) { 0 } else { 1 };
-            let sell_asset_index = if details.asset_out.eq(&asset1) { 0 } else { 1 };
+            let sell_asset_index = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
             let trade = Trade {
                 user_index,
@@ -240,49 +266,72 @@ impl MidenExecution {
             .custom_script(tx_script)
             .build()?;
 
-        let tx_result = self
+        let res = self
             .client
-            .execute_transaction(self.pool_id, tx_req)
+            .submit_new_transaction(self.pool_id, tx_req)
             .await?;
-        let measurements = tx_result.executed_transaction().measurements();
-        println!(
-            "Cycle count: {}, auth: {}",
-            measurements.total_cycles(),
-            measurements.auth_procedure
-        );
-        let prove_started = Instant::now();
-        let proven_transaction = self
-            .client
-            .prove_transaction_with(&tx_result, self.client.prover())
-            .await?;
-        let prove_elapsed = prove_started.elapsed();
-        let submission_height = self
-            .client
-            .submit_proven_transaction(proven_transaction, &tx_result)
-            .await?;
-        self.client
-            .apply_transaction(&tx_result, submission_height)
-            .await?;
-        let tx_hash = tx_result.id().to_string();
-        println!("Elapsed: {prove_elapsed:?}");
-        self.client.sync_state().await?;
 
+        let tx_hash = res.to_hex().to_string();
+
+        // let tx_result = self
+        //     .client
+        //     .execute_transaction(self.pool_id, tx_req)
+        //     .await?;
+        // let measurements = tx_result.executed_transaction().measurements();
+        // let tx_hash = tx_result.id().to_string();
+        // info!(
+        //     %tx_hash,
+        //     cycles = measurements.total_cycles(),
+        //     auth = measurements.auth_procedure,
+        //     "Transaction executed locally; proving (remote)"
+        // );
+
+        // let prove_started = Instant::now();
+        // let proven_transaction = self
+        //     .client
+        //     .prove_transaction_with(&tx_result, self.client.prover())
+        //     .await?;
+        // let prove_elapsed = prove_started.elapsed();
+        // info!(%tx_hash, prove_elapsed = ?prove_elapsed, "Proven; submitting to node");
+
+        // let submission_height = self
+        //     .client
+        //     .submit_proven_transaction(proven_transaction, &tx_result)
+        //     .await?;
+        // info!(%tx_hash, ?submission_height, "Submitted to node; applying locally");
+
+        // self.client
+        //     .apply_transaction(&tx_result, submission_height)
+        //     .await?;
+        // info!(%tx_hash, "Applied locally; syncing client state");
+
+        self.client.sync_state().await?;
+        info!(%tx_hash, "Client state synced");
+
+        let mut executed_count = 0usize;
         for order in orders {
             let details = order.details();
+            let executed = order.executed(
+                tx_hash.clone(),
+                OrderExecutionResult {
+                    amount_out: details.min_amount_out,
+                },
+            );
             self.message_broker
-                .broadcast_order_update(OrderUpdate::Executed(order.executed(
-                    tx_hash.clone(),
-                    OrderExecutionResult {
-                        amount_out: details.min_amount_out,
-                    },
-                )))?;
+                .broadcast_order_update(OrderUpdate::Executed(executed))?;
+            executed_count += 1;
         }
 
+        // Release the gate held by the Processing engine. We do not wait for
+        // on-chain settlement; the order lifecycle ends at Executed.
         self.message_broker
             .broadcast_amm(AmmEvent::OrdersExecuted)?;
 
-        self.message_broker
-            .broadcast_amm(AmmEvent::StartProcessing)?;
+        info!(
+            count = executed_count,
+            elapsed = ?instant.elapsed(),
+            "Batch executed"
+        );
 
         Ok(())
     }

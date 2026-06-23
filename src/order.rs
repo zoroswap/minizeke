@@ -161,6 +161,7 @@ pub struct OrderExecutionResult {
 pub enum OrderFailureReason {
     Expired,
     MinOutNotMet,
+    ExecutionError,
 }
 
 impl From<Order<Created>> for OrderUpdate {
@@ -358,7 +359,7 @@ impl Orders {
                 self.executed.insert(order.id, order);
             }
             OrderUpdate::Settled(order) => {
-                self.processed.remove(&order.id);
+                self.executed.remove(&order.id);
                 self.settled.insert(order.id, order);
             }
             OrderUpdate::Failed(order) => {

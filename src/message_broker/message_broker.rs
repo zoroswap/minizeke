@@ -6,7 +6,10 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use crate::{order::OrderUpdate, pool::PoolState};
+use crate::{
+    order::{Order, OrderUpdate, Processed},
+    pool::PoolState,
+};
 
 #[derive(Debug, Clone)]
 pub struct PoolStateEvent {
@@ -61,6 +64,7 @@ pub struct MessageBroker {
     pub stats_tx: broadcast::Sender<StatsEvent>,
     pub user_tx: broadcast::Sender<UserEvent>,
     pub amm_tx: broadcast::Sender<AmmEvent>,
+    pub processed_batch_tx: broadcast::Sender<Vec<Order<Processed>>>,
 }
 
 impl MessageBroker {
@@ -73,6 +77,7 @@ impl MessageBroker {
         let (stats_tx, _) = broadcast::channel(10);
         let (amm_tx, _) = broadcast::channel(100);
         let (user_tx, _) = broadcast::channel(100);
+        let (processed_batch_tx, _) = broadcast::channel(100);
 
         Self {
             order_updates_tx,
@@ -81,6 +86,7 @@ impl MessageBroker {
             stats_tx,
             amm_tx,
             user_tx,
+            processed_batch_tx,
         }
     }
 
@@ -153,6 +159,22 @@ impl MessageBroker {
                 Ok(())
             }
         }
+    }
+
+    /// Broadcast a batch of processed orders to the execution engine
+    pub fn broadcast_processed_batch(&self, batch: Vec<Order<Processed>>) -> Result<()> {
+        match self.processed_batch_tx.send(batch) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!("Failed to broadcast processed batch: {}", e);
+                Ok(())
+            }
+        }
+    }
+
+    /// Subscribe to processed order batches
+    pub fn subscribe_processed_batch(&self) -> broadcast::Receiver<Vec<Order<Processed>>> {
+        self.processed_batch_tx.subscribe()
     }
 
     /// Subscribe to order updates

@@ -28,6 +28,14 @@ mod websocket;
 fn main() {
     dotenv().ok();
 
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,minizeke=debug")),
+        )
+        .with_target(false)
+        .init();
+
     let message_broker = Arc::new(MessageBroker::new());
 
     println!("[INIT] Initializing Miden components");
