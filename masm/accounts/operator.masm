@@ -17,12 +17,9 @@ const DEPOSITOR_KEYS_SLOT = word("operator::depositor_keys")
 # exists). Plan 3 must move the nonce into per-depositor state (e.g. alongside the
 # commitment in the map) and re-bound it to u64. See the design spec follow-on section.
 
-const LAST_NONCE_SLOT = word("signed_intents::operator::last_nonce")
-const LAST_AUTH_SLOT  = word("signed_intents::operator::last_authorized")
 
-
-const LAST_NONCE_SLOT = word("operator::last_nonce")
-const LAST_AUTH_SLOT  = word("operator::last_authorized")
+#const LAST_NONCE_SLOT = word("operator::last_nonce")
+#const LAST_AUTH_SLOT  = word("operator::last_authorized")
 
 
 # Number of intent felts the sponge absorbs, and the capacity element that initializes the
@@ -151,8 +148,8 @@ pub proc verfiy_signature
     # the operand stack is deeper than 16. A `call`ed procedure must return at depth exactly 16;
     # `sys::truncate_stack` drops the deep overflow while preserving the (irrelevant) top 16.
     padw loc_loadw_le.4 padw locl_loadw_le.0
-    exec.sys::truncate_stack
-    # => [pad(16)]
+    #exec.sys::truncate_stack
+    # => [sell_amount, buy_amount, user_suf, user_pre, sell_suf, sell_pre, buy_suf, buy_pre, pad(8)]
 end
 
 #! Extracts the 4-element digest (the rate-0 word) from a Poseidon2 sponge state and drops the
