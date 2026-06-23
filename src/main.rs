@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     println!("Client ready.");
 
     // spawn the user accounts
-    let users = get_users(10, &mut client).await?;
+    let users = get_users(4, &mut client).await?;
 
     let pool_0_balance = 10_000_000;
     let pool_1_balance = 10_000_000;

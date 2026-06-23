@@ -10,7 +10,6 @@ use miden::protocol::native_account
 #   asset-only KEY = [asset_suffix, asset_prefix, 0, 0]
 
 # STORAGE SLOTS
-const USER_ASSET_BALANCES_SLOT = word("pool::user_asset_balances")
 const USER_00_BALANCE_SLOT = word("pool::user_00_balance")
 const USER_01_BALANCE_SLOT = word("pool::user_01_balance")
 const USER_10_BALANCE_SLOT = word("pool::user_10_balance")
@@ -19,6 +18,7 @@ const USER_20_BALANCE_SLOT = word("pool::user_20_balance")
 const USER_21_BALANCE_SLOT = word("pool::user_21_balance")
 const USER_30_BALANCE_SLOT = word("pool::user_30_balance")
 const USER_31_BALANCE_SLOT = word("pool::user_31_balance")
+
 
 const POOL_0_BALANCE_SLOT = word("pool::pool_0_state")
 const POOL_1_BALANCE_SLOT = word("pool::pool_1_state")
@@ -35,28 +35,29 @@ const ERR_OVERFLOW = "Overflow"
 # USER ASSET BALANCE
 # ----------------------------------------------------------------------------------------------
 
+
 #! USER_ASSET_BALANCES(assetId, userId) += amount
 #! Inputs:  [amount]
 #! Outputs: []
-pub proc add_to_user00_balance
+pub proc add_to_user0_balance
     push.USER_00_BALANCE_SLOT[0..2]
     # => [amount, slot_suffix, slot_prefix]
     exec.add_to_storage_item
     # => []
 end
 
-pub proc sub_from_user00_balance
+pub proc sub_from_user0_balance
     push.USER_00_BALANCE_SLOT[0..2]
     # => [amount, slot_suffix, slot_prefix]
     exec.sub_from_storage_item
     # => []
 end
 
-pub proc add_to_user01_balance(amount: felt)
+pub proc add_to_user1_balance(amount: felt)
     push.USER_01_BALANCE_SLOT[0..2] exec.add_to_storage_item
 end
 
-pub proc sub_from_user01_balance
+pub proc sub_from_user1_balance
     push.USER_01_BALANCE_SLOT[0..2] exec.sub_from_storage_item
 end
 
@@ -108,11 +109,11 @@ pub proc sub_from_user31_balance
     push.USER_31_BALANCE_SLOT[0..2] exec.sub_from_storage_item
 end
 
-pub proc get_user00_balance
+pub proc get_user0_balance
     push.USER_00_BALANCE_SLOT[0..2] exec.get_storage_item
 end
 
-pub proc get_user01_balance
+pub proc get_user1_balance
     push.USER_01_BALANCE_SLOT[0..2] exec.get_storage_item
 end
 
@@ -191,90 +192,6 @@ pub proc get_pool_1_balance
     # => [poolBalance]
 end
 
-# ----------------------------------------------------------------------------------------------
-# SWAP
-# ----------------------------------------------------------------------------------------------
-
-
-pub proc execute_swap
-    # => [sell_index, sell_amount, buy_index, , buy_amount]
-    dup eq.0
-    if.true
-        drop exec.sub_from_user00_balance
-    else 
-        dup eq.1
-        if.true
-            drop exec.sub_from_user01_balance
-        else 
-            dup eq.10
-            if.true
-                drop exec.sub_from_user10_balance
-            else 
-                dup eq.11
-                if.true
-                    drop exec.sub_from_user11_balance
-                else
-                    dup eq.20
-                    if.true
-                        drop exec.sub_from_user20_balance
-                    else 
-                        dup eq.21
-                        if.true
-                            drop exec.sub_from_user21_balance
-                        else 
-                            ## dup here and drop in true branche and continue checking
-                            eq.30
-                            if.true
-                                exec.sub_from_user30_balance
-                            else 
-                                exec.sub_from_user31_balance
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    # => [sell_index, sell_amount]
-    dup eq.0
-    if.true
-        drop exec.add_to_user00_balance
-    else 
-        dup eq.1
-        if.true
-            drop exec.add_to_user01_balance
-        else 
-            dup eq.10  
-            if.true
-                drop exec.add_to_user10_balance
-            else 
-                dup eq.11
-                if.true
-                    drop exec.add_to_user11_balance
-                else 
-                    dup eq.20
-                    if.true
-                        drop exec.add_to_user20_balance
-                    else 
-                        dup eq.21
-                        if.true
-                            drop exec.add_to_user21_balance
-                        else 
-                            ## dup here and drop in true branche and continue checking
-                            eq.30
-                            if.true
-                                drop exec.add_to_user30_balance
-                            else 
-                                exec.add_to_user31_balance
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    # => []
-end
 
 # ----------------------------------------------------------------------------------------------
 # POOL BALANCE ACCOUNTING
