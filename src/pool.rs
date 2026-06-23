@@ -147,8 +147,6 @@ pub fn build_pool_component(
             StorageSlot::with_value(slot_names[7].clone(), user_balance.into()),
             StorageSlot::with_value(slot_names[8].clone(), user_balance.into()),
             StorageSlot::with_value(slot_names[9].clone(), user_balance.into()),
-            StorageSlot::with_value(n("pool::pool_0_state"), pool_balance_0.into()),
-            StorageSlot::with_value(n("pool::pool_1_state"), pool_balance_1.into()),
         ],
         AccountComponentMetadata::new("zoro_miden::pool"),
     )?;

@@ -11,8 +11,6 @@ use miden::protocol::native_account
 
 # STORAGE SLOTS
 
-const POOL_0_BALANCE_SLOT = word("pool::pool_0_state")
-const POOL_1_BALANCE_SLOT = word("pool::pool_1_state")
 
 const USER_0_BALANCE_SLOT = word("pool::user_0_balance")
 const USER_1_BALANCE_SLOT = word("pool::user_1_balance")
@@ -48,7 +46,6 @@ end
 #! Inputs:  [slot_prefix, slot_suffix, idx, amount]
 #! Outputs: []
 pub proc sub_from_user_balance
-    # => [amount, slot_suffix, slot_prefix]
     exec.sub_from_storage_item_at_idx
     # => []
 end
@@ -70,48 +67,48 @@ end
 #! Outputs: []
 
 
-pub proc add_to_pool_0_balance
-    push.POOL_0_BALANCE_SLOT[0..2] exec.add_to_storage_item
-end
-
-pub proc sub_from_pool_0_balance
-    push.POOL_0_BALANCE_SLOT[0..2] exec.sub_from_storage_item
-end
-
-pub proc set_pool_0_balance(amount: felt)
-    push.0.0.0 movup.3
-    push.POOL_0_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
-end
-
-pub proc set_pool_1_balance(amount: felt)
-    push.0.0.0 movup.3
-    push.POOL_1_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
-end
-
-pub proc add_to_pool_1_balance
-    push.POOL_1_BALANCE_SLOT[0..2] exec.add_to_storage_item
-end
-
-pub proc sub_from_pool_1_balance
-    push.POOL_1_BALANCE_SLOT[0..2] exec.sub_from_storage_item
-end
-
-
-
-pub proc get_pool_0_balance
-    push.POOL_0_BALANCE_SLOT[0..2]
-    exec.active_account::get_item
-    movdn.3 drop drop drop
-    # => [poolBalance]
-end
-
-
-pub proc get_pool_1_balance
-    push.POOL_1_BALANCE_SLOT[0..2]
-    exec.active_account::get_item
-    movdn.3 drop drop drop
-    # => [poolBalance]
-end
+#pub proc add_to_pool_0_balance
+#    push.POOL_0_BALANCE_SLOT[0..2] exec.add_to_storage_item
+#end
+#
+#pub proc sub_from_pool_0_balance
+#    push.POOL_0_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+#end
+#
+#pub proc set_pool_0_balance(amount: felt)
+#    push.0.0.0 movup.3
+#    push.POOL_0_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
+#end
+#
+#pub proc set_pool_1_balance(amount: felt)
+#    push.0.0.0 movup.3
+#    push.POOL_1_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
+#end
+#
+#pub proc add_to_pool_1_balance
+#    push.POOL_1_BALANCE_SLOT[0..2] exec.add_to_storage_item
+#end
+#
+#pub proc sub_from_pool_1_balance
+#    push.POOL_1_BALANCE_SLOT[0..2] exec.sub_from_storage_item
+#end
+#
+#
+#
+#pub proc get_pool_0_balance
+#    push.POOL_0_BALANCE_SLOT[0..2]
+#    exec.active_account::get_item
+#    movdn.3 drop drop drop
+#    # => [poolBalance]
+#end
+#
+#
+#pub proc get_pool_1_balance
+#    push.POOL_1_BALANCE_SLOT[0..2]
+#    exec.active_account::get_item
+#    movdn.3 drop drop drop
+#    # => [poolBalance]
+#end
 
 # ----------------------------------------------------------------------------------------------
 # SWAP
@@ -119,6 +116,7 @@ end
 
 
 pub proc execute_swap
+    debug.stack
     # => [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount]
     exec.sub_from_user_balance
     # => [BUY_KEY]
@@ -211,7 +209,7 @@ const BALANCES_TEMP_VALUE = 0
 #const BAL_4 = 3;
 
 pub proc sub_from_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt, decrement_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE dropw
+    dup.1 dup.1 debug.stack.4 exec.active_account::get_item push.344 debug.stack.1 drop mem_storew_le.BALANCES_TEMP_VALUE dropw
     # => [ prefix, suffix, idx, decrement_by]
     movup.2 dup
     # => [idx, idx, prefix, suffix, decrement_by]

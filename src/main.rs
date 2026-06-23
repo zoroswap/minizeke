@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
 
     // Build client with remote prover as default
     let mut client = ClientBuilder::new()
-        //.in_debug_mode(true.into())
+        // .in_debug_mode(true.into())
         .prover(remote_prover.clone())
         .store(store)
         .rpc(rpc_client)
@@ -82,6 +82,15 @@ async fn main() -> Result<()> {
     client.submit_new_transaction(pool.id(), tx).await?;
     client.sync_state().await?;
 
+    let storage = client.get_account_storage(pool.id()).await?;
+    for slot in storage.slots() {
+        let id = slot.id();
+        println!("name: {}", slot.name().as_str());
+        println!("prefix: {}", id.prefix());
+        println!("suffix: {}", id.suffix());
+        println!("type: {:?}", slot.slot_type());
+        println!("value/root: {:?}", slot.value());
+    }
     // sleep(Duration::from_secs(4));
 
     println!("Pool touched.");
