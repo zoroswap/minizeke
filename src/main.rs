@@ -30,38 +30,39 @@ fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,minizeke=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,minizeke=debug,miden_core=off,log=warn")
+            }),
         )
         .with_target(false)
         .init();
 
     let message_broker = Arc::new(MessageBroker::new());
-
-    println!("[INIT] Initializing Miden components");
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|err| panic!("Failed building runtime for trading engine: {err:?}"));
-    let mut miden_execution = rt.block_on(async {
-        MidenExecution::initialize(message_broker.clone())
-            .await
-            .unwrap()
-    });
-
-    let initial_users = miden_execution.users();
-    let initial_pool_states = miden_execution.pool_states();
-    let pool_id = miden_execution.pool_id();
+    let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::scope(|s| {
+        let message_broker_for_miden = message_broker.clone();
         s.spawn(move || {
             let rt = Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap_or_else(|err| {
-                    panic!("Failed building runtime for trading engine: {err:?}")
+                    panic!("Failed building runtime for Miden execution: {err:?}")
                 });
-            rt.block_on(async {
+            rt.block_on(async move {
+                println!("[INIT] Initializing Miden components");
+                let mut miden_execution = MidenExecution::initialize(message_broker_for_miden)
+                    .await
+                    .unwrap();
+
+                init_tx
+                    .send((
+                        miden_execution.users(),
+                        miden_execution.pool_states(),
+                        miden_execution.pool_id(),
+                    ))
+                    .unwrap();
+
                 println!("[RUN] Starting Miden execution");
                 if let Err(e) = miden_execution.start().await {
                     eprintln!("Critical error on miden_execution: {e}. Exiting with status 1.");
@@ -69,6 +70,10 @@ fn main() {
                 }
             });
         });
+
+        let (initial_users, initial_pool_states, pool_id) = init_rx
+            .recv()
+            .expect("Miden init thread failed before sending init data");
 
         let _ = main_tokio(initial_users, initial_pool_states, pool_id, message_broker);
     });

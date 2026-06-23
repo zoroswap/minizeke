@@ -32,6 +32,7 @@ use crate::{
 pub struct MidenExecution {
     client: Client<FilesystemKeyStore>,
     message_broker: Arc<MessageBroker>,
+    prover_timeout: Duration,
     cycle: u64,
     asset0: AccountId,
     asset1: AccountId,
@@ -67,6 +68,8 @@ impl MidenExecution {
         let sqlite_store = SqliteStore::new("store.testnet.sqlite3".into()).await?;
         let store = Arc::new(sqlite_store);
         let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
+
+        let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
 
         let mut client = ClientBuilder::for_testnet()
             .prover(remote_prover)
@@ -129,6 +132,7 @@ impl MidenExecution {
             pool_id: pool.id(),
             client,
             message_broker,
+            prover_timeout,
             asset0,
             asset1,
             users,
@@ -266,44 +270,25 @@ impl MidenExecution {
             .custom_script(tx_script)
             .build()?;
 
-        let res = self
-            .client
-            .submit_new_transaction(self.pool_id, tx_req)
-            .await?;
+        let submit_started = Instant::now();
+        let pool_id = self.pool_id;
+        let res = tokio::time::timeout(
+            self.prover_timeout,
+            self.client.submit_new_transaction(pool_id, tx_req),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "transaction prove/submit timed out after {:?}",
+                self.prover_timeout
+            )
+        })??;
+        info!(
+            elapsed = ?submit_started.elapsed(),
+            "Transaction proven and submitted"
+        );
 
         let tx_hash = res.to_hex().to_string();
-
-        // let tx_result = self
-        //     .client
-        //     .execute_transaction(self.pool_id, tx_req)
-        //     .await?;
-        // let measurements = tx_result.executed_transaction().measurements();
-        // let tx_hash = tx_result.id().to_string();
-        // info!(
-        //     %tx_hash,
-        //     cycles = measurements.total_cycles(),
-        //     auth = measurements.auth_procedure,
-        //     "Transaction executed locally; proving (remote)"
-        // );
-
-        // let prove_started = Instant::now();
-        // let proven_transaction = self
-        //     .client
-        //     .prove_transaction_with(&tx_result, self.client.prover())
-        //     .await?;
-        // let prove_elapsed = prove_started.elapsed();
-        // info!(%tx_hash, prove_elapsed = ?prove_elapsed, "Proven; submitting to node");
-
-        // let submission_height = self
-        //     .client
-        //     .submit_proven_transaction(proven_transaction, &tx_result)
-        //     .await?;
-        // info!(%tx_hash, ?submission_height, "Submitted to node; applying locally");
-
-        // self.client
-        //     .apply_transaction(&tx_result, submission_height)
-        //     .await?;
-        // info!(%tx_hash, "Applied locally; syncing client state");
 
         self.client.sync_state().await?;
         info!(%tx_hash, "Client state synced");
