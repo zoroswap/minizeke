@@ -4,9 +4,12 @@ use anyhow::Result;
 use dotenv::dotenv;
 use miden_client::account::AccountId;
 use tokio::runtime::Builder;
+use tokio::sync::broadcast::error::RecvError;
+use tracing::warn;
 
 use crate::{
-    message_broker::message_broker::MessageBroker, miden_execution::MidenExecution,
+    message_broker::message_broker::{MessageBroker, StatsEvent},
+    miden_execution::MidenExecution,
     oracle_sse::OracleSSEClient, pool::PoolState, processing::Processing, store::Store,
     user::Users, websocket::connection_manager::ConnectionManager,
 };
@@ -129,6 +132,28 @@ async fn main_tokio(
     // Start event forwarding from MessageBroker to WebSocket clients
     println!("[RUN] Starting WebSocket event forwarding");
     connection_manager.clone().start_event_forwarding();
+
+    println!("[RUN] Starting stats updater");
+    {
+        let store_for_stats = store.clone();
+        let message_broker_for_stats = message_broker.clone();
+        tokio::spawn(async move {
+            let mut rx = message_broker_for_stats.subscribe_order_updates();
+            loop {
+                match rx.recv().await {
+                    Ok(update) => {
+                        store_for_stats.apply_order_update(update);
+                        let stats = store_for_stats.order_stats();
+                        let _ = message_broker_for_stats.broadcast_stats(StatsEvent::now(stats));
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!("stats updater lagged behind by {n} messages");
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 
     println!("[RUN] Starting ZEKE server");
     api::start(connection_manager, message_broker, store).await?;

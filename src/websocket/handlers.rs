@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     api::AppState,
-    message_broker::messages::{ClientMessage, ServerMessage},
+    message_broker::messages::{ClientMessage, ServerMessage, SubscriptionChannel},
 };
 
 /// WebSocket upgrade handler
@@ -98,7 +98,16 @@ async fn handle_client_message(msg: ClientMessage, conn_id: Uuid, state: &AppSta
                 state.connection_manager.subscribe(conn_id, channel.clone());
                 state
                     .connection_manager
-                    .send_to_connection(conn_id, ServerMessage::Subscribed { channel });
+                    .send_to_connection(conn_id, ServerMessage::Subscribed { channel: channel.clone() });
+
+                if matches!(channel, SubscriptionChannel::Stats) {
+                    let stats = state.store.order_stats();
+                    let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+                    state.connection_manager.send_to_connection(
+                        conn_id,
+                        ServerMessage::stats_update(stats, timestamp),
+                    );
+                }
             }
         }
         ClientMessage::Unsubscribe { channels } => {

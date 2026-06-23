@@ -41,6 +41,10 @@ impl Store {
         }
     }
 
+    pub fn order_stats(&self) -> crate::order::OrderStats {
+        self.orders.stats()
+    }
+
     pub fn get_order(&self, id: Uuid) -> Option<OrderUpdate> {
         self.orders.get_order(&id)
     }

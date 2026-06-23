@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{message_broker::message_broker::AmmEvent, order::OrderStatus, pool::PoolState};
+use crate::{
+    message_broker::message_broker::AmmEvent,
+    order::{OrderStats, OrderStatus, OrderStatusCounts},
+    pool::PoolState,
+};
 
 /// Messages sent from client to server
 #[derive(Debug, Deserialize, Clone)]
@@ -41,8 +45,10 @@ pub enum ServerMessage {
         timestamp: u64,
     },
     StatsUpdate {
+        total_orders: usize,
         open_orders: usize,
         closed_orders: usize,
+        by_status: OrderStatusCounts,
         timestamp: u64,
     },
     UserUpdate {
@@ -132,7 +138,32 @@ impl SubscriptionChannel {
                 SubscriptionChannel::OraclePrices { .. },
             ) => true,
             (SubscriptionChannel::Stats, SubscriptionChannel::Stats) => true,
+            (SubscriptionChannel::AmmEvent {}, SubscriptionChannel::AmmEvent {}) => true,
+            (
+                SubscriptionChannel::UserEvent {
+                    user_id: Some(id1),
+                },
+                SubscriptionChannel::UserEvent {
+                    user_id: Some(id2),
+                },
+            ) => id1 == id2,
+            (
+                SubscriptionChannel::UserEvent { user_id: None },
+                SubscriptionChannel::UserEvent { .. },
+            ) => true,
             _ => false,
+        }
+    }
+}
+
+impl ServerMessage {
+    pub fn stats_update(stats: OrderStats, timestamp: u64) -> Self {
+        Self::StatsUpdate {
+            total_orders: stats.total,
+            open_orders: stats.open,
+            closed_orders: stats.closed,
+            by_status: stats.by_status,
+            timestamp,
         }
     }
 }
@@ -171,6 +202,30 @@ mod tests {
         assert!(json.contains("OrderUpdate"));
         assert!(json.contains("executed"));
         assert!(json.contains("order_id"));
+    }
+
+    #[test]
+    fn test_stats_update_serialization() {
+        use crate::order::{OrderStats, OrderStatusCounts};
+
+        let stats = OrderStats {
+            total: 3,
+            open: 2,
+            closed: 1,
+            by_status: OrderStatusCounts {
+                created: 1,
+                processing: 1,
+                processed: 0,
+                executed: 1,
+                settled: 0,
+                failed: 0,
+            },
+        };
+        let msg = ServerMessage::stats_update(stats, 1234567890);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("StatsUpdate"));
+        assert!(json.contains("total_orders"));
+        assert!(json.contains("\"created\":1"));
     }
 
     #[test]

@@ -365,11 +365,7 @@ impl ConnectionManager {
                 loop {
                     match rx.recv().await {
                         Ok(event) => {
-                            let message = ServerMessage::StatsUpdate {
-                                open_orders: event.open_orders,
-                                closed_orders: event.closed_orders,
-                                timestamp: event.timestamp,
-                            };
+                            let message = ServerMessage::stats_update(event.stats, event.timestamp);
                             conn_mgr.broadcast_to_channel(&SubscriptionChannel::Stats, message);
                         }
                         Err(RecvError::Lagged(n)) => warn!("Stats lagged, skipped {n}"),
@@ -392,7 +388,7 @@ impl ConnectionManager {
                     match rx.recv().await {
                         Ok(event) => {
                             let message = ServerMessage::AmmUpdate { status: event };
-                            conn_mgr.broadcast_to_channel(&SubscriptionChannel::Stats, message);
+                            conn_mgr.broadcast_to_channel(&SubscriptionChannel::AmmEvent {}, message);
                         }
                         Err(RecvError::Lagged(n)) => warn!("Amm lagged, skipped {n}"),
                         Err(RecvError::Closed) => {
@@ -413,16 +409,26 @@ impl ConnectionManager {
                 loop {
                     match rx.recv().await {
                         Ok(event) => {
+                            let user_id = event.user_id.to_hex();
                             let message = ServerMessage::UserUpdate {
-                                user_id: event.user_id.to_hex(),
+                                user_id: user_id.clone(),
                                 faucet_id: event.faucet_id.to_hex(),
-                                amount: event.amount, // new balance
+                                amount: event.amount,
                             };
-                            conn_mgr.broadcast_to_channel(&SubscriptionChannel::Stats, message);
+                            conn_mgr.broadcast_to_channel(
+                                &SubscriptionChannel::UserEvent { user_id: None },
+                                message.clone(),
+                            );
+                            conn_mgr.broadcast_to_channel(
+                                &SubscriptionChannel::UserEvent {
+                                    user_id: Some(user_id),
+                                },
+                                message,
+                            );
                         }
-                        Err(RecvError::Lagged(n)) => warn!("Amm lagged, skipped {n}"),
+                        Err(RecvError::Lagged(n)) => warn!("User updates lagged, skipped {n}"),
                         Err(RecvError::Closed) => {
-                            error!("Amm channel closed");
+                            error!("User channel closed");
                             break;
                         }
                     }

@@ -80,6 +80,7 @@ pub async fn start(
     println!("📡 Available endpoints:");
     println!("  GET  /health                    - Health check");
     println!("  GET  /users                     - List engine user account IDs");
+    println!("  GET  /stats                     - Order count statistics");
     println!("  POST /orders/new                - Submit a new order");
     println!("  POST /withdraw/submit           - Submit a new withdrawal");
     println!("  POST /faucets/mint              - Mint from a faucet");
@@ -103,6 +104,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/pools/info", get(pool_info))
         .route("/users", get(users))
+        .route("/stats", get(stats))
         .route("/ws", get(websocket_handler))
         .route("/orders/new", post(order_new))
         .layer(CorsLayer::permissive())
@@ -139,6 +141,25 @@ async fn users(State(state): State<AppState>) -> impl IntoResponse {
         HeaderValue::from_static("max-age=60, must-revalidate"),
     );
     (headers, Json(serde_json::json!({ "users": users })))
+}
+
+async fn stats(State(state): State<AppState>) -> impl IntoResponse {
+    let stats = state.store.order_stats();
+    let timestamp = Utc::now().timestamp_millis() as u64;
+    let response = serde_json::json!({
+        "total_orders": stats.total,
+        "open_orders": stats.open,
+        "closed_orders": stats.closed,
+        "by_status": stats.by_status,
+        "timestamp": timestamp,
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    (headers, Json(response))
 }
 
 async fn pool_info(State(state): State<AppState>) -> impl IntoResponse {

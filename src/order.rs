@@ -430,6 +430,43 @@ impl Orders {
             .map(|(_, v)| v)
             .collect::<Vec<Order<Failed>>>()
     }
+
+    pub fn stats(&self) -> OrderStats {
+        let by_status = OrderStatusCounts {
+            created: self.new.len(),
+            processing: self.in_processing.len(),
+            processed: self.processed.len(),
+            executed: self.executed.len(),
+            settled: self.settled.len(),
+            failed: self.failed.len(),
+        };
+        let open = by_status.created + by_status.processing + by_status.processed;
+        let closed = by_status.executed + by_status.settled + by_status.failed;
+        OrderStats {
+            total: open + closed,
+            open,
+            closed,
+            by_status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct OrderStatusCounts {
+    pub created: usize,
+    pub processing: usize,
+    pub processed: usize,
+    pub executed: usize,
+    pub settled: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct OrderStats {
+    pub total: usize,
+    pub open: usize,
+    pub closed: usize,
+    pub by_status: OrderStatusCounts,
 }
 
 #[derive(Debug, Serialize)]

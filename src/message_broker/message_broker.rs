@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use chrono::Utc;
 use miden_client::account::AccountId;
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::{
-    order::{Order, OrderUpdate, Processed},
+    order::{Order, OrderStats, OrderUpdate, Processed},
     pool::PoolState,
 };
 
@@ -27,9 +28,17 @@ pub struct OraclePriceEvent {
 
 #[derive(Debug, Clone)]
 pub struct StatsEvent {
-    pub open_orders: usize,
-    pub closed_orders: usize,
+    pub stats: OrderStats,
     pub timestamp: u64,
+}
+
+impl StatsEvent {
+    pub fn now(stats: OrderStats) -> Self {
+        Self {
+            stats,
+            timestamp: Utc::now().timestamp_millis() as u64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
