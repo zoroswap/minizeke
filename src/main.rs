@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod execution;
+mod operator;
 mod pool;
 mod user;
 

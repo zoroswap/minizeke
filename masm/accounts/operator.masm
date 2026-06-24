@@ -8,7 +8,9 @@ use miden::protocol::native_account
 use miden::protocol::tx
 
 # Named storage slots. The first two felts of the hashed name address the slot.
-const DEPOSITOR_KEYS_SLOT = word("operator::depositor_keys")
+#const DEPOSITOR_0_KEY_SLOT = word("operator::depositor_0_keys")
+#const DEPOSITOR_1_KEY_SLOT = word("operator::depositor_1_keys")
+const DEPOSITOR_KEY_SLOT = word("operator::depositor_keys")
 # KNOWN PLAN-2 LIMITATION: last_nonce is a SINGLE GLOBAL slot, NOT per-depositor.
 # The replay guard is monotonic across ALL depositors, so it never weakens replay
 # protection or fund safety (authorization is per-key via the map). But it is a
@@ -40,7 +42,7 @@ const ERR_EXPIRED = "operator: intent has expired (block height >= expiry_block)
 #! Invocation: call
 @locals(12)
 pub proc verfiy_signature
-#! Inputs:  [ sell_amount, buy_amount, user_suf, user_pre, sell_suf, sell_pre, buy_suf, buy_pre, pad(8)]
+#! Inputs:  [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount, pad(8)]
     # We work only on the top 8 inputs (the full canonical intent); the call padding underneath
     # is left untouched (the transaction kernel manages it at the call boundary, as in the
     # standard account-component procedures).
