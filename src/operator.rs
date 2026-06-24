@@ -132,8 +132,6 @@ pub fn deploy_operator(chain: &mut MockChain, depositors: &[(Word, Word)]) -> De
     *chain = builder
         .build()
         .expect("chain must build with operator account");
-
-    DeployedOperator { account_id }
 }
 
 pub fn build_pool_component(
