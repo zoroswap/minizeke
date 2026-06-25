@@ -1,5 +1,7 @@
+use miden_client::account::StorageSlotId;
+
 pub struct Trade {
-    pub user_index: u16,
+    pub user: StorageSlotId,
     pub sell_asset_index: u64,
     pub buy_asset_index: u64,
     pub sell_amount: u64,
@@ -14,8 +16,6 @@ pub struct PoolStateDelta {
 pub fn make_exec_script(trades: Vec<Trade>) -> String {
     let mut script = r#"
 use zoro_miden::pool::execute_swap
-use zoro_miden::pool::set_pool_0_balance
-use zoro_miden::pool::set_pool_1_balance
 use miden::core::sys
 
 begin
@@ -24,17 +24,19 @@ begin
 
     for trade in trades {
         let Trade {
-            user_index,
+            user,
             sell_asset_index,
             buy_asset_index,
             sell_amount,
             buy_amount,
         } = trade;
 
-        let sell_index = user_index as u64 * 10 + sell_asset_index;
-        let buy_index = user_index as u64 * 10 + buy_asset_index;
+        let user_suffix: u64 = user.suffix().as_canonical_u64();
+        let user_prefix: u64 = user.prefix().as_canonical_u64();
+
         let trade_string = format!(
-            "push.{buy_amount}.{buy_index}.{sell_amount}.{sell_index} call.execute_swap\n",
+            // "push.{buy_amount}.{buy_asset_index}.{user_suffix}.{user_prefix}.{sell_amount}.{sell_asset_index}.{user_suffix}.{user_prefix} call.execute_swap\n",
+            "push.{buy_amount}.{buy_asset_index}.{user_prefix}.{user_suffix}.{sell_amount}.{sell_asset_index}.{user_prefix}.{user_suffix} call.execute_swap\n",
         );
 
         script.push_str(&trade_string);

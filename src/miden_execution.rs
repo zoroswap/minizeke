@@ -25,7 +25,7 @@ use crate::{
     execution::{Trade, make_exec_script},
     message_broker::message_broker::{AmmEvent, MessageBroker},
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolState, deploy_pool, link_pool},
+    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_pool},
     user::{Users, get_users},
 };
 
@@ -240,7 +240,7 @@ impl MidenExecution {
         //     },
         // ];
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-
+        let slot_names = get_user_balance_storage_slot_names();
         for order in &orders {
             let user_index = self
                 .users
@@ -251,7 +251,7 @@ impl MidenExecution {
             let sell_asset_index = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
             let trade = Trade {
-                user_index,
+                user: slot_names[user_index as usize].id(),
                 sell_asset_index,
                 buy_asset_index,
                 sell_amount: details.amount_in,

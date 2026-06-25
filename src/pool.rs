@@ -11,9 +11,6 @@ use miden_client::{
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
     rpc::Endpoint,
-    testing::account_id::{
-        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
-    },
 };
 use miden_core::{Felt, Word, ZERO};
 use miden_protocol::account::AccountComponentMetadata;
@@ -62,10 +59,18 @@ pub async fn deploy_pool(
         "contract id: {:?}",
         pool_contract
             .id()
-            .to_bech32(Endpoint::testnet().to_network_id())
+            .to_bech32(Endpoint::devnet().to_network_id())
     );
 
     Ok((pool_contract, pool_component))
+}
+
+pub fn get_user_balance_storage_slot_names() -> Vec<StorageSlotName> {
+    let mut slot_names: Vec<StorageSlotName> = Vec::with_capacity(100);
+    for i in 0..100 {
+        slot_names.push(n(format!("pool::user_{i}_balance").as_str()));
+    }
+    slot_names
 }
 
 pub fn build_pool_component(
@@ -78,10 +83,7 @@ pub fn build_pool_component(
     let cb = link_storage_utils(cb)?;
     let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
 
-    let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-    let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
-    let faucets = [asset0, asset1];
-    let user_amount = 1_000_000_000;
+    let user_amount = 1_000;
 
     let pool_balance_0: Word = [
         Felt::new(pool_0_balance).unwrap(),
@@ -101,26 +103,20 @@ pub fn build_pool_component(
 
     let user_balance: Word = [
         Felt::new(user_amount).unwrap(),
-        Felt::ZERO,
+        Felt::new(user_amount).unwrap(),
         Felt::ZERO,
         Felt::ZERO,
     ]
     .into();
 
+    let slot_names = get_user_balance_storage_slot_names();
+
     let component = AccountComponent::new(
         lib,
-        vec![
-            StorageSlot::with_value(n("pool::pool_0_state"), pool_balance_0.into()),
-            StorageSlot::with_value(n("pool::pool_1_state"), pool_balance_1.into()),
-            StorageSlot::with_value(n("pool::user_00_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_01_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_10_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_11_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_20_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_21_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_30_balance"), user_balance.into()),
-            StorageSlot::with_value(n("pool::user_31_balance"), user_balance.into()),
-        ],
+        slot_names[..users.len()]
+            .iter()
+            .map(|name| StorageSlot::with_value(name.clone(), user_balance.into()))
+            .collect(),
         AccountComponentMetadata::new("zoro_miden::pool"),
     )?;
 
@@ -138,7 +134,9 @@ pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
 }
 
 fn n(name: &str) -> StorageSlotName {
-    StorageSlotName::new(name).expect("valid slot name")
+    let name = StorageSlotName::new(name).expect("valid slot name");
+    // println!("Slot name: {:?}, id: {:?}", name, name.id());
+    name
 }
 
 pub fn link_pool(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {

@@ -10,8 +10,12 @@ use tracing::warn;
 use crate::{
     message_broker::message_broker::{MessageBroker, StatsEvent},
     miden_execution::MidenExecution,
-    oracle_sse::OracleSSEClient, pool::PoolState, processing::Processing, store::Store,
-    user::Users, websocket::connection_manager::ConnectionManager,
+    oracle_sse::OracleSSEClient,
+    pool::PoolState,
+    processing::Processing,
+    store::Store,
+    user::Users,
+    websocket::connection_manager::ConnectionManager,
 };
 
 mod api;
