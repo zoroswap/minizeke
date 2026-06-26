@@ -17,6 +17,8 @@ use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 use serde::Serialize;
 
+use crate::user::User;
+
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct PoolState {
     pub balance: u64,
@@ -24,7 +26,7 @@ pub struct PoolState {
 
 pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
-    users: Vec<AccountId>,
+    users: Vec<User>,
     pool_0_balance: u64,
     pool_1_balance: u64,
 ) -> Result<(Account, AccountComponent)> {
@@ -35,9 +37,12 @@ pub async fn deploy_pool(
     let pool_component =
         build_pool_component(pool_0_balance, pool_1_balance, users, client.code_builder())?;
 
+    let operator_component = build_operator_component(client.code_builder(), users)?;
+
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
         .with_component(pool_component.clone())
+        .with_component(operator_component.clone())
         .with_auth_component(AuthSingleSig::new(
             key_pair.public_key().to_commitment(),
             AuthScheme::EcdsaK256Keccak,
@@ -119,6 +124,40 @@ pub fn build_pool_component(
             .collect(),
         AccountComponentMetadata::new("zoro_miden::pool"),
     )?;
+
+    Ok(component)
+}
+
+pub fn build_operator_component(
+    code_builder: CodeBuilder,
+    depositors: &[(Word, Word)],
+) -> Result<AccountComponent> {
+    let code = read_masm_file(&["accounts", "operator.masm"])?;
+    let library = code_builder
+        .compile_component_code("signed_intents::operator", code)
+        .expect("operator.masm must assemble");
+
+    let keys_slot = StorageSlotName::new("operator::depositor_keys").expect("slot name must parse");
+    // let nonce_slot = StorageSlotName::new(LAST_NONCE_SLOT).expect("slot name must parse");
+    // let auth_slot = StorageSlotName::new(LAST_AUTH_SLOT).expect("slot name must parse");
+
+    let map = StorageMap::with_entries(
+        depositors
+            .iter()
+            .map(|(uid, comm)| (StorageMapKey::new(*uid), *comm)),
+    )
+    .expect("depositor map must build");
+
+    let component = AccountComponent::new(
+        library,
+        vec![
+            StorageSlot::with_map(keys_slot, map),
+            // StorageSlot::with_value(nonce_slot, Word::from([0u32, 0, 0, 0])),
+            // StorageSlot::with_value(auth_slot, Word::from([0u32, 0, 0, 0])),
+        ],
+        AccountComponentMetadata::mock("signed_intents::operator"),
+    )
+    .expect("operator component must build");
 
     Ok(component)
 }

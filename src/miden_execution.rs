@@ -18,6 +18,7 @@ use miden_client::{
     transaction::TransactionRequestBuilder,
 };
 use miden_client_sqlite_store::SqliteStore;
+use miden_core::Word;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
@@ -88,8 +89,16 @@ impl MidenExecution {
 
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
-        // spawn the pool account
-        let (pool, pool_component) =
+
+        let users_keys: Vec<(Word, Word)> = users
+            .iter()
+            .map(|user| {
+                let pubkey: Word = user.pubkey().to_commitment().into();
+                let user = user_id_word(user.id());
+                (user, pubkey)
+            })
+            .collect();
+        let (pool, _) =
             deploy_pool(&mut client, users.clone(), pool_0_balance, pool_1_balance).await?;
 
         println!(
@@ -333,4 +342,15 @@ impl MidenExecution {
     pub fn pool_states(&self) -> HashMap<AccountId, PoolState> {
         self.pool_states.clone()
     }
+}
+
+/// The depositor's user-id word: `[id_prefix, id_suffix, 0, 0]`. This is the raw `StorageMap` key
+/// under which the operator stores/looks up this depositor's pubkey commitment (Plan 2 Q1).
+pub fn user_id_word(account_id: AccountId) -> Word {
+    Word::from([
+        account_id.prefix().as_felt(),
+        account_id.suffix(),
+        0u32.into(),
+        0u32.into(),
+    ])
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 axum = { version = "0.8.4", features = ["macros", "tokio", "ws"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6.2.1"
 dotenv = "0.15.0"

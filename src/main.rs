@@ -20,7 +20,7 @@ use crate::{
 
 mod api;
 mod execution;
-mod operator;
+mod intent;
 mod message_broker;
 mod miden_execution;
 mod oracle_sse;

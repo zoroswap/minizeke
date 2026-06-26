@@ -130,25 +130,31 @@ pub enum OrderStatus {
 // States of the order
 #[derive(Debug, Clone)]
 pub struct Created;
+
 #[derive(Debug, Clone)]
 pub struct Processing;
+
 #[derive(Debug, Clone)]
 pub struct Processed {
     execution_result: OrderExecutionResult,
 }
+
 #[derive(Debug, Clone)]
 pub struct Executed {
     tx_hash: String,
     execution_result: OrderExecutionResult,
 }
+
 #[derive(Debug, Clone)]
 pub struct Settled {
     tx_hash: String,
     execution_result: OrderExecutionResult,
 }
+
 #[derive(Debug, Clone)]
 pub struct Failed {
     reason: OrderFailureReason,
+    tx_hash: Option<String>,
     execution_result: Option<OrderExecutionResult>,
 }
 
@@ -284,6 +290,7 @@ impl Order<Processed> {
             state: Failed {
                 reason,
                 execution_result,
+                tx_hash: None,
             },
             id: self.id,
             order_type: self.order_type,
