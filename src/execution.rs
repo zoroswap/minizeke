@@ -1,5 +1,4 @@
-use miden_client::account::{AccountId, StorageSlotId};
-use miden_core::{Word, field::PrimeField64};
+use miden_client::account::StorageSlotId;
 
 pub struct Trade {
     pub user: StorageSlotId,
@@ -14,7 +13,7 @@ pub struct PoolStateDelta {
     pub set_amount: u64,
 }
 
-pub fn make_exec_script(trades: Vec<Trade>, pool_state_deltas: Vec<PoolStateDelta>) -> String {
+pub fn make_exec_script(trades: Vec<Trade>) -> String {
     let mut script = r#"
 use zoro_miden::pool::execute_swap
 use miden::core::sys

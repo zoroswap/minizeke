@@ -13,15 +13,6 @@ use zoro_miden::operator
 
 # STORAGE SLOTS
 
-
-const USER_0_BALANCE_SLOT = word("pool::user_0_balance")
-const USER_1_BALANCE_SLOT = word("pool::user_1_balance")
-
-# USER BALANCE SLOTS
-#const USER_0_BALANCE_SLOT = word("pool::user_0_balance")
-#const USER_1_BALANCE_SLOT = word("pool::user_1_balance")
-# const USER_9_BALANCE_SLOT = word("pool::user_1=9_balance")
-
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "POOL: insufficient available balance for swap"
 const ERR_INVALID_POOL_STATE_TRYING_TO_SUB_AND_ADD = "POOL: invalid pool state trying to sub AND add"

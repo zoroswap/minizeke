@@ -11,13 +11,16 @@ use miden_client::{
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
     rpc::Endpoint,
-    testing::account_id::{
-        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
-    },
 };
 use miden_core::{Felt, Word, ZERO};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
+use serde::Serialize;
+
+#[derive(Debug, Copy, Clone, Serialize)]
+pub struct PoolState {
+    pub balance: u64,
+}
 
 pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
@@ -80,9 +83,6 @@ pub fn build_pool_component(
     let cb = link_storage_utils(cb)?;
     let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
 
-    let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-    let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
-    let faucets = [asset0, asset1];
     let user_amount = 1_000;
 
     let pool_balance_0: Word = [

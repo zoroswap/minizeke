@@ -1,186 +1,167 @@
-use std::{
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use miden_client::{
-    RemoteTransactionProver,
-    account::AccountId,
-    builder::ClientBuilder,
-    keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient},
-    testing::account_id::{
-        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
-    },
-    transaction::TransactionRequestBuilder,
-};
-use miden_client_sqlite_store::SqliteStore;
+use dotenv::dotenv;
+use miden_client::account::AccountId;
+use tokio::runtime::Builder;
+use tokio::sync::broadcast::error::RecvError;
+use tracing::warn;
 
 use crate::{
-    execution::{PoolStateDelta, Trade, make_exec_script},
-    pool::{
-        deploy_pool, get_user_balance_storage_slot_names, link_pool, link_storage_utils,
-        read_masm_file,
-    },
-    user::get_users,
+    message_broker::message_broker::{MessageBroker, StatsEvent},
+    miden_execution::MidenExecution,
+    oracle_sse::OracleSSEClient,
+    pool::PoolState,
+    processing::Processing,
+    store::Store,
+    user::Users,
+    websocket::connection_manager::ConnectionManager,
 };
 
+mod api;
 mod execution;
 mod operator;
+mod message_broker;
+mod miden_execution;
+mod oracle_sse;
+mod order;
 mod pool;
+mod price;
+mod processing;
+mod serde;
+mod store;
 mod user;
+mod websocket;
+
+fn main() {
+    dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,minizeke=debug,miden_core=off,log=warn")
+            }),
+        )
+        .with_target(false)
+        .init();
+
+    let message_broker = Arc::new(MessageBroker::new());
+    let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::scope(|s| {
+        let message_broker_for_miden = message_broker.clone();
+        s.spawn(move || {
+            let rt = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|err| {
+                    panic!("Failed building runtime for Miden execution: {err:?}")
+                });
+            rt.block_on(async move {
+                println!("[INIT] Initializing Miden components");
+                let mut miden_execution = MidenExecution::initialize(message_broker_for_miden)
+                    .await
+                    .unwrap();
+
+                init_tx
+                    .send((
+                        miden_execution.users(),
+                        miden_execution.pool_states(),
+                        miden_execution.pool_id(),
+                    ))
+                    .unwrap();
+
+                println!("[RUN] Starting Miden execution");
+                if let Err(e) = miden_execution.start().await {
+                    eprintln!("Critical error on miden_execution: {e}. Exiting with status 1.");
+                    std::process::exit(1);
+                }
+            });
+        });
+
+        let (initial_users, initial_pool_states, pool_id) = init_rx
+            .recv()
+            .expect("Miden init thread failed before sending init data");
+
+        let _ = main_tokio(initial_users, initial_pool_states, pool_id, message_broker);
+    });
+}
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    //miden client
-    let remote_prover = Arc::new(RemoteTransactionProver::new(
-        // "https://tx-prover.devnet.miden.io",
-        "https://tx-prover.testnet.miden.io",
+async fn main_tokio(
+    initial_users: Users,
+    initial_pool_states: HashMap<AccountId, PoolState>,
+    pool_id: AccountId,
+    message_broker: Arc<MessageBroker>,
+) -> Result<()> {
+    println!("[INIT] Connection manager");
+    let connection_manager = Arc::new(ConnectionManager::with_message_broker(
+        message_broker.clone(),
     ));
-    let sqlite_store = SqliteStore::new("store.sqlite3".into()).await?;
-    let store = Arc::new(sqlite_store);
-    // let rpc_client = Arc::new(GrpcClient::new(&Endpoint::devnet(), 30_000));
-    let rpc_client = Arc::new(GrpcClient::new(&Endpoint::testnet(), 30_000));
-    let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
-    // Build client with remote prover as default
-    let mut client = ClientBuilder::new()
-        // .in_debug_mode(true.into())
-        .prover(remote_prover.clone())
-        .store(store)
-        .rpc(rpc_client)
-        .authenticator(keystore)
-        .build()
-        .await?;
+    println!("[INIT] Initializing Store");
+    let store = Arc::new(Store::new(
+        pool_id,
+        initial_users.clone(),
+        initial_pool_states.clone(),
+    ));
 
-    client.ensure_genesis_in_place().await?;
-    client.sync_state().await?;
+    let mut oracle_client = OracleSSEClient::new(store.clone(), message_broker.clone());
+    println!("[INIT] Initializing oracle prices");
+    oracle_client.init_prices().await?;
 
-    println!("Client ready.");
-
-    // spawn the user accounts
-    let users = get_users(10, &mut client).await?;
-
-    let pool_0_balance = 10_000_000;
-    let pool_1_balance = 10_000_000;
-    // spawn the pool account
-    let (pool, pool_component) = deploy_pool(
-        &mut client,
-        users.clone(),
-        pool_0_balance.clone(),
-        pool_1_balance.clone(),
+    println!("[INIT] Initializing Processing");
+    let mut processing = Processing::new(
+        message_broker.clone(),
+        initial_users.clone(),
+        initial_pool_states.clone(),
     )
     .await?;
 
-    println!(
-        "Pool deployed. BECH32: {}, HEX: {}",
-        pool.id().to_bech32(Endpoint::devnet().to_network_id()),
-        pool.id().to_hex()
-    );
+    println!("[RUN] Starting Processing");
+    tokio::spawn(async move {
+        processing.start().await;
+    });
 
-    let tx = TransactionRequestBuilder::new().build()?;
-    client.add_account(&pool, true).await?;
-    client.submit_new_transaction(pool.id(), tx).await?;
-    client.sync_state().await?;
-
-    let storage = client.get_account_storage(pool.id()).await?;
-
-    // sleep(Duration::from_secs(4));
-
-    println!("Pool touched.");
-
-    let sim_runs = 5;
-    let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-    let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
-    let slot_names = get_user_balance_storage_slot_names();
-
-    let mut current_pool_0_balance = pool_0_balance;
-    let mut current_pool_1_balance = pool_1_balance;
-    for n in 0..sim_runs {
-        let instant = Instant::now();
-        println!("SIM RUN {n}");
-
-        let mut trades = Vec::new();
-        let (sell_asset, sell_pool_index) = if n % 2 == 0 { (asset0, 0) } else { (asset1, 1) };
-        let (buy_asset, buy_pool_index) = if n % 2 == 0 { (asset1, 1) } else { (asset0, 0) };
-        let trade_amount = 10;
-
-        let mut sell_pool_balance = 0;
-        let mut buy_pool_balance = 0;
-        if sell_pool_index == 0 {
-            current_pool_0_balance -= users.len() as u64 * trade_amount;
-            sell_pool_balance = current_pool_0_balance;
-
-            current_pool_1_balance += users.len() as u64 * trade_amount;
-            buy_pool_balance = current_pool_1_balance;
-        } else {
-            current_pool_1_balance -= users.len() as u64 * trade_amount;
-            sell_pool_balance = current_pool_1_balance;
-
-            current_pool_0_balance += users.len() as u64 * trade_amount;
-            buy_pool_balance = current_pool_0_balance;
+    println!("[RUN] Starting oracle listener");
+    tokio::spawn(async move {
+        if let Err(e) = oracle_client.start().await {
+            eprintln!("Critical error on oracle client: {e}. Exiting with status 1.");
+            std::process::exit(1);
         }
-        let pool_state_deltas = vec![
-            PoolStateDelta {
-                pool_index: sell_pool_index,
-                set_amount: sell_pool_balance,
-            },
-            PoolStateDelta {
-                pool_index: buy_pool_index,
-                set_amount: buy_pool_balance,
-            },
-        ];
-        for (idx, user) in users.iter().enumerate() {
-            let trade = Trade {
-                user: slot_names[idx].id().clone(),
-                sell_asset_index: sell_pool_index,
-                buy_asset_index: buy_pool_index,
-                sell_amount: trade_amount,
-                buy_amount: trade_amount,
-            };
-            trades.push(trade);
-        }
+    });
 
-        let tx_script = make_exec_script(trades, pool_state_deltas);
+    println!("[RUN] Starting WebSocket heartbeat task");
+    connection_manager.clone().start_heartbeat_task();
 
-        // println!("SCRIPT \n\n{tx_script}\n\n");
-        // run simulation
+    // Start event forwarding from MessageBroker to WebSocket clients
+    println!("[RUN] Starting WebSocket event forwarding");
+    connection_manager.clone().start_event_forwarding();
 
-        let cb = link_pool(client.code_builder())?;
-        let tx_script = cb
-            // .with_linked_module("zoro_miden::pool", code)?
-            // .with_dynamically_linked_library(pool_component.component_code())?
-            .compile_tx_script(tx_script)?;
-
-        let tx_req = TransactionRequestBuilder::new()
-            .custom_script(tx_script)
-            .build()?;
-
-        // let tx = client.submit_new_transaction(pool.id(), tx_req).await?;
-
-        let tx_result = client.execute_transaction(pool.id(), tx_req).await?;
-        let measurements = tx_result.executed_transaction().measurements();
-        println!(
-            "Cycle count: {}, auth: {}",
-            measurements.total_cycles(),
-            measurements.auth_procedure
-        );
-        let prove_started = Instant::now();
-        let proven_transaction = client
-            .prove_transaction_with(&tx_result, client.prover())
-            .await?;
-        let prove_elapsed = prove_started.elapsed();
-        let submission_height = client
-            .submit_proven_transaction(proven_transaction, &tx_result)
-            .await?;
-        client
-            .apply_transaction(&tx_result, submission_height)
-            .await?;
-        println!("Elapsed: {prove_elapsed:?}");
-        client.sync_state().await?;
+    println!("[RUN] Starting stats updater");
+    {
+        let store_for_stats = store.clone();
+        let message_broker_for_stats = message_broker.clone();
+        tokio::spawn(async move {
+            let mut rx = message_broker_for_stats.subscribe_order_updates();
+            loop {
+                match rx.recv().await {
+                    Ok(update) => {
+                        store_for_stats.apply_order_update(update);
+                        let stats = store_for_stats.order_stats();
+                        let _ = message_broker_for_stats.broadcast_stats(StatsEvent::now(stats));
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!("stats updater lagged behind by {n} messages");
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
     }
+
+    println!("[RUN] Starting ZEKE server");
+    api::start(connection_manager, message_broker, store).await?;
 
     Ok(())
 }
