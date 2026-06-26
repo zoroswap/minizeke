@@ -1,5 +1,7 @@
 use miden::protocol::active_account
 use miden::protocol::native_account
+
+use zoro_miden::operator
 # ZORO POOL (barebones standalone POC)
 #
 # Holds NO custody. Tracks virtual per-user balances, total asset balances and
@@ -105,9 +107,12 @@ end
 # SWAP
 # ----------------------------------------------------------------------------------------------
 
-
 pub proc execute_swap
-    # => [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount]
+    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
+    exec.operator::verfiy_signature
+    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
+    drop drop dup.3 dup.3
+    # => [user_suffix, user_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
     exec.sub_from_user_balance
     # => [BUY_KEY]
     exec.add_to_user_balance
@@ -126,48 +131,48 @@ end
 #!
 #! Inputs: [slot_id_prefix, slot_id_suffix, KEY, VALUE]
 #! Outputs: []
-pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word, sub_by: felt)
-    # duplicate the map accessor inputs
-    dup.5 dup.5 dup.5 dup.5 dup.5 dup.5
-    # => [slot_id_prefix, slot_id_suffix, KEY, slot_id_prefix, slot_id_suffix, KEY,sub_by, ]
-    exec.active_account::get_map_item
-    movup.10
-    # => [sub_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-    sub
-    # => [new_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-    movdn.9 movdn.9 movdn.9 movdn.9
-    ## set
-    exec.native_account::set_map_item dropw
-end
+#pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word, sub_by: felt)
+#    # duplicate the map accessor inputs
+#    dup.5 dup.5 dup.5 dup.5 dup.5 dup.5
+#    # => [slot_id_prefix, slot_id_suffix, KEY, slot_id_prefix, slot_id_suffix, KEY,sub_by, ]
+#    exec.active_account::get_map_item
+#    movup.10
+#    # => [sub_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
+#    sub
+#    # => [new_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
+#    movdn.9 movdn.9 movdn.9 movdn.9
+#    ## set
+#    exec.native_account::set_map_item dropw
+#end
 
 
-pub proc add_to_map_item #(increment_by: felt, slot_id_prefix: felt, slot_id_suffix: felt, key: Word)
-    # duplicate the map accessor inputs
-    dup.6 dup.6 dup.6 dup.6 dup.6 dup.6
-    exec.active_account::get_map_item
-    # => [old_value, 0, 0, 0, increment_by, slot_id_prefix, slot_id_suffix, KEY]
-    #movdn.4 drop drop drop
-    movup.4
-    # => [increment_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-    add
-    ## set
-    # => [new_value, 0,0,0,lot_id_prefix, slot_id_suffix, KEY]
-    #movdn.7 push.0 movdn.8 push.0 movdn.8 push.0 movdn.8
-    movdn.9 movdn.9 movdn.9 movdn.9
-    # => [new_value, 0, 0, 0, lot_id_prefix, slot_id_suffix, KEY, new_value, 0, 0, 0]
-    
-    exec.native_account::set_map_item  dropw
-end
+#pub proc add_to_map_item #(increment_by: felt, slot_id_prefix: felt, slot_id_suffix: felt, key: Word)
+#    # duplicate the map accessor inputs
+#    dup.6 dup.6 dup.6 dup.6 dup.6 dup.6
+#    exec.active_account::get_map_item
+#    # => [old_value, 0, 0, 0, increment_by, slot_id_prefix, slot_id_suffix, KEY]
+#    #movdn.4 drop drop drop
+#    movup.4
+#    # => [increment_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
+#    add
+#    ## set
+#    # => [new_value, 0,0,0,lot_id_prefix, slot_id_suffix, KEY]
+#    #movdn.7 push.0 movdn.8 push.0 movdn.8 push.0 movdn.8
+#    movdn.9 movdn.9 movdn.9 movdn.9
+#    # => [new_value, 0, 0, 0, lot_id_prefix, slot_id_suffix, KEY, new_value, 0, 0, 0]
+#    
+#    exec.native_account::set_map_item  dropw
+#end
 
 
 # @todo: inline
-pub proc set_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, value: felt) -> felt
-    ### fill out value with 0 to full word
-    push.0 movdn.7 push.0 movdn.7 push.0 movdn.7
-    ### load slot id and key
-    exec.native_account::set_map_item 
-    dropw
-end
+#pub proc set_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, value: felt) -> felt
+#    ### fill out value with 0 to full word
+#    push.0 movdn.7 push.0 movdn.7 push.0 movdn.7
+#    ### load slot id and key
+#    exec.native_account::set_map_item 
+#    dropw
+#end
 
 
 pub proc add_to_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, increment_by: felt) -> felt
@@ -247,9 +252,14 @@ end
 
 
 
-pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) -> felt
-    exec.active_account::get_map_item
-    
-    movdn.3 drop drop drop
-    # => [value]
-end
+#pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) -> felt
+#    exec.active_account::get_map_item
+#    
+#    movdn.3 drop drop drop
+#    # => [value]
+#end
+
+
+
+
+
