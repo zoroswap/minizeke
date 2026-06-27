@@ -90,14 +90,6 @@ impl MidenExecution {
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
 
-        let users_keys: Vec<(Word, Word)> = users
-            .iter()
-            .map(|user| {
-                let pubkey: Word = user.pubkey().to_commitment().into();
-                let user = user_id_word(user.id());
-                (user, pubkey)
-            })
-            .collect();
         let (pool, _) =
             deploy_pool(&mut client, users.clone(), pool_0_balance, pool_1_balance).await?;
 

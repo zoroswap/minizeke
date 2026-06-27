@@ -8,7 +8,7 @@ use miden_client::{
         StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
     },
     assembly::CodeBuilder,
-    auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
+    auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKeyCommitment},
     keystore::{FilesystemKeyStore, Keystore},
     rpc::Endpoint,
 };
@@ -17,7 +17,7 @@ use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 use serde::Serialize;
 
-use crate::user::User;
+use crate::{miden_execution::user_id_word, user::User};
 
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct PoolState {
@@ -34,10 +34,23 @@ pub async fn deploy_pool(
     client.rng().fill_bytes(&mut init_seed);
 
     let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
-    let pool_component =
-        build_pool_component(pool_0_balance, pool_1_balance, users, client.code_builder())?;
+    let user_ids: Vec<AccountId> = users.iter().map(|u| u.id()).collect();
+    let pool_component = build_pool_component(
+        pool_0_balance,
+        pool_1_balance,
+        user_ids,
+        client.code_builder(),
+    )?;
+    let users_keys: Vec<(Word, Word)> = users
+        .iter()
+        .map(|user| {
+            let pubkey: Word = user.pubkey().to_commitment().into();
+            let user = user_id_word(user.id());
+            (user, pubkey)
+        })
+        .collect();
 
-    let operator_component = build_operator_component(client.code_builder(), users)?;
+    let operator_component = build_operator_component(client.code_builder(), &users_keys)?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
