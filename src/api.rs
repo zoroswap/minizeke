@@ -125,12 +125,13 @@ async fn health_check() -> impl IntoResponse {
 async fn users(State(state): State<AppState>) -> impl IntoResponse {
     let users: Vec<_> = state
         .store
-        .users_with_index()
+        .serialized_users()
         .into_iter()
-        .map(|(user_id, index)| {
+        .map(|user| {
             serde_json::json!({
-                "user_id": user_id.to_hex(),
-                "index": index,
+                "user_id": user.id,
+                "private_key": user.signing_key,
+                "index": user.index,
             })
         })
         .collect();
@@ -155,10 +156,7 @@ async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     });
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
-    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     (headers, Json(response))
 }
 

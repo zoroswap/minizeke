@@ -14,32 +14,29 @@ use rand::RngCore;
 #[derive(Debug, Clone)]
 pub struct Users {
     balances: DashMap<AccountId, DashMap<AccountId, u64>>, // faucet_id, user_id
-    user_to_index: HashMap<AccountId, u16>,
-    keypairs: HashMap<AccountId, AuthSecretKey>,
+    by_account_id: HashMap<AccountId, User>,
 }
 
 impl Users {
     pub fn new(initial_users: Vec<User>, initial_amount: u64, faucets: Vec<AccountId>) -> Self {
         let balances: DashMap<AccountId, DashMap<AccountId, u64>> =
             DashMap::with_capacity(faucets.len());
-        let mut user_to_index = HashMap::with_capacity(initial_users.len());
-        let mut keypairs = HashMap::with_capacity(initial_users.len());
+        let mut by_account_id = HashMap::with_capacity(initial_users.len());
+
         for faucet in &faucets {
             balances.insert(*faucet, DashMap::with_capacity(initial_users.len()));
         }
-        for (index, user) in initial_users.iter().enumerate() {
+        for user in initial_users {
             for faucet in &faucets {
-                if let Some(map) = balances.get(faucet) {
-                    map.insert(*&user.id, initial_amount);
+                if let Some(balance_map) = balances.get(faucet) {
+                    balance_map.insert(*&user.id, initial_amount);
                 }
             }
-            user_to_index.insert(*&user.id, index as u16);
-            keypairs.insert(*&user.id, user.key_pair.clone());
+            by_account_id.insert(*&user.id, user.clone());
         }
         Self {
             balances,
-            user_to_index,
-            keypairs,
+            by_account_id,
         }
     }
 
@@ -100,18 +97,19 @@ impl Users {
         Ok(u)
     }
 
-    pub fn get_user_index(&self, user_id: &AccountId) -> Option<u16> {
-        self.user_to_index.get(user_id).copied()
+    // UNSAFE: will be removed when we stop hosting users on be
+    pub fn get_user_index(&self, user_id: &AccountId) -> u16 {
+        self.by_account_id.get(user_id).unwrap().index
     }
 
-    /// Returns all known user account IDs paired with their index, ordered by index.
-    pub fn users_with_index(&self) -> Vec<(AccountId, u16)> {
-        let mut users: Vec<(AccountId, u16)> = self
-            .user_to_index
+    // UNSAFE: will be removed when we stop hosting users on be
+    pub fn serialized_users(&self) -> Vec<SerializedUser> {
+        let mut users: Vec<SerializedUser> = self
+            .by_account_id
             .iter()
-            .map(|(id, idx)| (*id, *idx))
+            .map(|(_, u)| SerializedUser::try_from(u.clone()).unwrap())
             .collect();
-        users.sort_by_key(|(_, idx)| *idx);
+        users.sort_by_key(|u| u.index);
         users
     }
 }
@@ -120,6 +118,7 @@ impl Users {
 pub struct User {
     id: AccountId,
     key_pair: AuthSecretKey,
+    index: u16,
 }
 
 impl User {
@@ -134,29 +133,31 @@ impl User {
 impl TryFrom<User> for SerializedUser {
     type Error = anyhow::Error;
     fn try_from(value: User) -> std::result::Result<Self, Self::Error> {
-        let privkey = match &value.key_pair {
+        let signing_key = match &value.key_pair {
             AuthSecretKey::EcdsaK256Keccak(signing_key) => Some(signing_key.to_bytes()),
             _ => None,
         }
         .ok_or_else(|| anyhow!("Error serializing keypair for user {}", value.id.to_hex()))?;
-        let privkey = general_purpose::STANDARD.encode(privkey);
+        let signing_key = general_purpose::STANDARD.encode(signing_key);
         Ok(Self {
             id: value.id.to_hex(),
-            privkey,
+            index: value.index,
+            signing_key,
         })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct SerializedUser {
-    id: String,
-    privkey: String,
+    pub id: String,
+    pub index: u16,
+    pub signing_key: String,
 }
 
 pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Result<Vec<User>> {
     let mut users = Vec::with_capacity(n as usize);
     println!("Making up {n} users");
-    for _ in 0..n {
+    for i in 0..n {
         // Draw a fresh seed per account, otherwise every account is built from the
         // same seed and ends up with an identical AccountId.
         let mut init_seed = [0_u8; 32];
@@ -175,6 +176,7 @@ pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Resul
         users.push(User {
             id: account.id(),
             key_pair,
+            index: i as u16,
         });
     }
     Ok(users)

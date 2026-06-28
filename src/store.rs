@@ -1,7 +1,7 @@
 use crate::{
     order::{OrderUpdate, Orders},
     pool::PoolState,
-    user::Users,
+    user::{SerializedUser, Users},
 };
 use dashmap::DashMap;
 use miden_client::account::AccountId;
@@ -60,7 +60,7 @@ impl Store {
             .collect::<HashMap<AccountId, PoolState>>()
     }
 
-    pub fn users_with_index(&self) -> Vec<(AccountId, u16)> {
-        self.users.users_with_index()
+    pub fn serialized_users(&self) -> Vec<SerializedUser> {
+        self.users.serialized_users()
     }
 }

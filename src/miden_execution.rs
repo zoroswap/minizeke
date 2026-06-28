@@ -243,10 +243,7 @@ impl MidenExecution {
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
         let slot_names = get_user_balance_storage_slot_names();
         for order in &orders {
-            let user_index = self
-                .users
-                .get_user_index(&order.user_id())
-                .ok_or(anyhow!("user not found"))?;
+            let user_index = self.users.get_user_index(&order.user_id());
             let details = order.details();
             let buy_asset_index = if details.asset_out.eq(&asset0) { 0 } else { 1 };
             let sell_asset_index = if details.asset_in.eq(&asset0) { 0 } else { 1 };
