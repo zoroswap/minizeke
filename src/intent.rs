@@ -3,7 +3,7 @@ use miden_protocol::crypto::hash::poseidon2::Poseidon2;
 
 /// Domain-separation tag — stops a signature for one action type being
 /// replayed as another. See the cancel/withdraw tags in the perp repo.
-
+///
 /// A user's authorization to move `amount` to a recipient, bound to the
 /// depositor's account id so the operator knows whose funds are moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,8 +12,6 @@ pub struct Intent {
     pub user_prefix: u64,
     pub sell_idx: u64,
     pub sell_amount: u64,
-    pub user_suffix_2: u64,
-    pub user_prefix_2: u64,
     pub buy_idx: u64,
     pub buy_amount: u64,
 }
@@ -27,8 +25,6 @@ impl Intent {
             self.user_prefix,
             self.sell_idx,
             self.sell_amount,
-            self.user_prefix_2,
-            self.user_suffix_2,
             self.buy_idx,
             self.buy_amount,
         ]

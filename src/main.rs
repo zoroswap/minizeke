@@ -7,19 +7,8 @@ use tokio::runtime::Builder;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
 
-use crate::{
-    message_broker::message_broker::{MessageBroker, StatsEvent},
-    miden_execution::MidenExecution,
-    oracle_sse::OracleSSEClient,
-    pool::PoolState,
-    processing::Processing,
-    store::Store,
-    user::Users,
-    websocket::connection_manager::ConnectionManager,
-};
-
 mod api;
-mod execution;
+mod execution_script;
 mod intent;
 mod message_broker;
 mod miden_execution;
@@ -30,8 +19,20 @@ mod price;
 mod processing;
 mod serde;
 mod store;
+pub mod test_utils;
 mod user;
 mod websocket;
+
+use crate::{
+    message_broker::message_broker::{MessageBroker, StatsEvent},
+    miden_execution::MidenExecution,
+    oracle_sse::OracleSSEClient,
+    pool::PoolState,
+    processing::Processing,
+    store::Store,
+    user::Users,
+    websocket::connection_manager::ConnectionManager,
+};
 
 fn main() {
     dotenv().ok();

@@ -6,9 +6,10 @@ use dashmap::DashMap;
 use miden_client::{
     Client, Serializable,
     account::{AccountBuilder, AccountId, AccountType, component::BasicWallet},
-    auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKey},
+    auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKey, Signature},
     keystore::FilesystemKeyStore,
 };
+use miden_core::Word;
 use rand::RngCore;
 
 #[derive(Debug, Clone)]
@@ -112,6 +113,10 @@ impl Users {
         users.sort_by_key(|u| u.index);
         users
     }
+
+    pub fn by_account_id(&self) -> HashMap<AccountId, User> {
+        self.by_account_id.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +132,9 @@ impl User {
     }
     pub fn pubkey(&self) -> PublicKey {
         self.key_pair.public_key()
+    }
+    pub fn sign(&self, msg: Word) -> Signature {
+        self.key_pair.sign(msg)
     }
 }
 

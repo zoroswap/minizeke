@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -7,8 +7,9 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose};
 use chrono::Utc;
-use miden_client::account::AccountId;
+use miden_client::{Deserializable, account::AccountId, auth::Signature};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc};
@@ -39,7 +40,7 @@ struct NewOrderRequest {
     #[serde(serialize_with = "serialize_account_id")]
     #[serde(deserialize_with = "deserialize_account_id")]
     user_id: AccountId,
-    pubkey: String,
+    signed_intent: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -222,7 +223,14 @@ async fn order_new(State(state): State<AppState>, body: Bytes) -> Result<Respons
     //     "Accepted new order",
     // );
 
-    let order = Order::new(payload.pubkey, payload.user_id, payload.details);
+    let sig_bytes = general_purpose::STANDARD
+        .decode(payload.signed_intent)
+        .map_err(|e| ApiError(anyhow!("Failed to decode signature: {}", e)))?;
+
+    let signature = Signature::read_from_bytes(&sig_bytes)
+        .map_err(|e| ApiError(anyhow!("Failed to read signature from bytes: {}", e)))?;
+
+    let order = Order::new(signature, payload.user_id, payload.details);
     state
         .message_broker
         .broadcast_order_update(order.clone().into())

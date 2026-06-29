@@ -23,7 +23,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
 use crate::{
-    execution::{Trade, make_exec_script},
+    execution_script::{Trade, make_exec_script},
+    intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
     pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_pool},
@@ -189,7 +190,7 @@ impl MidenExecution {
     /// Execute a processed batch on the pool. On failure, mark every order in the
     /// batch as failed and still release the processing gate so the engine never
     /// deadlocks waiting for a settlement that will never come.
-    async fn handle_batch(&mut self, orders: Vec<Order<Processed>>) {
+    pub async fn handle_batch(&mut self, orders: Vec<Order<Processed>>) {
         info!(
             count = orders.len(),
             "Received processed batch for execution"
@@ -229,7 +230,6 @@ impl MidenExecution {
 
         let instant = Instant::now();
 
-        let mut trades = Vec::new();
         // let pool_state_deltas = vec![
         //     PoolStateDelta {
         //         pool_index: sell_pool_index,
@@ -240,25 +240,37 @@ impl MidenExecution {
         //         set_amount: buy_pool_balance,
         //     },
         // ];
+
+        let mut intents = Vec::with_capacity(orders.len());
+        // let mut advice_stack = Vec::new();
+
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-        let slot_names = get_user_balance_storage_slot_names();
+        // let slot_names = get_user_balance_storage_slot_names();
         for order in &orders {
-            let user_index = self.users.get_user_index(&order.user_id());
+            let user_id = order.user_id();
+            // let user_index = self.users.get_user_index(&user_id);
             let details = order.details();
-            let buy_asset_index = if details.asset_out.eq(&asset0) { 0 } else { 1 };
-            let sell_asset_index = if details.asset_in.eq(&asset0) { 0 } else { 1 };
+            let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
+            let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
-            let trade = Trade {
-                user: slot_names[user_index as usize].id(),
-                sell_asset_index,
-                buy_asset_index,
+
+            let user_suffix: u64 = user_id.suffix().as_canonical_u64();
+            let user_prefix: u64 = user_id.prefix().as_u64();
+
+            let intent = Intent {
+                user_suffix,
+                user_prefix,
+                sell_idx,
+                buy_idx,
                 sell_amount: details.amount_in,
                 buy_amount: amount_out,
             };
-            trades.push(trade);
+
+            intents.push(intent);
+            // advice_stack.push();
         }
 
-        let tx_script = make_exec_script(trades);
+        let tx_script = make_exec_script(intents);
 
         println!("SCRIPT \n\n{tx_script}\n\n");
 

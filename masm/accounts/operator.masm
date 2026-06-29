@@ -41,7 +41,7 @@ const ERR_EXPIRED = "operator: intent has expired (block height >= expiry_block)
 #!
 #! Invocation: call
 @locals(12)
-pub proc verfiy_signature
+pub proc verify_signature
 #! Inputs:  [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount, pad(8)]
     # We work only on the top 8 inputs (the full canonical intent); the call padding underneath
     # is left untouched (the transaction kernel manages it at the call boundary, as in the
@@ -149,7 +149,7 @@ pub proc verfiy_signature
     # The kernel storage syscalls and the hash leave residual words in the overflow table, so
     # the operand stack is deeper than 16. A `call`ed procedure must return at depth exactly 16;
     # `sys::truncate_stack` drops the deep overflow while preserving the (irrelevant) top 16.
-    padw loc_loadw_le.4 padw locl_loadw_le.0
+    padw loc_loadw_le.4 padw loc_loadw_le.0
     #exec.sys::truncate_stack
     # => [sell_amount, buy_amount, user_suf, user_pre, sell_suf, sell_pre, buy_suf, buy_pre, pad(8)]
 end
