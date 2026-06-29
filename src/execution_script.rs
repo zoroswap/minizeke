@@ -20,7 +20,6 @@ pub struct PoolStateDelta {
 
 const TX_SCRIPT_START: &str = r#"
 use zoro_miden::pool::execute_swap
-use operator::verify_signature
 use miden::core::sys
 
   begin"#;

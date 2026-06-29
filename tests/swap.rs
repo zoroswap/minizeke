@@ -7,6 +7,8 @@ use minizeke::{
 
 #[tokio::test]
 async fn test_swap() -> Result<()> {
+    tracing_subscriber::fmt().init();
+
     let mut miden_execution = get_miden_execution().await?;
     let users = miden_execution.users();
     let users_by_id = users.by_account_id();

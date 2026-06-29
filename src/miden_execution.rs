@@ -27,7 +27,7 @@ use crate::{
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_pool},
+    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_operator, link_pool},
     user::{Users, get_users},
 };
 
@@ -86,7 +86,7 @@ impl MidenExecution {
         println!("Client ready.");
 
         // spawn the user accounts
-        let users = get_users(10, &mut client).await?;
+        let users = get_users(1, &mut client).await?;
 
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
@@ -267,11 +267,13 @@ impl MidenExecution {
             };
 
             let signed_order = order.signed_order();
-            let pubkey = order.pubkey();
+            // let pubkey = order.pubkey();
 
             let msg = intent.message_word();
-            let pk_comm: Word = pubkey.to_commitment().into();
-            let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg.clone()); // [PK[9], SIG[17]]
+            // let pk_comm: Word = pubkey.to_commitment().into();
+            let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg); // [PK[9], SIG[17]]
+
+            info!("prepared len: {}", prepared.len());
 
             // advice_stack.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
             // advice_stack.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
@@ -282,9 +284,10 @@ impl MidenExecution {
 
         let tx_script = make_exec_script(intents);
 
-        println!("SCRIPT \n\n{tx_script}\n\n");
+        info!("SCRIPT \n\n{tx_script}\n\n");
 
-        let cb = link_pool(self.client.code_builder())?;
+        let cb = link_operator(self.client.code_builder())?;
+        let cb = link_pool(cb)?;
         let tx_script = cb.compile_tx_script(tx_script)?;
 
         let advice_map_key = Word::from([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]);
