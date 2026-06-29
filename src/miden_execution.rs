@@ -243,7 +243,7 @@ impl MidenExecution {
         // ];
 
         let mut intents = Vec::with_capacity(orders.len());
-        let mut advice_stack = Vec::new();
+        let mut advice_data = vec![];
 
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
         // let slot_names = get_user_balance_storage_slot_names();
@@ -274,24 +274,25 @@ impl MidenExecution {
             let pk_comm: Word = pubkey.to_commitment().into();
             let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg.clone()); // [PK[9], SIG[17]]
 
-            advice_stack.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
-            advice_stack.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
-            advice_stack.extend_from_slice(&prepared); // PK[9], SIG[17]
+            // advice_stack.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
+            // advice_stack.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
+            advice_data.extend_from_slice(&prepared); // PK[9], SIG[17]
 
             intents.push(intent);
         }
 
         let tx_script = make_exec_script(intents);
-        let advice_inputs = AdviceInputs::default().with_stack(advice_stack);
 
         println!("SCRIPT \n\n{tx_script}\n\n");
 
         let cb = link_pool(self.client.code_builder())?;
         let tx_script = cb.compile_tx_script(tx_script)?;
 
+        let advice_map_key = Word::from([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]);
+
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
-            .extend_advice_map(advice_inputs)
+            .extend_advice_map([(advice_map_key, advice_data)])
             .build()?;
 
         let submit_started = Instant::now();
