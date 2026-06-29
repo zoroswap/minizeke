@@ -1,6 +1,7 @@
 use anyhow::Result;
 use minizeke::{
     intent::Intent,
+    miden_execution::intent_user_fields,
     order::{Order, OrderDetails, OrderExecutionResult},
     test_utils::{get_asset0, get_asset1, get_miden_execution},
 };
@@ -17,8 +18,7 @@ async fn test_swap() -> Result<()> {
     let asset1 = get_asset1();
 
     for (user_id, user) in users.by_account_id() {
-        let user_suffix: u64 = user_id.suffix().as_canonical_u64();
-        let user_prefix: u64 = user_id.prefix().as_u64();
+        let (user_prefix, user_suffix) = intent_user_fields(user_id);
 
         let intent = Intent {
             user_suffix,

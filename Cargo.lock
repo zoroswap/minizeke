@@ -2847,6 +2847,7 @@ dependencies = [
  "miden-core",
  "miden-protocol",
  "miden-standards",
+ "miden-testing",
  "miden-tx",
  "rand 0.9.4",
  "reqwest",

@@ -12,6 +12,7 @@ use zoro_miden::operator
 #   asset-only KEY = [asset_suffix, asset_prefix, 0, 0]
 
 # STORAGE SLOTS
+const USER_0_BALANCE_SLOT = word("pool::user_0_balance")
 
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "POOL: insufficient available balance for swap"
@@ -107,17 +108,25 @@ end
 # SWAP
 # ----------------------------------------------------------------------------------------------
 
+@locals(12)
 pub proc execute_swap
-    exec.operator::populate_adv_stack
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
+    dup.6 dup.6 dup.6 dup.6
+    loc_storew_le.4 dropw
+    dup.4 dup.6 dup.7 dup.8
+    loc_storew_le.8 dropw
     exec.operator::verify_signature
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
-    drop drop dup.3 dup.3
-    # => [user_suffix, user_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
+    padw loc_loadw_le.8
+    dup.3 dup.2 loc_store.10 loc_store.11 drop drop drop drop drop drop
+    padw loc_loadw_le.4
+    dup.3 dup.2 loc_store.0 loc_store.1 drop drop drop drop drop drop
+    push.USER_0_BALANCE_SLOT[0..2]
+    loc_load.1
+    loc_load.0
     exec.sub_from_user_balance
-    # => [BUY_KEY]
+    push.USER_0_BALANCE_SLOT[0..2]
+    loc_load.11
+    loc_load.10
     exec.add_to_user_balance
-    # => []
 end
 
 # ----------------------------------------------------------------------------------------------

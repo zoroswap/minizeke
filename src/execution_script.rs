@@ -1,11 +1,9 @@
-use miden_client::account::{AccountId, StorageSlotId};
+use miden_client::account::StorageSlotId;
 
 use crate::intent::Intent;
 
 pub struct Trade {
-    pub user: StorageSlotId,
-    pub sell_asset: AccountId,
-    pub buy_asset: AccountId,
+    pub balance_slot: StorageSlotId,
     pub sell_asset_index: u64,
     pub buy_asset_index: u64,
     pub sell_amount: u64,
@@ -28,10 +26,10 @@ const TX_SCRIPT_END: &str = r#"
     exec.sys::truncate_stack
 end"#;
 
-pub fn make_exec_script(intents: Vec<Intent>) -> String {
+pub fn make_exec_script(swaps: Vec<(Intent, StorageSlotId)>) -> String {
     let mut script = TX_SCRIPT_START.to_string();
 
-    for intent in intents {
+    for (i, (intent, _balance_slot)) in swaps.into_iter().enumerate() {
         let Intent {
             user_suffix,
             user_prefix,
@@ -40,13 +38,12 @@ pub fn make_exec_script(intents: Vec<Intent>) -> String {
             buy_idx,
             buy_amount,
         } = intent;
+        let advice_key_idx = i as u64 + 1;
         let trade_string = format!(
-            // "push.{buy_amount}.{buy_asset_index}.{user_suffix}.{user_prefix}.{sell_amount}.{sell_asset_index}.{user_suffix}.{user_prefix} call.execute_swap\n",
-
-            // sell_amount, buy_amount, user_suf, user_pre, sell_suf, sell_pre, buy_suf, buy_pre
-            //
             r#"
-    push.{buy_amount}.{buy_idx}.{user_prefix}.{user_suffix}.{sell_amount}.{sell_idx}.{user_prefix}.{user_suffix} call.execute_swap"#,
+    push.0.0.0.{advice_key_idx} adv.push_mapval dropw
+    push.{buy_amount}.{buy_idx}.{user_prefix}.{user_suffix}.{sell_amount}.{sell_idx}.{user_prefix}.{user_suffix}
+    call.execute_swap"#,
         );
 
         script.push_str(&trade_string);

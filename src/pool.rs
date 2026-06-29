@@ -83,6 +83,10 @@ pub async fn deploy_pool(
     Ok((pool_contract, pool_component))
 }
 
+pub fn user_balance_slot_id(user_index: u16) -> miden_client::account::StorageSlotId {
+    get_user_balance_storage_slot_names()[user_index as usize].id()
+}
+
 pub fn get_user_balance_storage_slot_names() -> Vec<StorageSlotName> {
     let mut slot_names: Vec<StorageSlotName> = Vec::with_capacity(100);
     for i in 0..100 {
@@ -151,7 +155,8 @@ pub fn build_operator_component(
         .compile_component_code("zoro_miden::operator", code)
         .expect("operator.masm must assemble");
 
-    let keys_slot = StorageSlotName::new("operator::depositor_keys").expect("slot name must parse");
+    let keys_slot =
+        StorageSlotName::new("zoro_miden::operator::depositor_keys").expect("slot name must parse");
     // let nonce_slot = StorageSlotName::new(LAST_NONCE_SLOT).expect("slot name must parse");
     // let auth_slot = StorageSlotName::new(LAST_AUTH_SLOT).expect("slot name must parse");
 

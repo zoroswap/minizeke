@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     env,
+    panic,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,7 +28,7 @@ use crate::{
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_operator, link_pool},
+    pool::{PoolState, deploy_pool, link_operator, link_pool, user_balance_slot_id},
     user::{Users, get_users},
 };
 
@@ -241,21 +242,20 @@ impl MidenExecution {
         //     },
         // ];
 
-        let mut intents = Vec::with_capacity(orders.len());
-        let mut advice_data = vec![];
+        let mut swaps = Vec::with_capacity(orders.len());
+        let mut advice_map_entries = Vec::with_capacity(orders.len());
 
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-        // let slot_names = get_user_balance_storage_slot_names();
-        for order in &orders {
+        for (i, order) in orders.iter().enumerate() {
             let user_id = order.user_id();
-            // let user_index = self.users.get_user_index(&user_id);
+            let user_index = self.users.get_user_index(&user_id);
+            let balance_slot = user_balance_slot_id(user_index);
             let details = order.details();
             let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
             let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
 
-            let user_suffix: u64 = user_id.suffix().as_canonical_u64();
-            let user_prefix: u64 = user_id.prefix().as_u64();
+            let (user_prefix, user_suffix) = intent_user_fields(user_id);
 
             let intent = Intent {
                 user_suffix,
@@ -266,23 +266,46 @@ impl MidenExecution {
                 buy_amount: amount_out,
             };
 
-            let signed_order = order.signed_order();
-            // let pubkey = order.pubkey();
-
             let msg = intent.message_word();
-            // let pk_comm: Word = pubkey.to_commitment().into();
-            let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg); // [PK[9], SIG[17]]
+            let signed_order = order.signed_order();
+            if !order.pubkey().verify(msg, signed_order.clone()) {
+                return Err(anyhow!(
+                    "local ECDSA verify failed for user {} (intent/msg mismatch?)",
+                    user_id.to_hex()
+                ));
+            }
 
-            info!("prepared len: {}", prepared.len());
+            let prepared: Vec<Felt> = {
+                let prev_hook = panic::take_hook();
+                panic::set_hook(Box::new(|_| {}));
+                let result = panic::catch_unwind(|| signed_order.to_prepared_signature(msg));
+                panic::set_hook(prev_hook);
+                result.map_err(|_| {
+                    anyhow!("to_prepared_signature panicked (bad signature or tampered intent)")
+                })?
+            };
+            let pk_comm: Word = order.pubkey().to_commitment().into();
+            let mut advice_entry = pk_comm.as_elements().to_vec();
+            advice_entry.extend_from_slice(&prepared); // PK_COMM (4) || PK[9] || SIG[17]
+            advice_entry.push(balance_slot.suffix());
+            advice_entry.push(balance_slot.prefix());
+            advice_entry.push(Felt::ZERO);
+            advice_entry.push(Felt::ZERO);
 
-            // advice_stack.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
-            // advice_stack.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
-            advice_data.extend_from_slice(&prepared); // PK[9], SIG[17]
+            // adv.push_mapval resolves the key via stack_get_word(1) after `push.0.0.0.N`,
+            // which corresponds to Word([N, 0, 0, 0]), not Word([0, 0, 0, N]).
+            let advice_map_key = Word::from([
+                Felt::new(i as u64 + 1).unwrap(),
+                Felt::ZERO,
+                Felt::ZERO,
+                Felt::ZERO,
+            ]);
+            advice_map_entries.push((advice_map_key, advice_entry));
 
-            intents.push(intent);
+            swaps.push((intent, balance_slot));
         }
 
-        let tx_script = make_exec_script(intents);
+        let tx_script = make_exec_script(swaps);
 
         info!("SCRIPT \n\n{tx_script}\n\n");
 
@@ -290,11 +313,9 @@ impl MidenExecution {
         let cb = link_pool(cb)?;
         let tx_script = cb.compile_tx_script(tx_script)?;
 
-        let advice_map_key = Word::from([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]);
-
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
-            .extend_advice_map([(advice_map_key, advice_data)])
+            .extend_advice_map(advice_map_entries)
             .build()?;
 
         let submit_started = Instant::now();
@@ -370,4 +391,15 @@ pub fn user_id_word(account_id: AccountId) -> Word {
         0u32.into(),
         0u32.into(),
     ])
+}
+
+/// User-id felts for intent construction, derived from [`user_id_word`] so off-chain intent
+/// encoding matches the on-chain StorageMap key byte-for-byte.
+pub fn intent_user_fields(account_id: AccountId) -> (u64, u64) {
+    let word = user_id_word(account_id);
+    let elements = word.as_elements();
+    (
+        elements[0].as_canonical_u64(),
+        elements[1].as_canonical_u64(),
+    )
 }

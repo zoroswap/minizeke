@@ -39,6 +39,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.0", features = ["serde", "v4"] }
 
+[dev-dependencies]
+miden-testing = "0.15"
+
 [profile.dev]
 incremental = true
 codegen-units = 256
