@@ -33,6 +33,13 @@ const NUMBER_OF_HASHED_ELEMENTS_CAP = 0
 const ERR_STALE_NONCE = "operator: intent nonce must exceed the stored last_nonce"
 const ERR_EXPIRED = "operator: intent has expired (block height >= expiry_block)"
 
+
+const ADV_MAP_KEY = [0, 0, 0, 1]
+
+pub proc populate_adv_stack
+   push.ADV_MAP_KEY adv.push_mapval
+end
+
 #! Verifies a signed transfer intent on-chain and records it.
 #!
 #! Inputs:  [ sell_amount, buy_amount, user_suf, user_pre, sell_suf, sell_pre, buy_suf, buy_pre, pad(8)]
