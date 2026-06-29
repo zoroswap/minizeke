@@ -2,7 +2,7 @@ use anyhow::Result;
 use minizeke::{
     intent::Intent,
     order::{Order, OrderDetails, OrderExecutionResult},
-    test_utils::{get_asset0, get_asset1, get_client, get_miden_execution},
+    test_utils::{get_asset0, get_asset1, get_miden_execution},
 };
 
 #[tokio::test]
@@ -21,10 +21,10 @@ async fn test_swap() -> Result<()> {
         let intent = Intent {
             user_suffix,
             user_prefix,
-            sell_idx,
-            buy_idx,
-            sell_amount: details.amount_in,
-            buy_amount: amount_out,
+            sell_idx: 0,
+            buy_idx: 1,
+            sell_amount: 10,
+            buy_amount: 10,
         };
 
         let msg_word = intent.message_word();
@@ -40,11 +40,6 @@ async fn test_swap() -> Result<()> {
                 min_amount_out: 10,
             },
         );
-
-        let details = order.details();
-        let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
-        let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
-        let amount_out = order.execution_result().amount_out;
 
         let order = order.start_processing();
         let order = order.processed(OrderExecutionResult { amount_out: 10 });

@@ -1,7 +1,11 @@
 use base64::{Engine, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use miden_client::{Serializable, account::AccountId, auth::Signature};
+use miden_client::{
+    Serializable,
+    account::AccountId,
+    auth::{PublicKey, Signature},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -210,11 +214,17 @@ pub struct Order<State> {
     order_type: OrderType,
     user_id: AccountId,
     signed_order: Signature,
+    pubkey: PublicKey,
     timing: OrderTiming,
 }
 
 impl Order<Created> {
-    pub fn new(signed_order: Signature, user_id: AccountId, details: OrderDetails) -> Self {
+    pub fn new(
+        signed_order: Signature,
+        user_id: AccountId,
+        details: OrderDetails,
+        pubkey: PublicKey,
+    ) -> Self {
         Order {
             id: Uuid::new_v4(),
             timing: OrderTiming::new(),
@@ -223,6 +233,7 @@ impl Order<Created> {
             details,
             order_type: OrderType::Spot,
             state: Created,
+            pubkey,
         }
     }
 
@@ -235,6 +246,7 @@ impl Order<Created> {
             user_id: self.user_id,
             signed_order: self.signed_order,
             timing: self.timing.start_processing(),
+            pubkey: self.pubkey,
         }
     }
     pub fn user_id(&self) -> AccountId {
@@ -252,6 +264,7 @@ impl Order<Processing> {
             user_id: self.user_id,
             signed_order: self.signed_order,
             timing: self.timing.processed(),
+            pubkey: self.pubkey,
         }
     }
 
@@ -280,6 +293,7 @@ impl Order<Processed> {
             user_id: self.user_id,
             signed_order: self.signed_order,
             timing: self.timing.executed(),
+            pubkey: self.pubkey,
         }
     }
     pub fn failed(
@@ -299,6 +313,7 @@ impl Order<Processed> {
             user_id: self.user_id,
             signed_order: self.signed_order,
             timing: self.timing.failed(),
+            pubkey: self.pubkey,
         }
     }
     pub fn details(&self) -> OrderDetails {
@@ -309,6 +324,12 @@ impl Order<Processed> {
     }
     pub fn execution_result(&self) -> OrderExecutionResult {
         self.state.execution_result.clone()
+    }
+    pub fn signed_order(&self) -> Signature {
+        self.signed_order.clone()
+    }
+    pub fn pubkey(&self) -> PublicKey {
+        self.pubkey.clone()
     }
 }
 
@@ -325,6 +346,7 @@ impl Order<Executed> {
             user_id: self.user_id,
             signed_order: self.signed_order,
             timing: self.timing.settled(),
+            pubkey: self.pubkey,
         }
     }
     pub fn details(&self) -> OrderDetails {

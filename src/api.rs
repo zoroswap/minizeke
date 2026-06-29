@@ -9,7 +9,11 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose};
 use chrono::Utc;
-use miden_client::{Deserializable, account::AccountId, auth::Signature};
+use miden_client::{
+    Deserializable,
+    account::AccountId,
+    auth::{PublicKey, Signature},
+};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc};
@@ -41,6 +45,7 @@ struct NewOrderRequest {
     #[serde(deserialize_with = "deserialize_account_id")]
     user_id: AccountId,
     signed_intent: String,
+    pubkey: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -230,7 +235,14 @@ async fn order_new(State(state): State<AppState>, body: Bytes) -> Result<Respons
     let signature = Signature::read_from_bytes(&sig_bytes)
         .map_err(|e| ApiError(anyhow!("Failed to read signature from bytes: {}", e)))?;
 
-    let order = Order::new(signature, payload.user_id, payload.details);
+    let pubkey_bytes = general_purpose::STANDARD
+        .decode(payload.pubkey)
+        .map_err(|e| ApiError(anyhow!("Failed to decode signature: {}", e)))?;
+
+    let pubkey = PublicKey::read_from_bytes(&pubkey_bytes)
+        .map_err(|e| ApiError(anyhow!("Failed to read signature from bytes: {}", e)))?;
+
+    let order = Order::new(signature, payload.user_id, payload.details, pubkey);
     state
         .message_broker
         .broadcast_order_update(order.clone().into())

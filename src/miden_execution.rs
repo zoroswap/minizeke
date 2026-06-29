@@ -16,9 +16,10 @@ use miden_client::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     },
     transaction::TransactionRequestBuilder,
+    vm::AdviceInputs,
 };
 use miden_client_sqlite_store::SqliteStore;
-use miden_core::Word;
+use miden_core::{Felt, Word};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
@@ -242,7 +243,7 @@ impl MidenExecution {
         // ];
 
         let mut intents = Vec::with_capacity(orders.len());
-        // let mut advice_stack = Vec::new();
+        let mut advice_stack = Vec::new();
 
         let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
         // let slot_names = get_user_balance_storage_slot_names();
@@ -266,11 +267,22 @@ impl MidenExecution {
                 buy_amount: amount_out,
             };
 
+            let signed_order = order.signed_order();
+            let pubkey = order.pubkey();
+
+            let msg = intent.message_word();
+            let pk_comm: Word = pubkey.to_commitment().into();
+            let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg.clone()); // [PK[9], SIG[17]]
+
+            advice_stack.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
+            advice_stack.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
+            advice_stack.extend_from_slice(&prepared); // PK[9], SIG[17]
+
             intents.push(intent);
-            // advice_stack.push();
         }
 
         let tx_script = make_exec_script(intents);
+        let advice_inputs = AdviceInputs::default().with_stack(advice_stack);
 
         println!("SCRIPT \n\n{tx_script}\n\n");
 
@@ -279,6 +291,7 @@ impl MidenExecution {
 
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
+            .extend_advice_map(advice_inputs)
             .build()?;
 
         let submit_started = Instant::now();
