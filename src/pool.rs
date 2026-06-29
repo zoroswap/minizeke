@@ -35,12 +35,6 @@ pub async fn deploy_pool(
 
     let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
     let user_ids: Vec<AccountId> = users.iter().map(|u| u.id()).collect();
-    let pool_component = build_pool_component(
-        pool_0_balance,
-        pool_1_balance,
-        user_ids,
-        client.code_builder(),
-    )?;
     let users_keys: Vec<(Word, Word)> = users
         .iter()
         .map(|user| {
@@ -51,11 +45,17 @@ pub async fn deploy_pool(
         .collect();
 
     let operator_component = build_operator_component(client.code_builder(), &users_keys)?;
+    let pool_component = build_pool_component(
+        pool_0_balance,
+        pool_1_balance,
+        user_ids,
+        client.code_builder(),
+    )?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_component(pool_component.clone())
         .with_component(operator_component.clone())
+        .with_component(pool_component.clone())
         .with_auth_component(AuthSingleSig::new(
             key_pair.public_key().to_commitment(),
             AuthScheme::EcdsaK256Keccak,
@@ -99,6 +99,7 @@ pub fn build_pool_component(
 ) -> Result<AccountComponent> {
     let code = read_masm_file(&["accounts", "pool.masm"])?;
     let cb = link_storage_utils(cb)?;
+    let cb = link_operator(cb)?;
     let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
 
     let user_amount = 1_000;
@@ -147,7 +148,7 @@ pub fn build_operator_component(
 ) -> Result<AccountComponent> {
     let code = read_masm_file(&["accounts", "operator.masm"])?;
     let library = code_builder
-        .compile_component_code("signed_intents::operator", code)
+        .compile_component_code("zoro_miden::operator", code)
         .expect("operator.masm must assemble");
 
     let keys_slot = StorageSlotName::new("operator::depositor_keys").expect("slot name must parse");
@@ -168,7 +169,7 @@ pub fn build_operator_component(
             // StorageSlot::with_value(nonce_slot, Word::from([0u32, 0, 0, 0])),
             // StorageSlot::with_value(auth_slot, Word::from([0u32, 0, 0, 0])),
         ],
-        AccountComponentMetadata::mock("signed_intents::operator"),
+        AccountComponentMetadata::mock("zoro_miden::operator"),
     )
     .expect("operator component must build");
 
@@ -208,6 +209,12 @@ pub fn link_storage_utils(code_builder: CodeBuilder) -> Result<CodeBuilder> {
 pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
     let math_code = read_masm_file(&["lib", "math.masm"])?;
     code_builder.link_module("zoro_miden::lib::math", &math_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_operator(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let math_code = read_masm_file(&["accounts", "operator.masm"])?;
+    code_builder.link_module("zoro_miden::operator", &math_code)?;
     Ok(code_builder)
 }
 

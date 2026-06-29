@@ -2,6 +2,6 @@
 /keystore
 store.sqlite3
 .env
-
+store.testnet.sqlite3
 
 .DS_Store

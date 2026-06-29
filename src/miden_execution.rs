@@ -16,7 +16,6 @@ use miden_client::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     },
     transaction::TransactionRequestBuilder,
-    vm::AdviceInputs,
 };
 use miden_client_sqlite_store::SqliteStore;
 use miden_core::{Felt, Word};
@@ -24,7 +23,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
 use crate::{
-    execution_script::{Trade, make_exec_script},
+    execution_script::make_exec_script,
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},

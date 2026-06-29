@@ -4,13 +4,13 @@
 use miden::core::crypto::dsa::ecdsa_k256_keccak
 use miden::core::sys
 use miden::protocol::active_account
-use miden::protocol::native_account
-use miden::protocol::tx
+# use miden::protocol::native_account
+# use miden::protocol::tx
 
 # Named storage slots. The first two felts of the hashed name address the slot.
 #const DEPOSITOR_0_KEY_SLOT = word("operator::depositor_0_keys")
 #const DEPOSITOR_1_KEY_SLOT = word("operator::depositor_1_keys")
-const DEPOSITOR_KEY_SLOT = word("operator::depositor_keys")
+const DEPOSITOR_KEYS_SLOT = word("operator::depositor_keys")
 # KNOWN PLAN-2 LIMITATION: last_nonce is a SINGLE GLOBAL slot, NOT per-depositor.
 # The replay guard is monotonic across ALL depositors, so it never weakens replay
 # protection or fund safety (authorization is per-key via the map). But it is a
@@ -23,6 +23,11 @@ const DEPOSITOR_KEY_SLOT = word("operator::depositor_keys")
 #const LAST_NONCE_SLOT = word("operator::last_nonce")
 #const LAST_AUTH_SLOT  = word("operator::last_authorized")
 
+const ADV_MAP_KEY = [0, 0, 0, 1]
+
+pub proc populate_adv_stack
+   push.ADV_MAP_KEY adv.push_mapval
+end
 
 # Number of intent felts the sponge absorbs, and the capacity element that initializes the
 # permutation. The canonical signed intent is exactly 8 felts = one full sponge rate
@@ -33,13 +38,6 @@ const NUMBER_OF_HASHED_ELEMENTS_CAP = 0
 const ERR_STALE_NONCE = "operator: intent nonce must exceed the stored last_nonce"
 const ERR_EXPIRED = "operator: intent has expired (block height >= expiry_block)"
 
-
-const ADV_MAP_KEY = [0, 0, 0, 1]
-
-pub proc populate_adv_stack
-   push.ADV_MAP_KEY adv.push_mapval
-end
-
 #! Verifies a signed transfer intent on-chain and records it.
 #!
 #! Inputs:  [ sell_amount, buy_amount, user_suf, user_pre, sell_suf, sell_pre, buy_suf, buy_pre, pad(8)]
@@ -49,7 +47,8 @@ end
 #! Invocation: call
 @locals(12)
 pub proc verify_signature
-#! Inputs:  [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount, pad(8)]
+
+    # Inputs:  [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount, pad(8)]
     # We work only on the top 8 inputs (the full canonical intent); the call padding underneath
     # is left untouched (the transaction kernel manages it at the call boundary, as in the
     # standard account-component procedures).

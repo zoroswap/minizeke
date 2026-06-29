@@ -39,6 +39,7 @@ async fn test_swap() -> Result<()> {
                 asset_out: asset1,
                 min_amount_out: 10,
             },
+            user.pubkey(),
         );
 
         let order = order.start_processing();
