@@ -26,7 +26,7 @@ const DEPOSITOR_KEYS_SLOT = word("operator::depositor_keys")
 const ADV_MAP_KEY = [0, 0, 0, 1]
 
 pub proc populate_adv_stack
-   push.ADV_MAP_KEY adv.push_mapval
+    push.ADV_MAP_KEY adv.push_mapval dropw
 end
 
 # Number of intent felts the sponge absorbs, and the capacity element that initializes the
@@ -47,7 +47,6 @@ const ERR_EXPIRED = "operator: intent has expired (block height >= expiry_block)
 #! Invocation: call
 @locals(12)
 pub proc verify_signature
-
     # Inputs:  [user_prefix, user_suffix, sell_idx, sell_amount, user_prefix, user_suffix, buy_idx, buy_amount, pad(8)]
     # We work only on the top 8 inputs (the full canonical intent); the call padding underneath
     # is left untouched (the transaction kernel manages it at the call boundary, as in the
@@ -84,16 +83,28 @@ pub proc verify_signature
     # --- 2. Load THIS depositor's committed pubkey from the map and verify the signature. ---
     # The map is keyed by the depositor's account-id word; the intent's own [user_pre, user_suf]
     # selects the row, so a relayer cannot point one depositor's intent at another's key.
-    padw loc_loadw_le.0 drop drop swap 
-    # => [user_pref, user_suf MSG, pad...]   (raw map KEY restored; user_pre = TOP)
-    push.0 swap.2 
-    # => [user_suf, user_pref, 0 MSG, pad...]   (raw map KEY restored; user_pre = TOP)
-    push.0 swap.2
+    padw padw loc_loadw_le.0
+
+    debug.stack
+    movdn.3 movdn.3 drop drop swap
+
     # => [user_pref, user_suf, 0, 0, MSG, pad...]   (raw map KEY restored; user_pre = TOP)
+    debug.stack.8
     push.DEPOSITOR_KEYS_SLOT[0..2]
     # => [slot_prefix, slot_suffix, user_pre, user_suf, 0, 0, MSG, pad...]
+    debug.stack
     exec.active_account::get_map_item
     # => [PK_COMM, MSG, pad...]   (kernel hashes the RAW key internally; returns the seeded commitment)
+
+    movdn.5
+    movdn.5
+    movdn.5
+    movdn.5
+    drop drop
+
+    debug.stack
+    debug.adv_stack
+    
     exec.ecdsa_k256_keccak::verify
     # => [pad...]   (aborts the tx if commitment or signature is invalid)
 

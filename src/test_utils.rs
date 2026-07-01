@@ -57,8 +57,9 @@ pub async fn get_client() -> Result<Client<FilesystemKeyStore>> {
     let store = Arc::new(sqlite_store);
     let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
-    let client = ClientBuilder::for_testnet()
-        .prover(remote_prover)
+    let client = ClientBuilder::for_localhost()
+        // .prover(remote_prover)
+        .in_debug_mode(true.into())
         .store(store)
         .authenticator(keystore)
         .build()

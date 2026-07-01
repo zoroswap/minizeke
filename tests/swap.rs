@@ -27,6 +27,7 @@ async fn test_swap() -> Result<()> {
             buy_idx: 1,
             sell_amount: 10,
             buy_amount: 10,
+            pubkey_commitment: user.pubkey().to_commitment(),
         };
 
         let msg_word = intent.message_word();

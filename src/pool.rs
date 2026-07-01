@@ -16,6 +16,7 @@ use miden_core::{Felt, Word, ZERO};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 use serde::Serialize;
+use tracing::info;
 
 use crate::{miden_execution::user_id_word, user::User};
 
@@ -155,11 +156,10 @@ pub fn build_operator_component(
     // let nonce_slot = StorageSlotName::new(LAST_NONCE_SLOT).expect("slot name must parse");
     // let auth_slot = StorageSlotName::new(LAST_AUTH_SLOT).expect("slot name must parse");
 
-    let map = StorageMap::with_entries(
-        depositors
-            .iter()
-            .map(|(uid, comm)| (StorageMapKey::new(*uid), *comm)),
-    )
+    let map = StorageMap::with_entries(depositors.iter().map(|(uid, comm)| {
+        info!("depositor {uid:?}, commitment {comm:?}");
+        (StorageMapKey::new(*uid), *comm)
+    }))
     .expect("depositor map must build");
 
     let component = AccountComponent::new(

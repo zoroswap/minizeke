@@ -1,4 +1,7 @@
-use miden_client::account::{AccountId, StorageSlotId};
+use miden_client::{
+    account::{AccountId, StorageSlotId},
+    auth::PublicKeyCommitment,
+};
 
 use crate::intent::Intent;
 
@@ -39,14 +42,19 @@ pub fn make_exec_script(intents: Vec<Intent>) -> String {
             sell_amount,
             buy_idx,
             buy_amount,
+            pubkey_commitment: _,
         } = intent;
+
         let trade_string = format!(
             // "push.{buy_amount}.{buy_asset_index}.{user_suffix}.{user_prefix}.{sell_amount}.{sell_asset_index}.{user_suffix}.{user_prefix} call.execute_swap\n",
 
             // sell_amount, buy_amount, user_suf, user_pre, sell_suf, sell_pre, buy_suf, buy_pre
             //
             r#"
-    push.{buy_amount}.{buy_idx}.{user_prefix}.{user_suffix}.{sell_amount}.{sell_idx}.{user_prefix}.{user_suffix} call.execute_swap"#,
+       push.{buy_amount}.{buy_idx}.{user_prefix}.{user_suffix}.{sell_amount}.{sell_idx}.{user_prefix}.{user_suffix}
+    
+       call.execute_swap"#,
+            //intent.tx_script_string()
         );
 
         script.push_str(&trade_string);

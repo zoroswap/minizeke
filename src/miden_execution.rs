@@ -73,8 +73,9 @@ impl MidenExecution {
 
         let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
 
-        let mut client = ClientBuilder::for_testnet()
-            .prover(remote_prover)
+        let mut client = ClientBuilder::for_localhost()
+            // .prover(remote_prover)
+            .in_debug_mode(true.into())
             .store(store)
             .authenticator(keystore)
             .build()
@@ -264,19 +265,28 @@ impl MidenExecution {
                 buy_idx,
                 sell_amount: details.amount_in,
                 buy_amount: amount_out,
+                pubkey_commitment: order.pubkey().to_commitment(),
             };
 
             let signed_order = order.signed_order();
-            // let pubkey = order.pubkey();
+            let pubkey = order.pubkey();
 
             let msg = intent.message_word();
-            // let pk_comm: Word = pubkey.to_commitment().into();
+            let pk_comm: Word = pubkey.to_commitment().into();
+
+            info!(
+                "pk_comm: {pk_comm:?}, msg: {:?}, user suffix: {}, user prefix: {}",
+                intent.message_word(),
+                intent.user_suffix,
+                intent.user_prefix
+            );
+
             let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg); // [PK[9], SIG[17]]
 
             info!("prepared len: {}", prepared.len());
 
-            // advice_stack.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
-            // advice_stack.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
+            // advice_data.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
+            // advice_data.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
             advice_data.extend_from_slice(&prepared); // PK[9], SIG[17]
 
             intents.push(intent);

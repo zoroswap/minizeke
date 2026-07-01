@@ -1,3 +1,4 @@
+use miden_client::auth::PublicKeyCommitment;
 use miden_core::{Felt, Word};
 use miden_protocol::crypto::hash::poseidon2::Poseidon2;
 
@@ -14,6 +15,7 @@ pub struct Intent {
     pub sell_amount: u64,
     pub buy_idx: u64,
     pub buy_amount: u64,
+    pub pubkey_commitment: PublicKeyCommitment,
 }
 
 impl Intent {
@@ -25,6 +27,8 @@ impl Intent {
             self.user_prefix,
             self.sell_idx,
             self.sell_amount,
+            self.user_suffix,
+            self.user_prefix,
             self.buy_idx,
             self.buy_amount,
         ]
@@ -33,6 +37,19 @@ impl Intent {
     /// The Word the user signs.
     pub fn message_word(&self) -> Word {
         message_word(&self.canonical_felts())
+    }
+
+    pub fn tx_script_string(&self) -> String {
+        let pubkey_commitment: Word = self.pubkey_commitment.into();
+        let pubkey_committment_a = pubkey_commitment.a;
+        let pubkey_committment_b = pubkey_commitment.b;
+        let pubkey_committment_c = pubkey_commitment.c;
+        let pubkey_committment_d = pubkey_commitment.d;
+        let msg = self.message_word();
+        format!(
+            "push.{}.{}.{}.{}.{pubkey_committment_d}.{pubkey_committment_c}.{pubkey_committment_b}.{pubkey_committment_a}",
+            msg[3], msg[2], msg[1], msg[0]
+        )
     }
 }
 
