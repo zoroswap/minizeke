@@ -39,6 +39,7 @@ end
 #! Inputs:  [slot_prefix, slot_suffix, idx, amount]
 #! Outputs: []
 pub proc sub_from_user_balance
+    debug.stack
     exec.sub_from_storage_item_at_idx
     # => []
 end
@@ -109,11 +110,15 @@ end
 
 pub proc execute_swap
     exec.operator::populate_adv_stack
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
+    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]
     exec.operator::verify_signature
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
+    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]
+
+    debug.stack.8
+
     drop drop dup.3 dup.3
     # => [user_suffix, user_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
+    debug.stack.8
     exec.sub_from_user_balance
     # => [BUY_KEY]
     exec.add_to_user_balance

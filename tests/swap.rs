@@ -2,6 +2,7 @@ use anyhow::Result;
 use minizeke::{
     intent::Intent,
     order::{Order, OrderDetails, OrderExecutionResult},
+    pool::get_user_balance_storage_slot_names,
     test_utils::{get_asset0, get_asset1, get_miden_execution},
 };
 
@@ -19,15 +20,19 @@ async fn test_swap() -> Result<()> {
     for (user_id, user) in users.by_account_id() {
         let user_suffix: u64 = user_id.suffix().as_canonical_u64();
         let user_prefix: u64 = user_id.prefix().as_u64();
+        let user_keys = get_user_balance_storage_slot_names();
+        let user_index = users.get_user_index(&user_id);
+        let user_key_slot = &user_keys[user_index as usize];
 
         let intent = Intent {
             user_suffix,
             user_prefix,
+            user_key_prefix: user_key_slot.id().prefix().as_canonical_u64(),
+            user_key_suffix: user_key_slot.id().suffix().as_canonical_u64(),
             sell_idx: 0,
             buy_idx: 1,
             sell_amount: 10,
             buy_amount: 10,
-            pubkey_commitment: user.pubkey().to_commitment(),
         };
 
         let msg_word = intent.message_word();

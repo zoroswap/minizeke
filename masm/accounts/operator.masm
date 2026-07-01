@@ -85,14 +85,11 @@ pub proc verify_signature
     # selects the row, so a relayer cannot point one depositor's intent at another's key.
     padw padw loc_loadw_le.0
 
-    debug.stack
     movdn.3 movdn.3 drop drop swap
 
     # => [user_pref, user_suf, 0, 0, MSG, pad...]   (raw map KEY restored; user_pre = TOP)
-    debug.stack.8
     push.DEPOSITOR_KEYS_SLOT[0..2]
     # => [slot_prefix, slot_suffix, user_pre, user_suf, 0, 0, MSG, pad...]
-    debug.stack
     exec.active_account::get_map_item
     # => [PK_COMM, MSG, pad...]   (kernel hashes the RAW key internally; returns the seeded commitment)
 

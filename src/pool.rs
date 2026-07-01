@@ -135,7 +135,7 @@ pub fn build_pool_component(
         lib,
         slot_names[..users.len()]
             .iter()
-            .map(|name| StorageSlot::with_value(name.clone(), user_balance.into()))
+            .map(|name| StorageSlot::with_value(name.clone(), user_balance))
             .collect(),
         AccountComponentMetadata::new("zoro_miden::pool"),
     )?;

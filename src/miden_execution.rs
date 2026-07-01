@@ -249,23 +249,29 @@ impl MidenExecution {
         // let slot_names = get_user_balance_storage_slot_names();
         for order in &orders {
             let user_id = order.user_id();
+            let user_index = self.users.get_user_index(&order.user_id());
             // let user_index = self.users.get_user_index(&user_id);
             let details = order.details();
+
             let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
             let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
 
             let user_suffix: u64 = user_id.suffix().as_canonical_u64();
             let user_prefix: u64 = user_id.prefix().as_u64();
+            let user_keys = get_user_balance_storage_slot_names();
+
+            let user_key_slot = &user_keys[user_index as usize];
 
             let intent = Intent {
                 user_suffix,
                 user_prefix,
+                user_key_prefix: user_key_slot.id().prefix().as_canonical_u64(),
+                user_key_suffix: user_key_slot.id().suffix().as_canonical_u64(),
                 sell_idx,
                 buy_idx,
                 sell_amount: details.amount_in,
                 buy_amount: amount_out,
-                pubkey_commitment: order.pubkey().to_commitment(),
             };
 
             let signed_order = order.signed_order();
