@@ -2,6 +2,5 @@
 /keystore
 store.sqlite3
 .env
-store.testnet.sqlite3
-
+store.*.sqlite3
 .DS_Store

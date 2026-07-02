@@ -2,6 +2,7 @@ pub mod api;
 pub mod execution_script;
 pub mod intent;
 pub mod message_broker;
+pub mod miden_env;
 pub mod miden_execution;
 pub mod oracle_sse;
 pub mod order;

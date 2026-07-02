@@ -9,9 +9,7 @@ use anyhow::{Result, anyhow};
 use miden_client::{
     Client, RemoteTransactionProver,
     account::AccountId,
-    builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::Endpoint,
     testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     },
@@ -26,6 +24,7 @@ use crate::{
     execution_script::make_exec_script,
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
+    miden_env::MidenNetwork,
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
     pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_operator, link_pool},
     user::{Users, get_users},
@@ -46,39 +45,48 @@ pub struct MidenExecution {
 
 impl MidenExecution {
     pub async fn initialize(message_broker: Arc<MessageBroker>) -> Result<Self> {
-        const DEFAULT_TX_PROVER_URL: &str = "https://tx-prover.testnet.miden.io";
         const DEFAULT_TX_PROVER_TIMEOUT_SECS: u64 = 30;
 
-        let tx_prover_url =
-            env::var("TX_PROVER_URL").unwrap_or_else(|_| DEFAULT_TX_PROVER_URL.to_string());
+        let network = MidenNetwork::from_env();
+        let tx_prover_url = env::var("TX_PROVER_URL")
+            .ok()
+            .or_else(|| network.tx_prover_url());
         let tx_prover_timeout_secs = env::var("TX_PROVER_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_TX_PROVER_TIMEOUT_SECS);
 
-        let remote_prover = Arc::new(
-            RemoteTransactionProver::new(tx_prover_url.clone())
-                .with_timeout(Duration::from_secs(tx_prover_timeout_secs)),
-        );
+        let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
 
-        info!(
-            prover = %tx_prover_url,
-            timeout_secs = tx_prover_timeout_secs,
-            "Using Miden testnet (rpc.testnet.miden.io)"
-        );
-
-        let sqlite_store = SqliteStore::new("store.testnet.sqlite3".into()).await?;
+        let sqlite_store = SqliteStore::new(network.store_path().into()).await?;
         let store = Arc::new(sqlite_store);
         let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
-        let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
-
-        let mut client = ClientBuilder::for_testnet()
-            .prover(remote_prover)
+        let mut client_builder = MidenNetwork::client_builder()
+            .in_debug_mode(true.into())
             .store(store)
-            .authenticator(keystore)
-            .build()
-            .await?;
+            .authenticator(keystore);
+
+        if let Some(ref url) = tx_prover_url {
+            let remote_prover = Arc::new(
+                RemoteTransactionProver::new(url.clone())
+                    .with_timeout(prover_timeout),
+            );
+            info!(
+                network = network.as_str(),
+                prover = %url,
+                timeout_secs = tx_prover_timeout_secs,
+                "Using Miden network with remote prover"
+            );
+            client_builder = client_builder.prover(remote_prover);
+        } else {
+            info!(
+                network = network.as_str(),
+                "Using Miden network with local prover"
+            );
+        }
+
+        let mut client = client_builder.build().await?;
 
         client.ensure_genesis_in_place().await?;
         client.sync_state().await?;
@@ -96,7 +104,7 @@ impl MidenExecution {
 
         println!(
             "Pool deployed. BECH32: {}, HEX: {}",
-            pool.id().to_bech32(Endpoint::testnet().to_network_id()),
+            pool.id().to_bech32(network.endpoint().to_network_id()),
             pool.id().to_hex()
         );
 
@@ -248,18 +256,25 @@ impl MidenExecution {
         // let slot_names = get_user_balance_storage_slot_names();
         for order in &orders {
             let user_id = order.user_id();
+            let user_index = self.users.get_user_index(&order.user_id());
             // let user_index = self.users.get_user_index(&user_id);
             let details = order.details();
+
             let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
             let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
 
             let user_suffix: u64 = user_id.suffix().as_canonical_u64();
             let user_prefix: u64 = user_id.prefix().as_u64();
+            let user_keys = get_user_balance_storage_slot_names();
+
+            let user_key_slot = &user_keys[user_index as usize];
 
             let intent = Intent {
                 user_suffix,
                 user_prefix,
+                user_key_prefix: user_key_slot.id().prefix().as_canonical_u64(),
+                user_key_suffix: user_key_slot.id().suffix().as_canonical_u64(),
                 sell_idx,
                 buy_idx,
                 sell_amount: details.amount_in,
@@ -267,16 +282,24 @@ impl MidenExecution {
             };
 
             let signed_order = order.signed_order();
-            // let pubkey = order.pubkey();
+            let pubkey = order.pubkey();
 
             let msg = intent.message_word();
-            // let pk_comm: Word = pubkey.to_commitment().into();
+            let pk_comm: Word = pubkey.to_commitment().into();
+
+            info!(
+                "pk_comm: {pk_comm:?}, msg: {:?}, user suffix: {}, user prefix: {}",
+                intent.message_word(),
+                intent.user_suffix,
+                intent.user_prefix
+            );
+
             let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg); // [PK[9], SIG[17]]
 
             info!("prepared len: {}", prepared.len());
 
-            // advice_stack.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
-            // advice_stack.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
+            // advice_data.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
+            // advice_data.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
             advice_data.extend_from_slice(&prepared); // PK[9], SIG[17]
 
             intents.push(intent);

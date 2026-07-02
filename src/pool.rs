@@ -1,23 +1,71 @@
-use std::{fs::read_to_string, path::PathBuf};
+use std::{
+    fs::read_to_string,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{Result, anyhow};
 use miden_client::{
     Client,
     account::{
-        Account, AccountBuilder, AccountComponent, AccountId, AccountType, StorageMap,
-        StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
+        Account, AccountBuilder, AccountComponent, AccountId, AccountStorage, AccountType,
+        StorageMap, StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
     },
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKeyCommitment},
     keystore::{FilesystemKeyStore, Keystore},
-    rpc::Endpoint,
+    rpc::{GrpcClient, NodeRpcClient},
 };
 use miden_core::{Felt, Word, ZERO};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 use serde::Serialize;
+use tracing::info;
 
-use crate::{miden_execution::user_id_word, user::User};
+use crate::{miden_env::MidenNetwork, miden_execution::user_id_word, user::User};
+
+pub const USER_INITIAL_ON_CHAIN_BALANCE: u64 = 1_000;
+
+static FETCH_RPC: OnceLock<Arc<GrpcClient>> = OnceLock::new();
+
+fn get_fetch_rpc() -> &'static Arc<GrpcClient> {
+    FETCH_RPC.get_or_init(|| {
+        let endpoint = MidenNetwork::from_env().endpoint();
+        Arc::new(GrpcClient::new(&endpoint, 30_000))
+    })
+}
+
+pub async fn fetch_account_storage_from_rpc(account_id: AccountId) -> Result<AccountStorage> {
+    let account = get_fetch_rpc()
+        .get_account_details(account_id)
+        .await
+        .map_err(|e| anyhow!("failed to fetch account from RPC: {e:?}"))?
+        .ok_or_else(|| anyhow!("account {} not found or is private", account_id.to_hex()))?;
+
+    Ok(account.storage().clone())
+}
+
+pub async fn get_user_balance_from_pool(
+    pool_id: AccountId,
+    user_index: u16,
+    asset_index: u8,
+) -> Result<u64> {
+    if asset_index > 1 {
+        return Err(anyhow!("asset_index must be 0 or 1, got {asset_index}"));
+    }
+
+    let storage = fetch_account_storage_from_rpc(pool_id).await?;
+    let slot_names = get_user_balance_storage_slot_names();
+    let slot_name = slot_names
+        .get(user_index as usize)
+        .ok_or_else(|| anyhow!("user_index {user_index} out of range"))?;
+
+    let word = storage
+        .get_item(slot_name)
+        .map_err(|e| anyhow!("failed to read storage slot {}: {e:?}", slot_name.as_str()))?;
+
+    Ok(word.as_elements()[asset_index as usize].as_canonical_u64())
+}
 
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct PoolState {
@@ -77,7 +125,7 @@ pub async fn deploy_pool(
         "contract id: {:?}",
         pool_contract
             .id()
-            .to_bech32(Endpoint::devnet().to_network_id())
+            .to_bech32(MidenNetwork::from_env().endpoint().to_network_id())
     );
 
     Ok((pool_contract, pool_component))
@@ -102,7 +150,7 @@ pub fn build_pool_component(
     let cb = link_operator(cb)?;
     let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
 
-    let user_amount = 1_000;
+    let user_amount = USER_INITIAL_ON_CHAIN_BALANCE;
 
     let pool_balance_0: Word = [
         Felt::new(pool_0_balance).unwrap(),
@@ -134,7 +182,7 @@ pub fn build_pool_component(
         lib,
         slot_names[..users.len()]
             .iter()
-            .map(|name| StorageSlot::with_value(name.clone(), user_balance.into()))
+            .map(|name| StorageSlot::with_value(name.clone(), user_balance))
             .collect(),
         AccountComponentMetadata::new("zoro_miden::pool"),
     )?;
@@ -155,11 +203,10 @@ pub fn build_operator_component(
     // let nonce_slot = StorageSlotName::new(LAST_NONCE_SLOT).expect("slot name must parse");
     // let auth_slot = StorageSlotName::new(LAST_AUTH_SLOT).expect("slot name must parse");
 
-    let map = StorageMap::with_entries(
-        depositors
-            .iter()
-            .map(|(uid, comm)| (StorageMapKey::new(*uid), *comm)),
-    )
+    let map = StorageMap::with_entries(depositors.iter().map(|(uid, comm)| {
+        info!("depositor {uid:?}, commitment {comm:?}");
+        (StorageMapKey::new(*uid), *comm)
+    }))
     .expect("depositor map must build");
 
     let component = AccountComponent::new(
