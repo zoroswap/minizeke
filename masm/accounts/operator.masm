@@ -98,9 +98,6 @@ pub proc verify_signature
     movdn.5
     movdn.5
     drop drop
-
-    debug.stack
-    debug.adv_stack
     
     exec.ecdsa_k256_keccak::verify
     # => [pad...]   (aborts the tx if commitment or signature is invalid)

@@ -1,8 +1,13 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use minizeke::{
     intent::Intent,
     order::{Order, OrderDetails, OrderExecutionResult},
-    pool::get_user_balance_storage_slot_names,
+    pool::{
+        USER_INITIAL_ON_CHAIN_BALANCE, get_user_balance_from_pool,
+        get_user_balance_storage_slot_names,
+    },
     test_utils::{get_asset0, get_asset1, get_miden_execution},
 };
 
@@ -56,6 +61,17 @@ async fn test_swap() -> Result<()> {
     }
 
     miden_execution.handle_batch(orders).await;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let pool_id = miden_execution.pool_id();
+    for (user_id, _) in users.by_account_id() {
+        let user_index = users.get_user_index(&user_id);
+        let asset0_bal = get_user_balance_from_pool(pool_id, user_index, 0).await?;
+        let asset1_bal = get_user_balance_from_pool(pool_id, user_index, 1).await?;
+        assert_eq!(asset0_bal, USER_INITIAL_ON_CHAIN_BALANCE - 10);
+        assert_eq!(asset1_bal, USER_INITIAL_ON_CHAIN_BALANCE + 10);
+    }
 
     Ok(())
 }

@@ -11,6 +11,7 @@ mod api;
 mod execution_script;
 mod intent;
 mod message_broker;
+mod miden_env;
 mod miden_execution;
 mod oracle_sse;
 mod order;

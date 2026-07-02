@@ -9,9 +9,7 @@ use anyhow::{Result, anyhow};
 use miden_client::{
     Client, RemoteTransactionProver,
     account::AccountId,
-    builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::Endpoint,
     testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     },
@@ -26,6 +24,7 @@ use crate::{
     execution_script::make_exec_script,
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
+    miden_env::MidenNetwork,
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
     pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_operator, link_pool},
     user::{Users, get_users},
@@ -46,40 +45,48 @@ pub struct MidenExecution {
 
 impl MidenExecution {
     pub async fn initialize(message_broker: Arc<MessageBroker>) -> Result<Self> {
-        const DEFAULT_TX_PROVER_URL: &str = "https://tx-prover.testnet.miden.io";
         const DEFAULT_TX_PROVER_TIMEOUT_SECS: u64 = 30;
 
-        let tx_prover_url =
-            env::var("TX_PROVER_URL").unwrap_or_else(|_| DEFAULT_TX_PROVER_URL.to_string());
+        let network = MidenNetwork::from_env();
+        let tx_prover_url = env::var("TX_PROVER_URL")
+            .ok()
+            .or_else(|| network.tx_prover_url());
         let tx_prover_timeout_secs = env::var("TX_PROVER_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_TX_PROVER_TIMEOUT_SECS);
 
-        let remote_prover = Arc::new(
-            RemoteTransactionProver::new(tx_prover_url.clone())
-                .with_timeout(Duration::from_secs(tx_prover_timeout_secs)),
-        );
+        let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
 
-        info!(
-            prover = %tx_prover_url,
-            timeout_secs = tx_prover_timeout_secs,
-            "Using Miden testnet (rpc.testnet.miden.io)"
-        );
-
-        let sqlite_store = SqliteStore::new("store.testnet.sqlite3".into()).await?;
+        let sqlite_store = SqliteStore::new(network.store_path().into()).await?;
         let store = Arc::new(sqlite_store);
         let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
-        let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
-
-        let mut client = ClientBuilder::for_localhost()
-            // .prover(remote_prover)
+        let mut client_builder = MidenNetwork::client_builder()
             .in_debug_mode(true.into())
             .store(store)
-            .authenticator(keystore)
-            .build()
-            .await?;
+            .authenticator(keystore);
+
+        if let Some(ref url) = tx_prover_url {
+            let remote_prover = Arc::new(
+                RemoteTransactionProver::new(url.clone())
+                    .with_timeout(prover_timeout),
+            );
+            info!(
+                network = network.as_str(),
+                prover = %url,
+                timeout_secs = tx_prover_timeout_secs,
+                "Using Miden network with remote prover"
+            );
+            client_builder = client_builder.prover(remote_prover);
+        } else {
+            info!(
+                network = network.as_str(),
+                "Using Miden network with local prover"
+            );
+        }
+
+        let mut client = client_builder.build().await?;
 
         client.ensure_genesis_in_place().await?;
         client.sync_state().await?;
@@ -97,7 +104,7 @@ impl MidenExecution {
 
         println!(
             "Pool deployed. BECH32: {}, HEX: {}",
-            pool.id().to_bech32(Endpoint::testnet().to_network_id()),
+            pool.id().to_bech32(network.endpoint().to_network_id()),
             pool.id().to_hex()
         );
 
