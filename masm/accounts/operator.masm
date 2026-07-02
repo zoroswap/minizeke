@@ -27,6 +27,7 @@ const ADV_MAP_KEY = [0, 0, 0, 1]
 
 pub proc populate_adv_stack
     push.ADV_MAP_KEY adv.push_mapval dropw
+    debug.adv_stack
 end
 
 # Number of intent felts the sponge absorbs, and the capacity element that initializes the

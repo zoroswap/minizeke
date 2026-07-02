@@ -12,7 +12,7 @@ use miden_client::{
         StorageMap, StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
     },
     assembly::CodeBuilder,
-    auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKeyCommitment},
+    auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
     rpc::{GrpcClient, NodeRpcClient},
 };

@@ -108,7 +108,7 @@ end
 # ----------------------------------------------------------------------------------------------
 
 pub proc execute_swap
-    exec.operator::populate_adv_stack
+    # exec.operator::populate_adv_stack
     # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]
     exec.operator::verify_signature
     # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]

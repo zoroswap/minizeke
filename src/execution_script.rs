@@ -24,8 +24,12 @@ pub struct PoolStateDelta {
 const TX_SCRIPT_START: &str = r#"
 use zoro_miden::pool::execute_swap
 use miden::core::sys
+    const ADV_MAP_KEY = [0, 0, 0, 1]
 
-  begin"#;
+  begin
+    push.ADV_MAP_KEY adv.push_mapval dropw
+
+"#;
 
 const TX_SCRIPT_END: &str = r#"
     exec.sys::truncate_stack

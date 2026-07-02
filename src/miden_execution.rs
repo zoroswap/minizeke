@@ -68,10 +68,8 @@ impl MidenExecution {
             .authenticator(keystore);
 
         if let Some(ref url) = tx_prover_url {
-            let remote_prover = Arc::new(
-                RemoteTransactionProver::new(url.clone())
-                    .with_timeout(prover_timeout),
-            );
+            let remote_prover =
+                Arc::new(RemoteTransactionProver::new(url.clone()).with_timeout(prover_timeout));
             info!(
                 network = network.as_str(),
                 prover = %url,
@@ -94,7 +92,7 @@ impl MidenExecution {
         println!("Client ready.");
 
         // spawn the user accounts
-        let users = get_users(1, &mut client).await?;
+        let users = get_users(10, &mut client).await?;
 
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
