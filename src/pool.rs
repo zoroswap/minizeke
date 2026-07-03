@@ -55,13 +55,10 @@ pub async fn get_user_balance_from_pool(
     }
 
     let storage = fetch_account_storage_from_rpc(pool_id).await?;
-    let slot_names = get_user_balance_storage_slot_names();
-    let slot_name = slot_names
-        .get(user_index as usize)
-        .ok_or_else(|| anyhow!("user_index {user_index} out of range"))?;
+    let slot_name = get_user_balance_storage_slot_name(user_index);
 
     let word = storage
-        .get_item(slot_name)
+        .get_item(&slot_name)
         .map_err(|e| anyhow!("failed to read storage slot {}: {e:?}", slot_name.as_str()))?;
 
     Ok(word.as_elements()[asset_index as usize].as_canonical_u64())
@@ -131,12 +128,16 @@ pub async fn deploy_pool(
     Ok((pool_contract, pool_component))
 }
 
-pub fn get_user_balance_storage_slot_names() -> Vec<StorageSlotName> {
+pub fn get_user_balance_storage_slot_names(n_users: usize) -> Vec<StorageSlotName> {
     let mut slot_names: Vec<StorageSlotName> = Vec::with_capacity(100);
-    for i in 0..100 {
+    for i in 0..n_users {
         slot_names.push(n(format!("pool::user_{i}_balance").as_str()));
     }
     slot_names
+}
+
+pub fn get_user_balance_storage_slot_name(index: u16) -> StorageSlotName {
+    n(format!("pool::user_{index}_balance").as_str())
 }
 
 pub fn build_pool_component(
@@ -176,7 +177,7 @@ pub fn build_pool_component(
     ]
     .into();
 
-    let slot_names = get_user_balance_storage_slot_names();
+    let slot_names = get_user_balance_storage_slot_names(users.len());
 
     let component = AccountComponent::new(
         lib,

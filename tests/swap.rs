@@ -25,9 +25,8 @@ async fn test_swap() -> Result<()> {
     for (user_id, user) in users.by_account_id() {
         let user_suffix: u64 = user_id.suffix().as_canonical_u64();
         let user_prefix: u64 = user_id.prefix().as_u64();
-        let user_keys = get_user_balance_storage_slot_names();
         let user_index = users.get_user_index(&user_id);
-        let user_key_slot = &user_keys[user_index as usize];
+        let user_key_slot = get_user_balance_storage_slot_name(user_index);
 
         let intent = Intent {
             user_suffix,

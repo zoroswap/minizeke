@@ -26,6 +26,7 @@ use crate::{
     order::{Order, OrderDetails, OrderType, SerializableOrder},
     serde::{deserialize_account_id, serialize_account_id},
     store::Store,
+    test_utils::{get_asset0, get_asset1},
     websocket::{connection_manager::ConnectionManager, handlers::websocket_handler},
 };
 
@@ -138,6 +139,8 @@ async fn users(State(state): State<AppState>) -> impl IntoResponse {
                 "user_id": user.id,
                 "private_key": user.signing_key,
                 "index": user.index,
+                "balance_slot_prefix": user.balance_slot_prefix,
+                "balance_slot_suffix": user.balance_slot_suffix,
             })
         })
         .collect();
@@ -176,7 +179,9 @@ async fn pool_info(State(state): State<AppState>) -> impl IntoResponse {
 
     let response = serde_json::json!({
         "pool_account_id": state.store.pool_id().to_hex(),
-        "liq_pools": vec![(pool0_addr.to_hex(), pool0_state), (pool1_addr.to_hex(), pool1_state)]
+        "liq_pools": vec![(pool0_addr.to_hex(), pool0_state), (pool1_addr.to_hex(), pool1_state)],
+        "asset0": get_asset0().to_hex(),
+        "asset1": get_asset1().to_hex()
     });
     let mut headers = HeaderMap::new();
     headers.insert(

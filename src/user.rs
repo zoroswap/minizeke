@@ -12,6 +12,8 @@ use miden_client::{
 use miden_core::Word;
 use rand::RngCore;
 
+use crate::pool::get_user_balance_storage_slot_name;
+
 #[derive(Debug, Clone)]
 pub struct Users {
     balances: DashMap<AccountId, DashMap<AccountId, u64>>, // faucet_id, user_id
@@ -147,10 +149,13 @@ impl TryFrom<User> for SerializedUser {
         }
         .ok_or_else(|| anyhow!("Error serializing keypair for user {}", value.id.to_hex()))?;
         let signing_key = general_purpose::STANDARD.encode(signing_key);
+        let user_slot_key = get_user_balance_storage_slot_name(value.index);
         Ok(Self {
             id: value.id.to_hex(),
             index: value.index,
             signing_key,
+            balance_slot_prefix: user_slot_key.id().prefix().as_canonical_u64(),
+            balance_slot_suffix: user_slot_key.id().suffix().as_canonical_u64(),
         })
     }
 }
@@ -159,6 +164,8 @@ impl TryFrom<User> for SerializedUser {
 pub struct SerializedUser {
     pub id: String,
     pub index: u16,
+    pub balance_slot_prefix: u64,
+    pub balance_slot_suffix: u64,
     pub signing_key: String,
 }
 

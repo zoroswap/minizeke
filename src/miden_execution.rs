@@ -26,7 +26,7 @@ use crate::{
     message_broker::message_broker::{AmmEvent, MessageBroker},
     miden_env::MidenNetwork,
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_names, link_operator, link_pool},
+    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_name, link_operator, link_pool},
     user::{Users, get_users},
 };
 
@@ -264,15 +264,13 @@ impl MidenExecution {
 
             let user_suffix: u64 = user_id.suffix().as_canonical_u64();
             let user_prefix: u64 = user_id.prefix().as_u64();
-            let user_keys = get_user_balance_storage_slot_names();
-
-            let user_key_slot = &user_keys[user_index as usize];
+            let user_slot_key = get_user_balance_storage_slot_name(user_index);
 
             let intent = Intent {
                 user_suffix,
                 user_prefix,
-                user_key_prefix: user_key_slot.id().prefix().as_canonical_u64(),
-                user_key_suffix: user_key_slot.id().suffix().as_canonical_u64(),
+                user_key_prefix: user_slot_key.id().prefix().as_canonical_u64(),
+                user_key_suffix: user_slot_key.id().suffix().as_canonical_u64(),
                 sell_idx,
                 buy_idx,
                 sell_amount: details.amount_in,
