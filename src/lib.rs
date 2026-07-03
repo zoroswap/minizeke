@@ -1,4 +1,5 @@
 pub mod api;
+pub mod assembly_utils;
 pub mod execution_script;
 pub mod intent;
 pub mod message_broker;

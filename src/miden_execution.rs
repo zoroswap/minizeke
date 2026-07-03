@@ -21,12 +21,13 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
 use crate::{
+    assembly_utils::{link_operator, link_pool},
     execution_script::make_exec_script,
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
     miden_env::MidenNetwork,
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_name, link_operator, link_pool},
+    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_name},
     user::{Users, get_users},
 };
 

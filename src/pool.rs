@@ -1,8 +1,4 @@
-use std::{
-    fs::read_to_string,
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 use miden_client::{
@@ -16,13 +12,18 @@ use miden_client::{
     keystore::{FilesystemKeyStore, Keystore},
     rpc::{GrpcClient, NodeRpcClient},
 };
-use miden_core::{Felt, Word, ZERO};
+use miden_core::{Felt, Word};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 use serde::Serialize;
 use tracing::info;
 
-use crate::{miden_env::MidenNetwork, miden_execution::user_id_word, user::User};
+use crate::{
+    assembly_utils::{link_operator, link_storage_utils, read_masm_file, storage_slot_name},
+    miden_env::MidenNetwork,
+    miden_execution::user_id_word,
+    user::User,
+};
 
 pub const USER_INITIAL_ON_CHAIN_BALANCE: u64 = 1_000;
 
@@ -131,13 +132,15 @@ pub async fn deploy_pool(
 pub fn get_user_balance_storage_slot_names(n_users: usize) -> Vec<StorageSlotName> {
     let mut slot_names: Vec<StorageSlotName> = Vec::with_capacity(100);
     for i in 0..n_users {
-        slot_names.push(n(format!("pool::user_{i}_balance").as_str()));
+        slot_names.push(storage_slot_name(
+            format!("pool::user_{i}_balance").as_str(),
+        ));
     }
     slot_names
 }
 
 pub fn get_user_balance_storage_slot_name(index: u16) -> StorageSlotName {
-    n(format!("pool::user_{index}_balance").as_str())
+    storage_slot_name(format!("pool::user_{index}_balance").as_str())
 }
 
 pub fn build_pool_component(
@@ -222,77 +225,4 @@ pub fn build_operator_component(
     .expect("operator component must build");
 
     Ok(component)
-}
-
-pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let path = PathBuf::from_iter(
-        [manifest_dir, "masm"]
-            .into_iter()
-            .chain(path_steps.iter().copied()),
-    );
-    read_to_string(&path).map_err(|e| anyhow!("Error reading MASM file at path {path:?}: {e:?}"))
-}
-
-fn n(name: &str) -> StorageSlotName {
-    let name = StorageSlotName::new(name).expect("valid slot name");
-    // println!("Slot name: {:?}, id: {:?}", name, name.id());
-    name
-}
-
-pub fn link_pool(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    //let mut code_builder = link_storage_utils(code_builder)?;
-    let pool_code = read_masm_file(&["accounts", "pool.masm"])?;
-    code_builder.link_module("zoro_miden::pool", &pool_code)?;
-    Ok(code_builder)
-}
-
-pub fn link_storage_utils(code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let mut code_builder = link_math(code_builder)?;
-    let storage_utils_code = read_masm_file(&["lib", "storage_utils.masm"])?;
-    code_builder.link_module("zoro_miden::lib::storage_utils", &storage_utils_code)?;
-    Ok(code_builder)
-}
-
-pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let math_code = read_masm_file(&["lib", "math.masm"])?;
-    code_builder.link_module("zoro_miden::lib::math", &math_code)?;
-    Ok(code_builder)
-}
-
-pub fn link_operator(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let math_code = read_masm_file(&["accounts", "operator.masm"])?;
-    code_builder.link_module("zoro_miden::operator", &math_code)?;
-    Ok(code_builder)
-}
-
-fn map_from(entries: &[(Word, u64)]) -> StorageMap {
-    let mut map = StorageMap::new();
-    for (k, v) in entries {
-        map.insert(
-            StorageMapKey::new(*k),
-            [Felt::new(*v).unwrap(), ZERO, ZERO, ZERO].into(),
-        )
-        .expect("insert into map");
-    }
-    map
-}
-
-pub fn print_contract_procedures(pool_contract: &Account) {
-    println!("+++++Pool contract procedures");
-    pool_contract.code().procedures().iter().for_each(|proc| {
-        println!("Proc root: {:?} ", proc.mast_root().to_hex());
-    });
-}
-
-pub fn print_library_exports(masm_lib: &miden_assembly::Library) {
-    println!("+++++Masm lib exports:");
-    masm_lib.exports().for_each(|export| {
-        let path = export.path();
-        if let Some(root) = masm_lib.get_procedure_root_by_path(&path) {
-            println!("Export: {:?} {:?} {:?}", path, root, root.to_hex());
-        } else {
-            println!("Export: {:?} (no procedure root)", path);
-        }
-    });
 }
