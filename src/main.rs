@@ -7,22 +7,7 @@ use tokio::runtime::Builder;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
 
-mod api;
-mod execution_script;
-mod intent;
-mod message_broker;
-mod miden_env;
-mod miden_execution;
-mod oracle_sse;
-mod order;
-mod pool;
-mod price;
-mod processing;
-mod serde;
-mod store;
-pub mod test_utils;
-mod user;
-mod websocket;
+use minizeke::*;
 
 use crate::{
     message_broker::message_broker::{MessageBroker, StatsEvent},

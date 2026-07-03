@@ -1,0 +1,417 @@
+use miden::protocol::active_account
+use miden::protocol::native_account
+use miden::protocol::tx
+use miden::core::sys
+
+use zoro_miden::lib::math
+use zoro_miden::lib::storage_utils
+use zoro_miden::lib::asset_utils
+
+# ZORO VAULT (custody layer)
+#
+# Holds all real assets and tracks, per user per asset:
+#   - cumulative funding              (USER_ASSET_TOTAL_FUNDING)
+#   - cumulative initiated redeems    (USER_ASSET_TOTAL_INITIATED_REDEEMS)
+#   - cumulative completed redeems    (USER_ASSET_TOTAL_REDEEMS)
+#   - LP provider shares              (LP_ASSET_SHARES)
+#
+# Stores the POOL account id so it can FPI into the POOL for read-only checks.
+#
+# KEY CONVENTION (see docs/zoro_vault_pool_spec.md):
+#   user-asset KEY = [asset_suffix, asset_prefix, user_suffix, user_prefix]
+#   asset id on stack = [asset_suffix, asset_prefix]
+#   user id on stack  = [user_suffix, user_prefix]
+#
+# FPI CONVENTION (see docs/zoro_fpi_getter_export_notes.md):
+#   The POOL is the native account during a swap; the VAULT is the native account during
+#   redeem flows. Because a foreign context may NOT call back into the native account, the
+#   VAULT-native redeem flows read their own values locally and pass them to the POOL
+#   `*_with_vault_values` procedures via a single-hop FPI. The caller supplies the POOL
+#   procedure MAST root on the stack; the POOL account id is read from storage.
+
+# STORAGE SLOTS
+const USER_ASSET_TOTAL_FUNDING_SLOT = word("zorovault::user_asset_total_funding")
+const USER_ASSET_TOTAL_REDEEMS_SLOT = word("zorovault::user_asset_total_redeems")
+const USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT = word("zorovault::user_asset_total_initiated_redeems")
+const LP_ASSET_SHARES_SLOT = word("zorovault::lp_asset_shares")
+const POOL_ACCOUNT_ID_SLOT = word("zorovault::pool_account_id")
+const USER_POOL_BALANCE_DETAILS_PROC_ROOT = word("zorovault::user_pool_balance_details_proc_root")
+
+# ERRORS
+const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "VAULT: insufficient available balance to initiate redeem"
+const ERR_INSUFFICIENT_PENDING_REDEEM = "VAULT: user does not have enough pending redeem for asset"
+const ERR_INSUFFICIENT_POOL_BALANCE = "VAULT: pool user balance is lower than redeem amount"
+const ERR_LP_WITHDRAW_AMOUNT_EXCEEDS_USER_LP_SHARES = "VAULT: LP withdrawal amount exceeds user LP shares"
+
+# ----------------------------------------------------------------------------------------------
+# ID / KEY HELPERS
+# ----------------------------------------------------------------------------------------------
+
+#! Returns the stored POOL account id.
+#!
+#! Inputs:  []
+#! Outputs: [pool_id_suffix, pool_id_prefix]
+pub proc get_pool_account_id
+    push.POOL_ACCOUNT_ID_SLOT[0..2]
+    exec.active_account::get_item
+    # => [pool_id_suffix, pool_id_prefix, 0, 0]
+    movup.2 drop movup.2 drop
+    # => [pool_id_suffix, pool_id_prefix]
+end
+
+#! Sets the stored POOL account id.
+#!
+#! Inputs:  [pool_id_suffix, pool_id_prefix]
+#! Outputs: []
+pub proc set_pool_account_id
+    push.0.0 movup.3 movup.3
+    # => [pool_id_suffix, pool_id_prefix, 0, 0]
+    push.POOL_ACCOUNT_ID_SLOT[0..2]
+    exec.native_account::set_item
+    dropw
+end
+
+# ----------------------------------------------------------------------------------------------
+# MUTATORS (augmentations: explicit add_to_* / sub_from_* per mapping)
+# ----------------------------------------------------------------------------------------------
+
+#! USER_ASSET_TOTAL_FUNDING(assetId, userId) += amount
+#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: []
+pub proc add_to_user_asset_total_funding
+    movdn.4
+    # => [KEY, amount]
+    push.USER_ASSET_TOTAL_FUNDING_SLOT[0..2]
+    # => [slot_prefix, slot_suffix, KEY, amount]
+    exec.storage_utils::add_to_map_item drop
+end
+
+#! USER_ASSET_TOTAL_INITIATED_REDEEMS(assetId, userId) += amount
+#! Inputs:  [asset_suffix, asset_prefix, user_suffix, user_prefix, amount]
+#! Outputs: []
+pub proc add_to_user_asset_total_initiated_redeems
+    push.USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT[0..2]
+    exec.storage_utils::add_to_map_item drop
+end
+
+#! USER_ASSET_TOTAL_REDEEMS(assetId, userId) += amount
+#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: []
+pub proc add_to_user_asset_total_redeems
+    movdn.4
+    push.USER_ASSET_TOTAL_REDEEMS_SLOT[0..2]
+    exec.storage_utils::add_to_map_item drop
+end
+
+#! LP_ASSET_SHARES(assetId, lpProviderId) += shares
+#! Inputs:  [shares, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! Outputs: []
+pub proc add_to_lp_asset_shares
+    movdn.4
+    push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.storage_utils::add_to_map_item drop
+end
+
+#! LP_ASSET_SHARES(assetId, lpProviderId) -= shares
+#! Inputs:  [shares, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! Outputs: []
+pub proc sub_from_lp_asset_shares
+    movdn.4
+    push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.storage_utils::sub_from_map_item drop
+end
+
+# ----------------------------------------------------------------------------------------------
+# GETTERS (also exported for FPI; single felt outputs, well within FPI limits)
+# ----------------------------------------------------------------------------------------------
+
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: [amount]
+pub proc get_user_asset_total_funding_amount
+    push.USER_ASSET_TOTAL_FUNDING_SLOT[0..2]
+    exec.active_account::get_map_item
+    swap.3 drop drop drop
+end
+
+#! Inputs:  [KEY]
+#! Outputs: [amount]
+pub proc get_user_asset_total_redeemed_amount
+    push.USER_ASSET_TOTAL_REDEEMS_SLOT[0..2]
+    exec.active_account::get_map_item
+    swap.3 drop drop drop
+end
+
+#! Inputs:  [KEY]
+#! Outputs: [amount]
+pub proc get_user_asset_total_initiated_redeem_amount
+    push.USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT[0..2]
+    exec.active_account::get_map_item
+    swap.3 drop drop drop
+end
+
+#! Inputs:  [KEY]
+#! Outputs: [total_funding, total_redeemed, pending_redeem]
+pub proc get_user_asset_funding_details(key: word) -> (felt, felt, felt)
+    dupw exec.get_user_asset_total_funding_amount movdn.4
+    # => [KEY, total_funding]
+    dupw exec.get_user_asset_total_redeemed_amount movdn.5
+    # => [KEY, total_funding, total_redeemed]
+    exec.get_user_asset_pending_redeem_amount movdn.2
+    # => [total_funding, total_redeemed, pending_redeem]
+    exec.sys::truncate_stack
+end
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! Outputs: [shares]
+pub proc get_lp_asset_shares
+    push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.active_account::get_map_item
+    swap.3 drop drop drop
+end
+
+#! pending = total_initiated_redeems - total_redeems
+#! Inputs:  [KEY]
+#! Outputs: [pending]
+pub proc get_user_asset_pending_redeem_amount
+    dupw
+    # => [KEY, KEY]
+    exec.get_user_asset_total_initiated_redeem_amount
+    # => [initiated, KEY]
+    movdn.4
+    # => [KEY, initiated]
+    exec.get_user_asset_total_redeemed_amount
+    # => [redeemed, initiated]
+    exec.math::safe_sub
+    # => [initiated - redeemed]
+end
+
+#! Inputs:  [asset_suffix, asset_prefix]
+#! Outputs: [balance]
+pub proc get_total_asset_in_vault
+    exec.active_account::get_balance
+    # FPI-invoked procs must return with stack depth 16
+    exec.sys::truncate_stack
+end
+
+#! pending >= amount
+#! Inputs:  [amount, KEY]
+#! Outputs: [bool]
+pub proc has_user_enough_pending_redeem_for_asset
+    movdn.4
+    # => [KEY, amount]
+    exec.get_user_asset_pending_redeem_amount
+    # => [pending, amount]
+    swap
+    # => [amount, pending]
+    gte
+    # => [pending >= amount]
+end
+
+# ----------------------------------------------------------------------------------------------
+# LP KEY HELPERS
+# ----------------------------------------------------------------------------------------------
+
+#! Returns ASSET address (suffix, prefix).
+#! Inputs:  [ASSET]
+#! Outputs: [asset_suffix, asset_prefix]
+pub proc address_from_asset
+    swap.2 drop
+    swap.2 drop
+end
+
+#! Returns asset-only LP map key: [asset_suffix, asset_prefix, 0, 0].
+#! Inputs:  [ASSET]
+#! Outputs: [KEY]
+proc get_lp_total_supply_key
+    exec.address_word_from_asset
+end
+
+#! Inputs:  [ASSET]
+#! Outputs: [asset_suffix, asset_prefix, 0, 0]
+proc address_word_from_asset
+    push.0 swap.3 drop
+    push.0 swap.4 drop
+end
+
+#! Builds per-user LP key: [asset_suffix, asset_prefix, user_suffix, user_prefix].
+#! Inputs:  [ASSET, user_suffix, user_prefix]
+#! Outputs: [KEY]
+proc build_lp_key
+    exec.address_from_asset
+    # => [asset_suffix, asset_prefix, user_suffix, user_prefix]
+end
+
+#! Reads LP shares for a composite key.
+#! Inputs:  [KEY]
+#! Outputs: [shares]
+proc get_lp_shares_for_key
+    push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.active_account::get_map_item
+    swap.3 drop drop drop
+end
+
+# ----------------------------------------------------------------------------------------------
+# LP DEPOSIT / WITHDRAW
+# ----------------------------------------------------------------------------------------------
+
+#! Records LP shares for a provider deposit. Custody is handled by the consuming note.
+#!
+#! Inputs:  [ASSET, user_suffix, user_prefix, lp_amount]
+#! Outputs: []
+const VD_USER_LP_KEY_LOCAL = 0
+const VD_LP_AMOUNT_LOCAL = 4
+@locals(5)
+pub proc deposit
+    exec.build_lp_key
+    # => [USER_LP_KEY, lp_amount]
+    loc_storew_be.VD_USER_LP_KEY_LOCAL
+    movup.4
+    # => [lp_amount, KEY]
+    dup loc_store.VD_LP_AMOUNT_LOCAL
+    movdn.4
+    # => [USER_LP_KEY, lp_amount]
+    push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.storage_utils::add_to_map_item drop
+    # => []
+
+    # total supply += lp_amount
+    loc_load.VD_LP_AMOUNT_LOCAL padw loc_loadw_be.VD_USER_LP_KEY_LOCAL
+    exec.get_lp_total_supply_key
+    push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.storage_utils::add_to_map_item drop
+    exec.sys::truncate_stack
+end
+
+#! Burns LP shares for a provider withdrawal. Custody release is handled by the consuming note.
+#!
+#! Inputs:  [ASSET, user_suffix, user_prefix, lp_withdraw_amount]
+#!         (same stack layout as zoropool::withdraw from the WITHDRAW note)
+#! Outputs: []
+const VW_USER_SUFFIX_LOCAL = 0
+const VW_USER_PREFIX_LOCAL = 1
+const VW_LP_WITHDRAW_AMOUNT_LOCAL = 2
+const VW_USER_LP_SHARES_LOCAL = 3
+const VW_ASSET_LOCAL = 4
+const VW_USER_LP_KEY_LOCAL = 8
+@locals(12)
+pub proc withdraw
+    loc_store.VW_USER_SUFFIX_LOCAL loc_store.VW_USER_PREFIX_LOCAL loc_store.VW_LP_WITHDRAW_AMOUNT_LOCAL loc_storew_be.VW_ASSET_LOCAL dropw
+    loc_load.VW_USER_PREFIX_LOCAL loc_load.VW_USER_SUFFIX_LOCAL padw loc_loadw_be.VW_ASSET_LOCAL
+    exec.build_lp_key loc_storew_be.VW_USER_LP_KEY_LOCAL dropw
+    padw loc_loadw_be.VW_USER_LP_KEY_LOCAL exec.get_lp_shares_for_key loc_store.VW_USER_LP_SHARES_LOCAL
+    loc_load.VW_USER_LP_SHARES_LOCAL loc_load.VW_LP_WITHDRAW_AMOUNT_LOCAL
+    sub
+    dup loc_load.VW_USER_LP_SHARES_LOCAL
+    lt assert.err=ERR_LP_WITHDRAW_AMOUNT_EXCEEDS_USER_LP_SHARES
+
+    padw loc_loadw_be.VW_USER_LP_KEY_LOCAL push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.storage_utils::set_map_item drop
+
+    loc_load.VW_LP_WITHDRAW_AMOUNT_LOCAL
+    padw loc_loadw_be.VW_ASSET_LOCAL exec.get_lp_total_supply_key
+    push.LP_ASSET_SHARES_SLOT[0..2]
+    exec.storage_utils::sub_from_map_item drop
+    exec.sys::truncate_stack
+end
+
+# ----------------------------------------------------------------------------------------------
+# FLOWS
+# ----------------------------------------------------------------------------------------------
+
+const FFN_ASSET_LOCAL = 0
+#! VAULT::fund(amount, userId, assetId)
+#! Records cumulative funding. The asset receipt itself is handled by the consuming note
+#! (receive_asset on the wallet); this proc only updates the accounting map.
+#!
+#! Inputs:  [ASSET, user_suffix, user_prefix]
+#! Outputs: []
+@locals(4)
+pub proc fund
+    # loc.0-3: ASSET, loc.4-7: user_id
+    loc_storew_be.FFN_ASSET_LOCAL 
+    # => [ASSET, user_suffix, user_prefix]
+    exec.address_from_asset
+    # => [asset_suffix, asset_prefix, user_suffix, user_prefix]
+    padw loc_loadw_be.FFN_ASSET_LOCAL exec.asset_utils::get_amount_c
+    # => [funding_amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+    exec.add_to_user_asset_total_funding
+    exec.sys::truncate_stack
+end
+
+#! VAULT::initiate_redeem(amount, userId, assetId)
+#! Asserts the user has enough POOL available balance, then records the initiated redeem.
+#!
+#! available = POOL::get_user_asset_balance_with_vault_values(...) - pending(local)
+#! assert(available >= amount)
+#!
+#! The POOL balance is fetched via a single-hop FPI (VAULT native -> POOL foreign), passing
+#! the vault-derived totals so the POOL never needs to call back into the native VAULT.
+#!
+#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: []
+const IR_KEY_LOCAL = 0
+const IR_AMOUNT_LOCAL = 4
+const IR_AVAILABLE_LOCAL = 6
+@locals(7)
+pub proc initiate_redeem
+    # => [amount, KEY]
+    loc_store.IR_AMOUNT_LOCAL loc_storew_be.IR_KEY_LOCAL
+    # => [KEY]
+    exec.fetch_user_asset_balance_details
+    # => [balance, available_balance]
+    ### assert available >= amount
+    drop loc_load.IR_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+
+    # USER_ASSET_TOTAL_INITIATED_REDEEMS += amount
+    loc_load.IR_AMOUNT_LOCAL padw loc_loadw_be.IR_KEY_LOCAL
+    exec.add_to_user_asset_total_initiated_redeems
+end 
+
+#! VAULT::redeem(amount, userId, assetId)
+#! Asserts the user has enough pending redeem (local) and enough POOL balance (FPI), then
+#! records the completed redeem. The asset transfer out is handled by the consuming note.
+#!
+#! Inputs:  [amount, asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: []
+const R_KEY_LOCAL = 0
+const R_AMOUNT_LOCAL = 4
+const R_VAULT_TOTAL_FUNDING_LOCAL = 5
+const R_VAULT_TOTAL_REDEEMED_LOCAL = 6
+const R_POOL_USER_BALANCE_LOCAL = 7
+@locals(8)
+pub proc redeem
+    # => [amount, KEY] 
+    loc_store.R_AMOUNT_LOCAL loc_storew_be.R_KEY_LOCAL
+    # => [KEY]
+    # assert pending >= amount (local)
+    loc_load.R_AMOUNT_LOCAL exec.has_user_enough_pending_redeem_for_asset
+    assert.err=ERR_INSUFFICIENT_PENDING_REDEEM
+
+    padw loc_loadw_be.R_KEY_LOCAL exec.fetch_user_asset_balance_details
+    # => [balance, available_balance]
+    # assert pool_user_balance >= amount
+    loc_load.R_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_POOL_BALANCE
+    # => [available_balance]
+    drop
+    # USER_ASSET_TOTAL_REDEEMS += amount
+    padw loc_loadw_be.R_KEY_LOCAL loc_load.R_AMOUNT_LOCAL
+    exec.add_to_user_asset_total_redeems
+
+    # @todo create the bloody note
+end
+
+
+# ----------------------------------------------------------------------------------------------
+# FPI CALLS
+# ----------------------------------------------------------------------------------------------
+
+#! VAULT::get_user_asset_balance_details_with_vault_values(key: word) -> (balance: felt, available_balance: felt)
+#! Inputs:  [KEY]
+#! Outputs: [balance, available_balance]
+pub proc fetch_user_asset_balance_details(key: word) -> (felt, felt)
+    dupw exec.get_user_asset_funding_details movdn.6 movdn.6 movdn.6
+    # => [KEY, total_funding, total_redeemed, pending_redeem]
+    push.USER_POOL_BALANCE_DETAILS_PROC_ROOT exec.get_pool_account_id 
+    # => [pool_id_suffix, pool_id_prefix, ROOT, KEY, total_funding, total_redeemed, pending_redeem]
+    exec.tx::execute_foreign_procedure
+    # => [balance, available_balance]
+end

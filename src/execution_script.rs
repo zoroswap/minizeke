@@ -1,7 +1,4 @@
-use miden_client::{
-    account::{AccountId, StorageSlotId},
-    auth::PublicKeyCommitment,
-};
+use miden_client::account::{AccountId, StorageSlotId};
 
 use crate::intent::Intent;
 
