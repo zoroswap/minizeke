@@ -139,8 +139,10 @@ async fn users(State(state): State<AppState>) -> impl IntoResponse {
                 "user_id": user.id,
                 "private_key": user.signing_key,
                 "index": user.index,
-                "balance_slot_prefix": user.balance_slot_prefix,
-                "balance_slot_suffix": user.balance_slot_suffix,
+                "user_prefix": user.user_prefix.to_string(),
+                "user_suffix": user.user_suffix.to_string(),
+                "balance_slot_prefix": user.balance_slot_prefix.to_string(),
+                "balance_slot_suffix": user.balance_slot_suffix.to_string(),
             })
         })
         .collect();

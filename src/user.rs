@@ -143,16 +143,13 @@ impl User {
 impl TryFrom<User> for SerializedUser {
     type Error = anyhow::Error;
     fn try_from(value: User) -> std::result::Result<Self, Self::Error> {
-        let signing_key = match &value.key_pair {
-            AuthSecretKey::EcdsaK256Keccak(signing_key) => Some(signing_key.to_bytes()),
-            _ => None,
-        }
-        .ok_or_else(|| anyhow!("Error serializing keypair for user {}", value.id.to_hex()))?;
-        let signing_key = general_purpose::STANDARD.encode(signing_key);
+        let signing_key = general_purpose::STANDARD.encode(value.key_pair.to_bytes());
         let user_slot_key = get_user_balance_storage_slot_name(value.index);
         Ok(Self {
             id: value.id.to_hex(),
             index: value.index,
+            user_prefix: value.id.prefix().as_u64(),
+            user_suffix: value.id.suffix().as_canonical_u64(),
             signing_key,
             balance_slot_prefix: user_slot_key.id().prefix().as_canonical_u64(),
             balance_slot_suffix: user_slot_key.id().suffix().as_canonical_u64(),
@@ -164,6 +161,8 @@ impl TryFrom<User> for SerializedUser {
 pub struct SerializedUser {
     pub id: String,
     pub index: u16,
+    pub user_prefix: u64,
+    pub user_suffix: u64,
     pub balance_slot_prefix: u64,
     pub balance_slot_suffix: u64,
     pub signing_key: String,
