@@ -2,3 +2,5 @@
 /keystore
 store.sqlite3
 .env
+store.*.sqlite3
+.DS_Store

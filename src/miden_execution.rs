@@ -9,23 +9,24 @@ use anyhow::{Result, anyhow};
 use miden_client::{
     Client, RemoteTransactionProver,
     account::AccountId,
-    builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::Endpoint,
     testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     },
     transaction::TransactionRequestBuilder,
 };
 use miden_client_sqlite_store::SqliteStore;
+use miden_core::{Felt, Word};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
 use crate::{
-    execution::{Trade, make_exec_script},
+    execution_script::make_exec_script,
+    intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
+    miden_env::MidenNetwork,
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolState, deploy_pool, link_pool},
+    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_name, link_operator, link_pool},
     user::{Users, get_users},
 };
 
@@ -44,39 +45,46 @@ pub struct MidenExecution {
 
 impl MidenExecution {
     pub async fn initialize(message_broker: Arc<MessageBroker>) -> Result<Self> {
-        const DEFAULT_TX_PROVER_URL: &str = "https://tx-prover.testnet.miden.io";
         const DEFAULT_TX_PROVER_TIMEOUT_SECS: u64 = 30;
 
-        let tx_prover_url =
-            env::var("TX_PROVER_URL").unwrap_or_else(|_| DEFAULT_TX_PROVER_URL.to_string());
+        let network = MidenNetwork::from_env();
+        let tx_prover_url = env::var("TX_PROVER_URL")
+            .ok()
+            .or_else(|| network.tx_prover_url());
         let tx_prover_timeout_secs = env::var("TX_PROVER_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_TX_PROVER_TIMEOUT_SECS);
 
-        let remote_prover = Arc::new(
-            RemoteTransactionProver::new(tx_prover_url.clone())
-                .with_timeout(Duration::from_secs(tx_prover_timeout_secs)),
-        );
+        let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
 
-        info!(
-            prover = %tx_prover_url,
-            timeout_secs = tx_prover_timeout_secs,
-            "Using Miden testnet (rpc.testnet.miden.io)"
-        );
-
-        let sqlite_store = SqliteStore::new("store.testnet.sqlite3".into()).await?;
+        let sqlite_store = SqliteStore::new(network.store_path().into()).await?;
         let store = Arc::new(sqlite_store);
         let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
-        let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
-
-        let mut client = ClientBuilder::for_testnet()
-            .prover(remote_prover)
+        let mut client_builder = MidenNetwork::client_builder()
+            .in_debug_mode(true.into())
             .store(store)
-            .authenticator(keystore)
-            .build()
-            .await?;
+            .authenticator(keystore);
+
+        if let Some(ref url) = tx_prover_url {
+            let remote_prover =
+                Arc::new(RemoteTransactionProver::new(url.clone()).with_timeout(prover_timeout));
+            info!(
+                network = network.as_str(),
+                prover = %url,
+                timeout_secs = tx_prover_timeout_secs,
+                "Using Miden network with remote prover"
+            );
+            client_builder = client_builder.prover(remote_prover);
+        } else {
+            info!(
+                network = network.as_str(),
+                "Using Miden network with local prover"
+            );
+        }
+
+        let mut client = client_builder.build().await?;
 
         client.ensure_genesis_in_place().await?;
         client.sync_state().await?;
@@ -88,13 +96,13 @@ impl MidenExecution {
 
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
-        // spawn the pool account
-        let (pool, pool_component) =
+
+        let (pool, _) =
             deploy_pool(&mut client, users.clone(), pool_0_balance, pool_1_balance).await?;
 
         println!(
             "Pool deployed. BECH32: {}, HEX: {}",
-            pool.id().to_bech32(Endpoint::testnet().to_network_id()),
+            pool.id().to_bech32(network.endpoint().to_network_id()),
             pool.id().to_hex()
         );
 
@@ -188,7 +196,7 @@ impl MidenExecution {
     /// Execute a processed batch on the pool. On failure, mark every order in the
     /// batch as failed and still release the processing gate so the engine never
     /// deadlocks waiting for a settlement that will never come.
-    async fn handle_batch(&mut self, orders: Vec<Order<Processed>>) {
+    pub async fn handle_batch(&mut self, orders: Vec<Order<Processed>>) {
         info!(
             count = orders.len(),
             "Received processed batch for execution"
@@ -228,7 +236,6 @@ impl MidenExecution {
 
         let instant = Instant::now();
 
-        let mut trades = Vec::new();
         // let pool_state_deltas = vec![
         //     PoolStateDelta {
         //         pool_index: sell_pool_index,
@@ -239,36 +246,74 @@ impl MidenExecution {
         //         set_amount: buy_pool_balance,
         //     },
         // ];
-        let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
 
+        let mut intents = Vec::with_capacity(orders.len());
+        let mut advice_data = vec![];
+
+        let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+        // let slot_names = get_user_balance_storage_slot_names();
         for order in &orders {
-            let user_index = self
-                .users
-                .get_user_index(&order.user_id())
-                .ok_or(anyhow!("user not found"))?;
+            let user_id = order.user_id();
+            let user_index = self.users.get_user_index(&order.user_id());
+            // let user_index = self.users.get_user_index(&user_id);
             let details = order.details();
-            let buy_asset_index = if details.asset_out.eq(&asset0) { 0 } else { 1 };
-            let sell_asset_index = if details.asset_in.eq(&asset0) { 0 } else { 1 };
+
+            let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
+            let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
-            let trade = Trade {
-                user_index,
-                sell_asset_index,
-                buy_asset_index,
+
+            let user_suffix: u64 = user_id.suffix().as_canonical_u64();
+            let user_prefix: u64 = user_id.prefix().as_u64();
+            let user_slot_key = get_user_balance_storage_slot_name(user_index);
+
+            let intent = Intent {
+                user_suffix,
+                user_prefix,
+                user_key_prefix: user_slot_key.id().prefix().as_canonical_u64(),
+                user_key_suffix: user_slot_key.id().suffix().as_canonical_u64(),
+                sell_idx,
+                buy_idx,
                 sell_amount: details.amount_in,
                 buy_amount: amount_out,
             };
-            trades.push(trade);
+
+            let signed_order = order.signed_order();
+            let pubkey = order.pubkey();
+
+            let msg = intent.message_word();
+            let pk_comm: Word = pubkey.to_commitment().into();
+
+            info!(
+                "pk_comm: {pk_comm:?}, msg: {:?}, user suffix: {}, user prefix: {}",
+                intent.message_word(),
+                intent.user_suffix,
+                intent.user_prefix
+            );
+
+            let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg); // [PK[9], SIG[17]]
+
+            info!("prepared len: {}", prepared.len());
+
+            // advice_data.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
+            // advice_data.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
+            advice_data.extend_from_slice(&prepared); // PK[9], SIG[17]
+
+            intents.push(intent);
         }
 
-        let tx_script = make_exec_script(trades);
+        let tx_script = make_exec_script(intents);
 
-        println!("SCRIPT \n\n{tx_script}\n\n");
+        info!("SCRIPT \n\n{tx_script}\n\n");
 
-        let cb = link_pool(self.client.code_builder())?;
+        let cb = link_operator(self.client.code_builder())?;
+        let cb = link_pool(cb)?;
         let tx_script = cb.compile_tx_script(tx_script)?;
+
+        let advice_map_key = Word::from([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]);
 
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
+            .extend_advice_map([(advice_map_key, advice_data)])
             .build()?;
 
         let submit_started = Instant::now();
@@ -333,4 +378,15 @@ impl MidenExecution {
     pub fn pool_states(&self) -> HashMap<AccountId, PoolState> {
         self.pool_states.clone()
     }
+}
+
+/// The depositor's user-id word: `[id_prefix, id_suffix, 0, 0]`. This is the raw `StorageMap` key
+/// under which the operator stores/looks up this depositor's pubkey commitment (Plan 2 Q1).
+pub fn user_id_word(account_id: AccountId) -> Word {
+    Word::from([
+        account_id.prefix().as_felt(),
+        account_id.suffix(),
+        0u32.into(),
+        0u32.into(),
+    ])
 }

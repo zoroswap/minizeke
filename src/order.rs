@@ -1,6 +1,11 @@
+use base64::{Engine, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use miden_client::account::AccountId;
+use miden_client::{
+    Serializable,
+    account::AccountId,
+    auth::{PublicKey, Signature},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -130,25 +135,31 @@ pub enum OrderStatus {
 // States of the order
 #[derive(Debug, Clone)]
 pub struct Created;
+
 #[derive(Debug, Clone)]
 pub struct Processing;
+
 #[derive(Debug, Clone)]
 pub struct Processed {
     execution_result: OrderExecutionResult,
 }
+
 #[derive(Debug, Clone)]
 pub struct Executed {
     tx_hash: String,
     execution_result: OrderExecutionResult,
 }
+
 #[derive(Debug, Clone)]
 pub struct Settled {
     tx_hash: String,
     execution_result: OrderExecutionResult,
 }
+
 #[derive(Debug, Clone)]
 pub struct Failed {
     reason: OrderFailureReason,
+    tx_hash: Option<String>,
     execution_result: Option<OrderExecutionResult>,
 }
 
@@ -202,20 +213,27 @@ pub struct Order<State> {
     details: OrderDetails,
     order_type: OrderType,
     user_id: AccountId,
-    pubkey: String,
+    signed_order: Signature,
+    pubkey: PublicKey,
     timing: OrderTiming,
 }
 
 impl Order<Created> {
-    pub fn new(pubkey: String, user_id: AccountId, details: OrderDetails) -> Self {
+    pub fn new(
+        signed_order: Signature,
+        user_id: AccountId,
+        details: OrderDetails,
+        pubkey: PublicKey,
+    ) -> Self {
         Order {
             id: Uuid::new_v4(),
             timing: OrderTiming::new(),
-            pubkey,
+            signed_order,
             user_id,
             details,
             order_type: OrderType::Spot,
             state: Created,
+            pubkey,
         }
     }
 
@@ -226,8 +244,9 @@ impl Order<Created> {
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
-            pubkey: self.pubkey,
+            signed_order: self.signed_order,
             timing: self.timing.start_processing(),
+            pubkey: self.pubkey,
         }
     }
     pub fn user_id(&self) -> AccountId {
@@ -243,8 +262,9 @@ impl Order<Processing> {
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
-            pubkey: self.pubkey,
+            signed_order: self.signed_order,
             timing: self.timing.processed(),
+            pubkey: self.pubkey,
         }
     }
 
@@ -271,8 +291,9 @@ impl Order<Processed> {
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
-            pubkey: self.pubkey,
+            signed_order: self.signed_order,
             timing: self.timing.executed(),
+            pubkey: self.pubkey,
         }
     }
     pub fn failed(
@@ -284,13 +305,15 @@ impl Order<Processed> {
             state: Failed {
                 reason,
                 execution_result,
+                tx_hash: None,
             },
             id: self.id,
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
-            pubkey: self.pubkey,
+            signed_order: self.signed_order,
             timing: self.timing.failed(),
+            pubkey: self.pubkey,
         }
     }
     pub fn details(&self) -> OrderDetails {
@@ -301,6 +324,12 @@ impl Order<Processed> {
     }
     pub fn execution_result(&self) -> OrderExecutionResult {
         self.state.execution_result.clone()
+    }
+    pub fn signed_order(&self) -> Signature {
+        self.signed_order.clone()
+    }
+    pub fn pubkey(&self) -> PublicKey {
+        self.pubkey.clone()
     }
 }
 
@@ -315,8 +344,9 @@ impl Order<Executed> {
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
-            pubkey: self.pubkey,
+            signed_order: self.signed_order,
             timing: self.timing.settled(),
+            pubkey: self.pubkey,
         }
     }
     pub fn details(&self) -> OrderDetails {
@@ -475,7 +505,7 @@ pub struct SerializableOrder {
     details: OrderDetails,
     order_type: OrderType,
     user_id: String,
-    pubkey: String,
+    signed_order: String,
     timing: OrderTiming,
     failure_reason: Option<OrderFailureReason>,
     execution_result: Option<OrderExecutionResult>,
@@ -502,7 +532,7 @@ impl From<Order<Created>> for SerializableOrder {
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
-            pubkey: value.pubkey,
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
             timing: value.timing,
             failure_reason: None,
             execution_result: None,
@@ -517,7 +547,7 @@ impl From<Order<Processing>> for SerializableOrder {
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
-            pubkey: value.pubkey,
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
             timing: value.timing,
             failure_reason: None,
             execution_result: None,
@@ -532,7 +562,7 @@ impl From<Order<Processed>> for SerializableOrder {
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
-            pubkey: value.pubkey,
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
             timing: value.timing,
             failure_reason: None,
             execution_result: Some(value.state.execution_result),
@@ -547,7 +577,7 @@ impl From<Order<Executed>> for SerializableOrder {
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
-            pubkey: value.pubkey,
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
             timing: value.timing,
             failure_reason: None,
             execution_result: Some(value.state.execution_result),
@@ -562,7 +592,7 @@ impl From<Order<Settled>> for SerializableOrder {
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
-            pubkey: value.pubkey,
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
             timing: value.timing,
             failure_reason: None,
             execution_result: Some(value.state.execution_result),
@@ -577,7 +607,7 @@ impl From<Order<Failed>> for SerializableOrder {
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
-            pubkey: value.pubkey,
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
             timing: value.timing,
             failure_reason: Some(value.state.reason),
             execution_result: value.state.execution_result,

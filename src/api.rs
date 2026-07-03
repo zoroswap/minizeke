@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -7,8 +7,13 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose};
 use chrono::Utc;
-use miden_client::account::AccountId;
+use miden_client::{
+    Deserializable,
+    account::AccountId,
+    auth::{PublicKey, Signature},
+};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc};
@@ -21,6 +26,7 @@ use crate::{
     order::{Order, OrderDetails, OrderType, SerializableOrder},
     serde::{deserialize_account_id, serialize_account_id},
     store::Store,
+    test_utils::{get_asset0, get_asset1},
     websocket::{connection_manager::ConnectionManager, handlers::websocket_handler},
 };
 
@@ -39,6 +45,7 @@ struct NewOrderRequest {
     #[serde(serialize_with = "serialize_account_id")]
     #[serde(deserialize_with = "deserialize_account_id")]
     user_id: AccountId,
+    signed_intent: String,
     pubkey: String,
 }
 
@@ -125,12 +132,17 @@ async fn health_check() -> impl IntoResponse {
 async fn users(State(state): State<AppState>) -> impl IntoResponse {
     let users: Vec<_> = state
         .store
-        .users_with_index()
+        .serialized_users()
         .into_iter()
-        .map(|(user_id, index)| {
+        .map(|user| {
             serde_json::json!({
-                "user_id": user_id.to_hex(),
-                "index": index,
+                "user_id": user.id,
+                "private_key": user.signing_key,
+                "index": user.index,
+                "user_prefix": user.user_prefix.to_string(),
+                "user_suffix": user.user_suffix.to_string(),
+                "balance_slot_prefix": user.balance_slot_prefix.to_string(),
+                "balance_slot_suffix": user.balance_slot_suffix.to_string(),
             })
         })
         .collect();
@@ -155,10 +167,7 @@ async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     });
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
-    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     (headers, Json(response))
 }
 
@@ -172,7 +181,9 @@ async fn pool_info(State(state): State<AppState>) -> impl IntoResponse {
 
     let response = serde_json::json!({
         "pool_account_id": state.store.pool_id().to_hex(),
-        "liq_pools": vec![(pool0_addr.to_hex(), pool0_state), (pool1_addr.to_hex(), pool1_state)]
+        "liq_pools": vec![(pool0_addr.to_hex(), pool0_state), (pool1_addr.to_hex(), pool1_state)],
+        "asset0": get_asset0().to_hex(),
+        "asset1": get_asset1().to_hex()
     });
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -224,7 +235,21 @@ async fn order_new(State(state): State<AppState>, body: Bytes) -> Result<Respons
     //     "Accepted new order",
     // );
 
-    let order = Order::new(payload.pubkey, payload.user_id, payload.details);
+    let sig_bytes = general_purpose::STANDARD
+        .decode(payload.signed_intent)
+        .map_err(|e| ApiError(anyhow!("Failed to decode signature: {}", e)))?;
+
+    let signature = Signature::read_from_bytes(&sig_bytes)
+        .map_err(|e| ApiError(anyhow!("Failed to read signature from bytes: {}", e)))?;
+
+    let pubkey_bytes = general_purpose::STANDARD
+        .decode(payload.pubkey)
+        .map_err(|e| ApiError(anyhow!("Failed to decode signature: {}", e)))?;
+
+    let pubkey = PublicKey::read_from_bytes(&pubkey_bytes)
+        .map_err(|e| ApiError(anyhow!("Failed to read signature from bytes: {}", e)))?;
+
+    let order = Order::new(signature, payload.user_id, payload.details, pubkey);
     state
         .message_broker
         .broadcast_order_update(order.clone().into())

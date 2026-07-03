@@ -1,44 +1,45 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
+use base64::{Engine, engine::general_purpose};
 use dashmap::DashMap;
 use miden_client::{
-    Client,
+    Client, Serializable,
     account::{AccountBuilder, AccountId, AccountType, component::BasicWallet},
+    auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKey, Signature},
     keystore::FilesystemKeyStore,
 };
-use miden_protocol::testing::noop_auth_component::NoopAuthComponent;
+use miden_core::Word;
 use rand::RngCore;
+
+use crate::pool::get_user_balance_storage_slot_name;
 
 #[derive(Debug, Clone)]
 pub struct Users {
     balances: DashMap<AccountId, DashMap<AccountId, u64>>, // faucet_id, user_id
-    user_to_index: HashMap<AccountId, u16>,
+    by_account_id: HashMap<AccountId, User>,
 }
 
 impl Users {
-    pub fn new(
-        initial_users: Vec<AccountId>,
-        initial_amount: u64,
-        faucets: Vec<AccountId>,
-    ) -> Self {
+    pub fn new(initial_users: Vec<User>, initial_amount: u64, faucets: Vec<AccountId>) -> Self {
         let balances: DashMap<AccountId, DashMap<AccountId, u64>> =
             DashMap::with_capacity(faucets.len());
-        let mut user_to_index = HashMap::with_capacity(initial_users.len());
+        let mut by_account_id = HashMap::with_capacity(initial_users.len());
+
         for faucet in &faucets {
             balances.insert(*faucet, DashMap::with_capacity(initial_users.len()));
         }
-        for (index, user) in initial_users.iter().enumerate() {
+        for user in initial_users {
             for faucet in &faucets {
-                if let Some(map) = balances.get(faucet) {
-                    map.insert(*user, initial_amount);
+                if let Some(balance_map) = balances.get(faucet) {
+                    balance_map.insert(*&user.id, initial_amount);
                 }
             }
-            user_to_index.insert(*user, index as u16);
+            by_account_id.insert(*&user.id, user.clone());
         }
         Self {
             balances,
-            user_to_index,
+            by_account_id,
         }
     }
 
@@ -47,9 +48,13 @@ impl Users {
             .balances
             .get(&faucet)
             .ok_or_else(|| anyhow!("faucet {} not found", faucet.to_hex()))?;
-        let u = *f
-            .get(&user)
-            .ok_or_else(|| anyhow!("user {} not found for faucet {}", user.to_hex(), faucet.to_hex()))?;
+        let u = *f.get(&user).ok_or_else(|| {
+            anyhow!(
+                "user {} not found for faucet {}",
+                user.to_hex(),
+                faucet.to_hex()
+            )
+        })?;
         let new_balance = u.checked_sub(amount).ok_or_else(|| {
             anyhow!(
                 "insufficient balance for user {} on faucet {}: have {}, need {}",
@@ -68,9 +73,13 @@ impl Users {
             .balances
             .get(&faucet)
             .ok_or_else(|| anyhow!("faucet {} not found", faucet.to_hex()))?;
-        let u = *f
-            .get(&user)
-            .ok_or_else(|| anyhow!("user {} not found for faucet {}", user.to_hex(), faucet.to_hex()))?;
+        let u = *f.get(&user).ok_or_else(|| {
+            anyhow!(
+                "user {} not found for faucet {}",
+                user.to_hex(),
+                faucet.to_hex()
+            )
+        })?;
         let new_balance = u.checked_add(amount).ok_or_else(|| {
             anyhow!(
                 "balance overflow for user {} on faucet {}",
@@ -91,33 +100,98 @@ impl Users {
         Ok(u)
     }
 
-    pub fn get_user_index(&self, user_id: &AccountId) -> Option<u16> {
-        self.user_to_index.get(user_id).copied()
+    // UNSAFE: will be removed when we stop hosting users on be
+    pub fn get_user_index(&self, user_id: &AccountId) -> u16 {
+        self.by_account_id.get(user_id).unwrap().index
     }
 
-    /// Returns all known user account IDs paired with their index, ordered by index.
-    pub fn users_with_index(&self) -> Vec<(AccountId, u16)> {
-        let mut users: Vec<(AccountId, u16)> =
-            self.user_to_index.iter().map(|(id, idx)| (*id, *idx)).collect();
-        users.sort_by_key(|(_, idx)| *idx);
+    // UNSAFE: will be removed when we stop hosting users on be
+    pub fn serialized_users(&self) -> Vec<SerializedUser> {
+        let mut users: Vec<SerializedUser> = self
+            .by_account_id
+            .iter()
+            .map(|(_, u)| SerializedUser::try_from(u.clone()).unwrap())
+            .collect();
+        users.sort_by_key(|u| u.index);
         users
+    }
+
+    pub fn by_account_id(&self) -> HashMap<AccountId, User> {
+        self.by_account_id.clone()
     }
 }
 
-pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Result<Vec<AccountId>> {
+#[derive(Debug, Clone)]
+pub struct User {
+    id: AccountId,
+    key_pair: AuthSecretKey,
+    index: u16,
+}
+
+impl User {
+    pub fn id(&self) -> AccountId {
+        self.id
+    }
+    pub fn pubkey(&self) -> PublicKey {
+        self.key_pair.public_key()
+    }
+    pub fn sign(&self, msg: Word) -> Signature {
+        self.key_pair.sign(msg)
+    }
+}
+
+impl TryFrom<User> for SerializedUser {
+    type Error = anyhow::Error;
+    fn try_from(value: User) -> std::result::Result<Self, Self::Error> {
+        let signing_key = general_purpose::STANDARD.encode(value.key_pair.to_bytes());
+        let user_slot_key = get_user_balance_storage_slot_name(value.index);
+        Ok(Self {
+            id: value.id.to_hex(),
+            index: value.index,
+            user_prefix: value.id.prefix().as_u64(),
+            user_suffix: value.id.suffix().as_canonical_u64(),
+            signing_key,
+            balance_slot_prefix: user_slot_key.id().prefix().as_canonical_u64(),
+            balance_slot_suffix: user_slot_key.id().suffix().as_canonical_u64(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SerializedUser {
+    pub id: String,
+    pub index: u16,
+    pub user_prefix: u64,
+    pub user_suffix: u64,
+    pub balance_slot_prefix: u64,
+    pub balance_slot_suffix: u64,
+    pub signing_key: String,
+}
+
+pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Result<Vec<User>> {
     let mut users = Vec::with_capacity(n as usize);
     println!("Making up {n} users");
-    for _ in 0..n {
+    for i in 0..n {
         // Draw a fresh seed per account, otherwise every account is built from the
         // same seed and ends up with an identical AccountId.
         let mut init_seed = [0_u8; 32];
         client.rng().fill_bytes(&mut init_seed);
+
+        let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
         let builder = AccountBuilder::new(init_seed)
             .account_type(AccountType::Public)
-            .with_auth_component(NoopAuthComponent)
+            .with_auth_component(AuthSingleSig::new(
+                key_pair.public_key().to_commitment(),
+                AuthScheme::EcdsaK256Keccak,
+            ))
             .with_component(BasicWallet);
         let account = builder.build()?;
-        users.push(account.id());
+
+        users.push(User {
+            id: account.id(),
+            key_pair,
+            index: i as u16,
+        });
     }
     Ok(users)
 }
