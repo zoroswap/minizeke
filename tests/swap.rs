@@ -6,7 +6,7 @@ use minizeke::{
     order::{Order, OrderDetails, OrderExecutionResult},
     pool::{
         USER_INITIAL_ON_CHAIN_BALANCE, get_user_balance_from_pool,
-        get_user_balance_storage_slot_name, get_user_balance_storage_slot_names,
+        get_user_balance_storage_slot_name,
     },
     test_utils::{get_asset0, get_asset1, get_miden_execution},
 };

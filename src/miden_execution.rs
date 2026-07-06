@@ -92,7 +92,7 @@ impl MidenExecution {
         println!("Client ready.");
 
         // spawn the user accounts
-        let users = get_users(10, &mut client).await?;
+        let users = get_users(1, &mut client).await?;
 
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
@@ -318,23 +318,47 @@ impl MidenExecution {
 
         let submit_started = Instant::now();
         let pool_id = self.pool_id;
-        let res = tokio::time::timeout(
-            self.prover_timeout,
-            self.client.submit_new_transaction(pool_id, tx_req),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "transaction prove/submit timed out after {:?}",
-                self.prover_timeout
-            )
-        })??;
+
+        let tx_result = self.client.execute_transaction(pool_id, tx_req).await?;
+        let measurements = tx_result.executed_transaction().measurements();
+        info!(
+            total_cycles = measurements.total_cycles(),
+            auth_cycles = measurements.auth_procedure,
+            "Transaction cycle count",
+        );
+        let prove_started = Instant::now();
+        let proven_transaction = self
+            .client
+            .prove_transaction_with(&tx_result, self.client.prover())
+            .await?;
+        let prove_elapsed = prove_started.elapsed();
+        let submission_height = self
+            .client
+            .submit_proven_transaction(proven_transaction, &tx_result)
+            .await?;
+        self.client
+            .apply_transaction(&tx_result, submission_height)
+            .await?;
+        println!("Elapsed: {prove_elapsed:?}");
+        self.client.sync_state().await?;
+
+        // let res = self
+        //     .client
+        //     .submit_new_transaction(pool_id, tx_req)
+        //     .await
+        //     .map_err(|_| {
+        //         anyhow!(
+        //             "transaction prove/submit timed out after {:?}",
+        //             self.prover_timeout
+        //         )
+        //     })?;
+
         info!(
             elapsed = ?submit_started.elapsed(),
             "Transaction proven and submitted"
         );
 
-        let tx_hash = res.to_hex().to_string();
+        let tx_hash = tx_result.id().to_hex().to_string();
 
         self.client.sync_state().await?;
         info!(%tx_hash, "Client state synced");
