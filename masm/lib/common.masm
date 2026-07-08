@@ -26,7 +26,7 @@ const STORAGE_POINTER = 32
 const STORAGE_END     = STORAGE_WORD_3 + 63
 const MAX_NUMBER_OF_STORAGE_WORDS = 16
 
-const DEFAULT_NUMBER_OF_STORAGE_ITEMS = 12
+pub const DEFAULT_NUMBER_OF_STORAGE_ITEMS = 12
 const DEFAULT_STORAGE_END = STORAGE_POINTER + 11
 
 const STORAGE_WORD_0 = STORAGE_POINTER
@@ -61,11 +61,10 @@ const BENEFICIARY_2_ID_PREFIX = STORAGE_BENEFICIARY_WORD + 3  # default empty
 const ERR_UNEXPECTED_NUMBER_OF_STORAGE_ITEMS = "unexpected number of storage items"
 
 ### SETTERS
-proc store_storage_to_memory(expected_num_storage_items: u16)
+pub proc store_storage_to_memory(expected_num_storage_items: u16)
     push.STORAGE_POINTER exec.active_note::get_storage
     # => [num_storage_items, storage_ptr, expected_num_storage_items]
     # make sure the number of storage items is equal to the expected number of storage items
-    swap drop 
     # => [num_storage_items, expected_num_storage_items]
     eq assert.err=ERR_UNEXPECTED_NUMBER_OF_STORAGE_ITEMS
 end
@@ -73,29 +72,29 @@ end
 
 ### GETTERS ###
 #! Expected word padding
-proc get_expected_asset() -> word
+pub proc get_expected_asset() -> word
     mem_loadw_le.STORAGE_EXPECTED_ASSET_WORD
 end
 
 #! Expected word padding
-proc get_metadata() -> word
+pub proc get_metadata() -> word
     mem_loadw_le.STORAGE_METADATA_WORD
 end
 
-proc get_deadline() -> felt
+pub proc get_deadline() -> felt
     mem_load.METADATA_DEADLINE
 end
 pub proc get_p2id_tag() -> felt
     mem_load.METADATA_P2ID_TAG
 end
-proc get_metadata_item_2() -> felt
+pub proc get_metadata_item_2() -> felt
     mem_load.METADATA_ITEM_2
 end
-proc get_metadata_item_3() -> felt
+pub proc get_metadata_item_3() -> felt
     mem_load.METADATA_ITEM_3
 end
 
-proc get_beneficiary_id() -> AccountId
+pub proc get_beneficiary_id() -> AccountId
     mem_load.BENEFICIARY_ID_PREFIX
     mem_load.BENEFICIARY_ID_SUFFIX
 end
@@ -110,12 +109,12 @@ end
 #! Panics if:
 #! - the account_id is not valid.
 
-proc is_active_account(account_id: AccountId) -> bool
+pub proc is_active_account(account_id: AccountId) -> bool
     exec.active_account::get_id
     exec.account_id::is_equal
 end
 
-proc is_active_account_beneficiary() -> bool
+pub proc is_active_account_beneficiary() -> bool
     exec.active_account::get_id
     exec.get_beneficiary_id
     exec.account_id::is_equal
@@ -154,13 +153,13 @@ const RESERVE_WITH_SLIPPAGE_1 = ARGUMENTS_WORD_1 + 3  # 0x0043
 
 
 # ====================================================
-proc store_arguments_from_stack_to_memory
+pub proc store_arguments_from_stack_to_memory
     mem_storew_le.ARGUMENTS_WORD_0
     dropw
 end
 
 
-proc store_arguments_from_advicemap_to_memory
+pub proc store_arguments_from_advicemap_to_memory
     exec.active_note::get_serial_number
     adv.push_mapval dropw
     push.ARGUMENTS_POINTER push.2 #number_of words
@@ -170,7 +169,7 @@ proc store_arguments_from_advicemap_to_memory
     dropw dropw dropw drop
 end
 
-proc store_arbitrary_arguments_from_advicemap_to_memory(num_words: u16)
+pub proc store_arbitrary_arguments_from_advicemap_to_memory(num_words: u16)
     dup push.MAXNUMBER_OF_ARGUMENTS_WORDS lte assert.err=ERR_MAX_NUMBER_OF_ARGUMENTS_EXCEEDED
     # => [num_words]
     exec.active_note::get_serial_number
@@ -194,45 +193,45 @@ end
 
 
 ### GETTERS ###
-proc get_amount_out_argument() -> felt
+pub proc get_amount_out_argument() -> felt
     mem_load.AMOUNT_OUT
 end
 
 #! Returns POOL 0 STATE, expexts padding
-proc get_pool_0_state() -> (felt, felt, felt)
+pub proc get_pool_0_state() -> (felt, felt, felt)
     mem_loadw_le.ARGUMENTS_WORD_0
     # => [amount_out, liabilities_0, reserve_0, reserve_with_slippage_0]
     drop
     # => [liabilities_0, reserve_0, reserve_with_slippage_0]
 end
-proc get_pool_0_liabilities() -> felt
+pub proc get_pool_0_liabilities() -> felt
     mem_load.LIABILITIES_0
 end
-proc get_pool_0_reserve() -> felt
+pub proc get_pool_0_reserve() -> felt
     mem_load.RESERVE_0
 end
-proc get_pool_0_reserve_with_slippage() -> felt
+pub proc get_pool_0_reserve_with_slippage() -> felt
     mem_load.RESERVE_WITH_SLIPPAGE_0
 end
 
 #! Returns POOL 0 STATE, expexts padding
-proc get_pool_1_state() -> (felt, felt, felt)
+pub proc get_pool_1_state() -> (felt, felt, felt)
     mem_loadw_le.ARGUMENTS_WORD_1
     # => [amount_out, liabilities_1, reserve_1, reserve_with_slippage_1]
     drop
     # => [liabilities_1, reserve_1, reserve_with_slippage_1]
 end
-proc get_pool_1_liabilities() -> felt
+pub proc get_pool_1_liabilities() -> felt
     mem_load.LIABILITIES_1
 end
-proc get_pool_1_reserve() -> felt
+pub proc get_pool_1_reserve() -> felt
     mem_load.RESERVE_1
 end
-proc get_pool_1_reserve_with_slippage() -> felt
+pub proc get_pool_1_reserve_with_slippage() -> felt
     mem_load.RESERVE_WITH_SLIPPAGE_1
 end
 
-proc get_argument_word_by_index(word_index: u16, word_padding: word) -> word
+pub proc get_argument_word_by_index(word_index: u16, word_padding: word) -> word
     # => [word_index, pad(4)]
     mul.WORD_SIZE add.ARGUMENTS_POINTER
     # => [word_ptr, pad(4)]
@@ -265,13 +264,13 @@ const INPUT_ASSET_END = INPUT_ASSET_VALUE + 3
 #!
 #! Panics is there is more than one asset in the active note.
 #!
-proc store_asset_to_memory
+pub proc store_asset_to_memory
     push.INPUT_ASSET_KEY exec.active_note::get_assets assert.err=ERR_WRONG_NUMBER_OF_ASSETS
     drop
 end
 
 
-proc store_all_assets_to_memory() -> (felt, felt)
+pub proc store_all_assets_to_memory() -> (felt, felt)
     push.INPUT_ASSETS_POINTER exec.active_note::get_assets
     # => [num_assets, assets_ptr]
     # make sure the number of assets is less than the maximum number of input assets
@@ -284,18 +283,18 @@ end
 ### GETTERS ###
 # @todo rename and remove padding
 # Needs padw
-proc get_input_asset_key(_padding_word: word) -> word
+pub proc get_input_asset_key(_padding_word: word) -> word
    mem_loadw_le.INPUT_ASSET_KEY
 end
 
 # Needs padw
-proc get_input_asset_value(_padding_word: word) -> word 
+pub proc get_input_asset_value(_padding_word: word) -> word 
    mem_loadw_le.INPUT_ASSET_VALUE
 end
 
 # Gets the stored input asset in one word
 # Needs padw
-proc get_input_asset(_padding_word: word) -> word
+pub proc get_input_asset(_padding_word: word) -> word
     exec.get_input_asset_value padw exec.get_input_asset_key
     # => [ASSET_KEY, ASSET_VALUE]
     exec.asset_utils::compress_asset
@@ -330,13 +329,13 @@ const OUTPUT_ASSET_KEY = OUTPUT_NOTE_ASSETS_START + 4
 const OUTPUT_ASSET_VALUE = OUTPUT_ASSET_KEY + 4
 const OUTPUT_ASSET_END = OUTPUT_ASSET_VALUE + 4
 
-proc set_output_asset(key: word, value: word)
+pub proc set_output_asset(key: word, value: word)
     # => [ASSET_KEY, ASSET_VALUE]
     mem_storew_be.OUTPUT_ASSET_KEY dropw mem_storew_be.OUTPUT_ASSET_VALUE dropw
     # => []
 end
 
-proc set_output_asset_to_input_asset
+pub proc set_output_asset_to_input_asset
     padw padw mem_loadw_be.INPUT_ASSET_VALUE mem_loadw_be.INPUT_ASSET_KEY
     # => [ASSET_KEY, ASSET_VALUE]
     mem_storew_be.OUTPUT_ASSET_KEY mem_storew_be.OUTPUT_ASSET_VALUE

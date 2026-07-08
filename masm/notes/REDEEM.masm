@@ -1,7 +1,7 @@
 use miden::core::sys
 use miden::protocol::native_account
 
-use zoroswap::vault
+use zoro_miden::vault
 use zoro_miden::lib::asset_utils
 use zoro_miden::lib::output_note_utils
 use zoro_miden::note::common

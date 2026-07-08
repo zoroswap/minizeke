@@ -16,8 +16,9 @@ use miden_client::{
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
     note::NoteType,
-    testing::account_id::{
-        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
+    testing::{
+        account_id::{ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2},
+        common::wait_for_blocks,
     },
     transaction::TransactionRequestBuilder,
 };
@@ -122,6 +123,8 @@ pub async fn get_user(client: &mut Client<FilesystemKeyStore>) -> Result<Account
         .build()
         .unwrap();
 
+    info!(acc_id = acc.id().to_hex(), "New user account");
+
     // Add the account to the client
     client.add_account(&acc, false).await?;
 
@@ -220,7 +223,7 @@ pub async fn get_funded_user(
             .collect::<Result<Vec<_>, _>>()?;
 
         if !notes.is_empty() {
-            println!("Found 5 consumable notes for Alice. Consuming them now...");
+            println!("Consuming notes now...");
             let transaction_request = TransactionRequestBuilder::new()
                 .build_consume_notes(notes)
                 .unwrap();
@@ -237,4 +240,15 @@ pub async fn get_funded_user(
     }
 
     Ok((user_id, faucet_id))
+}
+
+pub async fn touch_account(
+    client: &mut Client<FilesystemKeyStore>,
+    account_id: &AccountId,
+) -> Result<()> {
+    let tx_req = TransactionRequestBuilder::new().build()?;
+    client.submit_new_transaction(*account_id, tx_req).await?;
+    client.sync_state().await?;
+    wait_for_blocks(client, 1).await;
+    Ok(())
 }

@@ -7,6 +7,7 @@ use miden_client::{
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
+    testing::common::wait_for_blocks,
 };
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
@@ -17,6 +18,7 @@ use crate::{
         storage_slot_name,
     },
     miden_env::MidenNetwork,
+    test_utils::touch_account,
 };
 
 pub async fn deploy_vault(client: &mut Client<FilesystemKeyStore>) -> Result<Account> {
@@ -47,11 +49,19 @@ pub async fn deploy_vault(client: &mut Client<FilesystemKeyStore>) -> Result<Acc
         vault_contract.to_commitment().to_hex()
     );
     println!(
-        "contract id: {:?}",
+        "contract id: {:?}, hex: {:?}",
         vault_contract
             .id()
-            .to_bech32(MidenNetwork::from_env().endpoint().to_network_id())
+            .to_bech32(MidenNetwork::from_env().endpoint().to_network_id()),
+        vault_contract.id().to_hex()
     );
+
+    // Add the account to the client
+    client.add_account(&vault_contract, false).await?;
+
+    client.sync_state().await?;
+
+    touch_account(client, &vault_contract.id()).await?;
 
     Ok(vault_contract)
 }

@@ -1,6 +1,6 @@
 use miden::core::sys
 
-use zoroswap::vault
+use zoro_miden::vault
 use zoro_miden::note::common
 use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
 
