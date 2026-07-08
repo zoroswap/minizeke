@@ -30,8 +30,10 @@ async fn test_fund_redeem() -> Result<()> {
     .clone();
 
     info!("[TEST] building a FUND transaction");
+    let fund_script = fund_note.recipient().script().clone();
     let tx_req = TransactionRequestBuilder::new()
         .input_notes(vec![(fund_note, None)])
+        .expected_ntx_scripts(vec![fund_script])
         .build()?;
 
     info!("[TEST] submitting a FUND transaction");

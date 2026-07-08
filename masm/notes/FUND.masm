@@ -27,6 +27,5 @@ pub proc main
     push.DEFAULT_NUMBER_OF_STORAGE_ITEMS exec.common::store_storage_to_memory drop
     exec.common::store_asset_to_memory
     exec.execute_FUND
-    debug.stack
     exec.sys::truncate_stack
 end

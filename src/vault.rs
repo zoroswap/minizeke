@@ -7,16 +7,12 @@ use miden_client::{
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
-    testing::common::wait_for_blocks,
 };
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 
 use crate::{
-    assembly_utils::{
-        link_all_libraries_for_vault, link_storage_utils, link_vault, read_masm_file,
-        storage_slot_name,
-    },
+    assembly_utils::{storage_slot_name, vault_component_code},
     miden_env::MidenNetwork,
     test_utils::touch_account,
 };
@@ -57,19 +53,20 @@ pub async fn deploy_vault(client: &mut Client<FilesystemKeyStore>) -> Result<Acc
     );
 
     // Add the account to the client
-    client.add_account(&vault_contract, false).await?;
+    client.add_account(&vault_contract, true).await?;
 
     client.sync_state().await?;
 
     touch_account(client, &vault_contract.id()).await?;
 
+    // Sync may fetch a partial public view from the network; keep the locally-built code.
+    client.add_account(&vault_contract, true).await?;
+
     Ok(vault_contract)
 }
 
-pub fn build_vault_component(cb: CodeBuilder) -> Result<AccountComponent> {
-    let code = read_masm_file(&["accounts", "vault.masm"])?;
-    let cb = link_all_libraries_for_vault(cb)?;
-    let lib = cb.compile_component_code("zoro_miden::vault", &code)?;
+pub fn build_vault_component(_cb: CodeBuilder) -> Result<AccountComponent> {
+    let lib = vault_component_code().clone();
     let slot_user_assets_total_funding =
         StorageSlot::with_empty_map(storage_slot_name("zorovault::user_asset_total_funding"));
     let slot_user_total_redeems =
