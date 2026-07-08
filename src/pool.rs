@@ -73,8 +73,6 @@ pub struct PoolState {
 pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
     users: Vec<User>,
-    pool_0_balance: u64,
-    pool_1_balance: u64,
 ) -> Result<(Account, AccountComponent)> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
@@ -91,12 +89,7 @@ pub async fn deploy_pool(
         .collect();
 
     let operator_component = build_operator_component(client.code_builder(), &users_keys)?;
-    let pool_component = build_pool_component(
-        pool_0_balance,
-        pool_1_balance,
-        user_ids,
-        client.code_builder(),
-    )?;
+    let pool_component = build_pool_component(user_ids, client.code_builder())?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
@@ -143,34 +136,13 @@ pub fn get_user_balance_storage_slot_name(index: u16) -> StorageSlotName {
     storage_slot_name(format!("pool::user_{index}_balance").as_str())
 }
 
-pub fn build_pool_component(
-    pool_0_balance: u64,
-    pool_1_balance: u64,
-    users: Vec<AccountId>,
-    cb: CodeBuilder,
-) -> Result<AccountComponent> {
+pub fn build_pool_component(users: Vec<AccountId>, cb: CodeBuilder) -> Result<AccountComponent> {
     let code = read_masm_file(&["accounts", "pool.masm"])?;
     let cb = link_storage_utils(cb)?;
     let cb = link_operator(cb)?;
     let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
 
     let user_amount = USER_INITIAL_ON_CHAIN_BALANCE;
-
-    let pool_balance_0: Word = [
-        Felt::new(pool_0_balance).unwrap(),
-        Felt::ZERO,
-        Felt::ZERO,
-        Felt::ZERO,
-    ]
-    .into();
-
-    let pool_balance_1: Word = [
-        Felt::new(pool_1_balance).unwrap(),
-        Felt::ZERO,
-        Felt::ZERO,
-        Felt::ZERO,
-    ]
-    .into();
 
     let user_balance: Word = [
         Felt::new(user_amount).unwrap(),

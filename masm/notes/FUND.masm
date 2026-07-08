@@ -1,0 +1,31 @@
+use miden::core::sys
+use miden::protocol::native_account
+
+use zoroswap::vault
+use zoro_miden::lib::asset_utils
+use zoro_miden::note::common
+use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
+
+# Note storage layout (same as DEPOSIT):
+# word 0: EXPECTED_ASSET [0, 0, 0, 0]
+# word 1: METADATA [0, 0, 0, 0]
+# word 2: BENEFICIARY [user_id_suffix, user_id_prefix, 0, 0]
+proc execute_FUND
+    padw exec.common::get_input_asset
+    exec.asset_utils::expand_asset
+    exec.native_account::add_asset
+    dropw
+
+    exec.common::get_beneficiary_id
+    padw exec.common::get_input_asset
+    # => [ASSET, beneficiary_suffix, beneficiary_prefix]
+    call.vault::fund_from_note
+end
+
+@note_script
+pub proc main
+    push.DEFAULT_NUMBER_OF_STORAGE_ITEMS exec.common::store_storage_to_memory drop
+    exec.common::store_asset_to_memory
+    exec.execute_FUND
+    exec.sys::truncate_stack
+end

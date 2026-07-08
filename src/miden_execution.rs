@@ -98,8 +98,7 @@ impl MidenExecution {
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
 
-        let (pool, _) =
-            deploy_pool(&mut client, users.clone(), pool_0_balance, pool_1_balance).await?;
+        let (pool, _) = deploy_pool(&mut client, users.clone()).await?;
 
         println!(
             "Pool deployed. BECH32: {}, HEX: {}",

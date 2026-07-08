@@ -17,14 +17,18 @@ pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
 }
 
 pub fn storage_slot_name(name: &str) -> StorageSlotName {
-    let name = StorageSlotName::new(name).expect("valid slot name");
-    name
+    StorageSlotName::new(name).expect("valid slot name")
 }
 
 pub fn link_pool(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    //let mut code_builder = link_storage_utils(code_builder)?;
     let pool_code = read_masm_file(&["accounts", "pool.masm"])?;
     code_builder.link_module("zoro_miden::pool", &pool_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_vault(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let vault_code = read_masm_file(&["accounts", "vault.masm"])?;
+    code_builder.link_module("zoro_miden::vault", &vault_code)?;
     Ok(code_builder)
 }
 
@@ -44,6 +48,41 @@ pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
 pub fn link_operator(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
     let math_code = read_masm_file(&["accounts", "operator.masm"])?;
     code_builder.link_module("zoro_miden::operator", &math_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_note_common_lib(code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let mut code_builder = code_builder.clone();
+    let note_common_lib_code = read_masm_file(&["lib", "common.masm"])?;
+    code_builder.link_module("zoro_miden::note::common", &note_common_lib_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_asset_utils_lib(code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let mut code_builder = code_builder.clone();
+    let lib_code = read_masm_file(&["lib", "asset_utils.masm"])?;
+    code_builder.link_module("zoro_miden::lib::asset_utils", &lib_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_output_note_utils_lib(code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let mut code_builder = code_builder.clone();
+    let lib_code = read_masm_file(&["lib", "output_note_utils.masm"])?;
+    code_builder.link_module("zoro_miden::lib::output_note_utils", &lib_code)?;
+    Ok(code_builder)
+}
+
+pub fn link_all_libraries_for_vault(code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let code_builder = link_storage_utils(code_builder)?;
+    let code_builder = link_asset_utils_lib(code_builder)?;
+    let code_builder = link_note_common_lib(code_builder)?;
+    let code_builder = link_output_note_utils_lib(code_builder)?;
+    Ok(code_builder)
+}
+
+pub fn link_all_note_libraries(code_builder: CodeBuilder) -> Result<CodeBuilder> {
+    let code_builder = link_all_libraries_for_vault(code_builder)?;
+    let code_builder = link_vault(code_builder)?;
     Ok(code_builder)
 }
 

@@ -1,10 +1,12 @@
 pub mod api;
 pub mod assembly_utils;
+pub mod asset_utils;
 pub mod execution_script;
 pub mod intent;
 pub mod message_broker;
 pub mod miden_env;
 pub mod miden_execution;
+pub mod note;
 pub mod oracle_sse;
 pub mod order;
 pub mod pool;
@@ -14,4 +16,5 @@ pub mod serde;
 pub mod store;
 pub mod test_utils;
 pub mod user;
+pub mod vault;
 pub mod websocket;

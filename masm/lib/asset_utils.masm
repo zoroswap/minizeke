@@ -57,10 +57,10 @@ end
 
 # AMOUNT
 # =================================================================================================
-proc has_amount_c(asset: word) -> bool
+pub proc has_amount_c(asset: word) -> bool
     drop drop drop gt.0
 end
 
-proc get_amount_c(asset: word) -> felt
+pub proc get_amount_c(asset: word) -> felt
     drop drop drop
 end
