@@ -1,13 +1,11 @@
 use miden::core::sys
-use miden::protocol::native_account
+use miden::protocol::active_note
 
 use zoro_miden::vault
 use zoro_miden::lib::asset_utils
 use zoro_miden::lib::output_note_utils
 use zoro_miden::note::common
 use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
-use common::BENEFICIARY_ID_SUFFIX
-use common::BENEFICIARY_ID_PREFIX
 
 # Note storage layout:
 # word 0: [EXPECTED_ASSET]
@@ -25,11 +23,7 @@ proc execute_REDEEM
     exec.asset_utils::expand_asset
     exec.common::set_output_asset
 
-    padw exec.common::get_expected_asset
-    exec.asset_utils::expand_asset
-    exec.native_account::remove_asset
-    dropw
-
+    # creates the P2ID payout note and moves the asset out of the account's vault into it
     exec.output_note_utils::create_p2id_beneficiary_note
 end
 

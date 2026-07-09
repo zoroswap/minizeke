@@ -1,6 +1,8 @@
 use miden::core::sys
+use miden::protocol::active_note
 
 use zoro_miden::vault
+use zoro_miden::lib::asset_utils
 use zoro_miden::note::common
 use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
 

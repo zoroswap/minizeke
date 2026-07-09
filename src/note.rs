@@ -124,7 +124,9 @@ impl ZekeNote {
                 note_storage_builder =
                     note_storage_builder.with_asset(instructions.min_expected_asset);
                 note_kind = NoteKind::Redeem;
-                note_storage_builder = note_storage_builder.with_beneficiary(instructions.user_id);
+                note_storage_builder = note_storage_builder
+                    .with_beneficiary(instructions.user_id)
+                    .with_p2id_tag(NoteTag::with_account_target(instructions.user_id));
             }
             ZekeNoteInstructions::Deposit(instructions) => {
                 vault_id = instructions.vault_id;

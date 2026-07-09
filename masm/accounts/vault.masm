@@ -360,10 +360,13 @@ pub proc initiate_redeem
     # => [amount, KEY]
     loc_store.IR_AMOUNT_LOCAL loc_storew_be.IR_KEY_LOCAL
     # => [KEY]
-    exec.fetch_user_asset_balance_details
-    # => [balance, available_balance]
-    ### assert available >= amount
-    drop loc_load.IR_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+    dropw
+
+    # TODO: add back FPI (pool available-balance check) when we add the extra checks on the pool
+    # exec.fetch_user_asset_balance_details
+    # # => [balance, available_balance]
+    # ### assert available >= amount
+    # drop loc_load.IR_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
 
     # USER_ASSET_TOTAL_INITIATED_REDEEMS += amount
     loc_load.IR_AMOUNT_LOCAL padw loc_loadw_be.IR_KEY_LOCAL
@@ -390,12 +393,14 @@ pub proc redeem
     loc_load.R_AMOUNT_LOCAL exec.has_user_enough_pending_redeem_for_asset
     assert.err=ERR_INSUFFICIENT_PENDING_REDEEM
 
-    padw loc_loadw_be.R_KEY_LOCAL exec.fetch_user_asset_balance_details
-    # => [balance, available_balance]
-    # assert pool_user_balance >= amount
-    loc_load.R_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_POOL_BALANCE
-    # => [available_balance]
-    drop
+    # TODO: add back FPI (pool balance check) when we add the extra checks on the pool
+    # padw loc_loadw_be.R_KEY_LOCAL exec.fetch_user_asset_balance_details
+    # # => [balance, available_balance]
+    # # assert pool_user_balance >= amount
+    # loc_load.R_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_POOL_BALANCE
+    # # => [available_balance]
+    # drop
+
     # USER_ASSET_TOTAL_REDEEMS += amount
     padw loc_loadw_be.R_KEY_LOCAL loc_load.R_AMOUNT_LOCAL
     exec.add_to_user_asset_total_redeems

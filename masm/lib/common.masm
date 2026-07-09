@@ -366,7 +366,7 @@ end
 pub proc set_beneficiary_as_output_note_target
     exec.get_beneficiary_id
     # [suffix, prefix]
-    mem_store.OUTPUT_ASSET_TARGET_PREFIX mem_store.OUTPUT_ASSET_TARGET_SUFFIX
+    mem_store.OUTPUT_ASSET_TARGET_SUFFIX mem_store.OUTPUT_ASSET_TARGET_PREFIX
     # []
 end
 
@@ -377,9 +377,20 @@ end
 #!
 pub proc set_sender_as_output_note_target
     exec.active_note::get_sender
-    # [prefix, suffix]
-    mem_store.OUTPUT_ASSET_TARGET_PREFIX drop mem_store.OUTPUT_ASSET_TARGET_SUFFIX drop
+    # [suffix, prefix]
+    mem_store.OUTPUT_ASSET_TARGET_SUFFIX mem_store.OUTPUT_ASSET_TARGET_PREFIX
     # []
+end
+
+#! Returns the stored output note target id.
+#!
+#! Inputs: []
+#! Outputs: [target_id_suffix, target_id_prefix]
+#!
+pub proc get_output_note_target() -> (felt, felt)
+    mem_load.OUTPUT_ASSET_TARGET_PREFIX
+    mem_load.OUTPUT_ASSET_TARGET_SUFFIX
+    # => [target_id_suffix, target_id_prefix]
 end
 
 
