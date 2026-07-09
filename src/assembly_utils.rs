@@ -88,7 +88,8 @@ pub fn vault_component_code() -> &'static AccountComponentCode {
     VAULT_COMPONENT_CODE.get_or_init(|| {
         let code = read_masm_file(&["accounts", "vault.masm"]).expect("vault.masm");
         let cb = link_all_libraries_for_vault(CodeBuilder::new()).expect("vault libs");
-        cb.compile_component_code("zoro_miden::vault", &code).expect("vault component")
+        cb.compile_component_code("zoro_miden::vault", &code)
+            .expect("vault component")
     })
 }
 

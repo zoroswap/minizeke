@@ -3,6 +3,7 @@ use miden_client::{asset::FungibleAsset, transaction::TransactionRequestBuilder}
 use minizeke::{
     note::{FundInstructions, ZekeNote, ZekeNoteInstructions},
     test_utils::{get_client, get_funded_user, get_vault},
+    vault::get_vault_user_asset_info,
 };
 use tracing::info;
 
@@ -38,6 +39,14 @@ async fn test_fund_redeem() -> Result<()> {
 
     info!("[TEST] submitting a FUND transaction");
     client.submit_new_transaction(vault_id, tx_req).await?;
+
+    info!("[TEST] syncing state and checking on-chain vault storage");
+    client.sync_state().await?;
+
+    let vault_info = get_vault_user_asset_info(&client, vault_id, faucet_id, user_id).await?;
+    assert_eq!(vault_info.total_funding, 199);
+    assert_eq!(vault_info.total_initiated_redeems, 0);
+    assert_eq!(vault_info.total_redeems, 0);
 
     Ok(())
 }
