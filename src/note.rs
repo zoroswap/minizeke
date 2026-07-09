@@ -99,17 +99,20 @@ impl ZekeNote {
     pub fn new(note_instructions: ZekeNoteInstructions, code_builder: CodeBuilder) -> Result<Self> {
         let note_kind;
         let vault_id;
+        let sender_id;
         let mut note_assets = None;
         let mut note_storage_builder = NoteStorageBuilder::default();
         match note_instructions {
             ZekeNoteInstructions::Fund(instructions) => {
                 vault_id = instructions.vault_id;
+                sender_id = instructions.user_id;
                 note_assets = Some(instructions.note_assets);
                 note_kind = NoteKind::Fund;
                 note_storage_builder = note_storage_builder.with_beneficiary(instructions.user_id);
             }
             ZekeNoteInstructions::InitRedeem(instructions) => {
                 vault_id = instructions.vault_id;
+                sender_id = instructions.user_id;
                 note_kind = NoteKind::InitRedeem;
                 note_storage_builder =
                     note_storage_builder.with_asset(instructions.min_expected_asset);
@@ -117,6 +120,7 @@ impl ZekeNote {
             }
             ZekeNoteInstructions::Redeem(instructions) => {
                 vault_id = instructions.vault_id;
+                sender_id = instructions.user_id;
                 note_storage_builder =
                     note_storage_builder.with_asset(instructions.min_expected_asset);
                 note_kind = NoteKind::Redeem;
@@ -124,6 +128,7 @@ impl ZekeNote {
             }
             ZekeNoteInstructions::Deposit(instructions) => {
                 vault_id = instructions.vault_id;
+                sender_id = instructions.user_id;
                 note_kind = NoteKind::Deposit;
                 note_storage_builder =
                     note_storage_builder.with_min_amount(instructions.min_expected_lp)?;
@@ -131,6 +136,7 @@ impl ZekeNote {
             }
             ZekeNoteInstructions::Withdraw(instructions) => {
                 vault_id = instructions.vault_id;
+                sender_id = instructions.user_id;
                 note_kind = NoteKind::Deposit;
                 note_storage_builder =
                     note_storage_builder.with_min_amount(instructions.min_amount_out)?;
@@ -141,7 +147,8 @@ impl ZekeNote {
         let note_storage = note_storage_builder.build()?;
         let serial_number = random_word();
         let note_script = Self::get_note_script(code_builder, note_kind.masm_name())?;
-        let note_metadata = PartialNoteMetadata::new(vault_id, NoteType::Public);
+        let note_metadata = PartialNoteMetadata::new(sender_id, NoteType::Public)
+            .with_tag(NoteTag::with_account_target(vault_id));
         let recipient = NoteRecipient::new(serial_number, note_script, note_storage);
         let note_assets = NoteAssets::new(
             note_assets

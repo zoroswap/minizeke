@@ -14,7 +14,10 @@ use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 
 use crate::{
-    assembly_utils::{storage_slot_name, vault_component_code},
+    assembly_utils::{
+        link_all_libraries_for_vault, print_contract_procedures, print_library_exports,
+        read_masm_file, storage_slot_name,
+    },
     miden_env::MidenNetwork,
     test_utils::touch_account,
 };
@@ -56,18 +59,19 @@ pub async fn deploy_vault(client: &mut Client<FilesystemKeyStore>) -> Result<Acc
 
     // Add the account to the client
     client.add_account(&vault_contract, true).await?;
-
     client.sync_state().await?;
-
     touch_account(client, &vault_contract.id()).await?;
-
     let vault_contract = client.try_get_account(vault_contract.id()).await?;
 
     Ok(vault_contract)
 }
 
-pub fn build_vault_component(_cb: CodeBuilder) -> Result<AccountComponent> {
-    let lib = vault_component_code().clone();
+pub fn build_vault_component(cb: CodeBuilder) -> Result<AccountComponent> {
+    let code = read_masm_file(&["accounts", "vault.masm"])?;
+    let cb = link_all_libraries_for_vault(cb)?;
+    let lib = cb.compile_component_code("zoro_miden::vault", code)?;
+    print_library_exports(lib.as_library());
+
     let slot_user_assets_total_funding =
         StorageSlot::with_empty_map(storage_slot_name("zorovault::user_asset_total_funding"));
     let slot_user_total_redeems =
@@ -124,7 +128,8 @@ pub struct VaultUserAssetInfo {
 impl VaultUserAssetInfo {
     /// Redeems that have been initiated but not yet completed.
     pub fn pending_redeem(&self) -> u64 {
-        self.total_initiated_redeems.saturating_sub(self.total_redeems)
+        self.total_initiated_redeems
+            .saturating_sub(self.total_redeems)
     }
 }
 

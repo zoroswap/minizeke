@@ -1,21 +1,16 @@
 use miden::core::sys
-use miden::protocol::native_account
 
 use zoro_miden::vault
 use zoro_miden::lib::asset_utils
 use zoro_miden::note::common
 use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
+use miden::standards::wallets::basic->basic_wallet
 
 # Note storage layout (same as DEPOSIT):
 # word 0: EXPECTED_ASSET [0, 0, 0, 0]
 # word 1: METADATA [0, 0, 0, 0]
 # word 2: BENEFICIARY [user_id_suffix, user_id_prefix, 0, 0]
 proc execute_FUND
-    padw exec.common::get_input_asset
-    exec.asset_utils::expand_asset
-    exec.native_account::add_asset
-    dropw
-
     exec.common::get_beneficiary_id
     padw exec.common::get_input_asset
     # => [ASSET, beneficiary_suffix, beneficiary_prefix]

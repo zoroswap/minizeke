@@ -1,5 +1,7 @@
 use anyhow::Result;
-use miden_client::{asset::FungibleAsset, transaction::TransactionRequestBuilder};
+use miden_client::{
+    asset::FungibleAsset, testing::common::wait_for_blocks, transaction::TransactionRequestBuilder,
+};
 use minizeke::{
     note::{FundInstructions, ZekeNote, ZekeNoteInstructions},
     test_utils::{get_client, get_funded_user, get_vault},
@@ -26,22 +28,29 @@ async fn test_fund_redeem() -> Result<()> {
             note_assets: vec![FungibleAsset::new(faucet_id, 199)?],
         }),
         client.code_builder(),
-    )?
-    .note()
-    .clone();
+    )?;
 
-    info!("[TEST] building a FUND transaction");
-    let fund_script = fund_note.recipient().script().clone();
+    info!("[TEST] building tx for sending FUND note");
     let tx_req = TransactionRequestBuilder::new()
-        .input_notes(vec![(fund_note, None)])
-        .expected_ntx_scripts(vec![fund_script])
+        .own_output_notes(vec![fund_note.note().clone()])
         .build()?;
 
-    info!("[TEST] submitting a FUND transaction");
-    client.submit_new_transaction(vault_id, tx_req).await?;
-
-    info!("[TEST] syncing state and checking on-chain vault storage");
+    info!("[TEST] sending a FUND note");
+    client.submit_new_transaction(user_id, tx_req).await?;
     client.sync_state().await?;
+
+    wait_for_blocks(&mut client, 1).await;
+
+    info!("[TEST] building tx for consuming FUND note");
+    let tx_req = TransactionRequestBuilder::new()
+        .input_notes(vec![(fund_note.note().clone(), None)])
+        .build()?;
+
+    info!("[TEST] consuming a FUND note");
+    client.submit_new_transaction(vault_id, tx_req).await?;
+    client.sync_state().await?;
+
+    wait_for_blocks(&mut client, 1).await;
 
     let vault_info = get_vault_user_asset_info(&client, vault_id, faucet_id, user_id).await?;
     assert_eq!(vault_info.total_funding, 199);

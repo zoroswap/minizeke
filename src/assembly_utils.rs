@@ -1,11 +1,11 @@
-use std::{fs::read_to_string, path::PathBuf, sync::OnceLock};
+use std::{fs::read_to_string, path::PathBuf};
 
 use anyhow::{Result, anyhow};
+use miden_assembly::Library;
 use miden_client::{
     account::{Account, StorageSlotName},
     assembly::CodeBuilder,
 };
-use miden_protocol::account::component::AccountComponentCode;
 
 pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -81,21 +81,9 @@ pub fn link_all_libraries_for_vault(code_builder: CodeBuilder) -> Result<CodeBui
     Ok(code_builder)
 }
 
-static VAULT_COMPONENT_CODE: OnceLock<AccountComponentCode> = OnceLock::new();
-
-/// Canonical vault component library — shared by account deploy and note scripts.
-pub fn vault_component_code() -> &'static AccountComponentCode {
-    VAULT_COMPONENT_CODE.get_or_init(|| {
-        let code = read_masm_file(&["accounts", "vault.masm"]).expect("vault.masm");
-        let cb = link_all_libraries_for_vault(CodeBuilder::new()).expect("vault libs");
-        cb.compile_component_code("zoro_miden::vault", &code)
-            .expect("vault component")
-    })
-}
-
 pub fn link_all_note_libraries(code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let mut code_builder = link_all_libraries_for_vault(code_builder)?;
-    code_builder.link_static_library(vault_component_code().as_library())?;
+    let code_builder = link_all_libraries_for_vault(code_builder)?;
+    let code_builder = link_vault(code_builder)?;
     Ok(code_builder)
 }
 
@@ -106,7 +94,7 @@ pub fn print_contract_procedures(pool_contract: &Account) {
     });
 }
 
-pub fn print_library_exports(masm_lib: &miden_assembly::Library) {
+pub fn print_library_exports(masm_lib: &Library) {
     println!("+++++Masm lib exports:");
     masm_lib.exports().for_each(|export| {
         let path = export.path();

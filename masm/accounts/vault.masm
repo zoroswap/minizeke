@@ -2,6 +2,7 @@ use miden::protocol::active_account
 use miden::protocol::native_account
 use miden::protocol::tx
 use miden::core::sys
+use miden::standards::wallets::basic->wallet
 
 use zoro_miden::lib::math
 use zoro_miden::lib::storage_utils
@@ -329,6 +330,9 @@ pub proc fund
     # loc.0-3: ASSET, loc.4-7: user_id
     loc_storew_be.FFN_ASSET_LOCAL 
     # => [ASSET, user_suffix, user_prefix]
+    exec.wallet::add_assets_to_account
+    
+    loc_loadw_be.FFN_ASSET_LOCAL
     exec.address_from_asset
     # => [asset_suffix, asset_prefix, user_suffix, user_prefix]
     padw loc_loadw_be.FFN_ASSET_LOCAL exec.asset_utils::get_amount_c
