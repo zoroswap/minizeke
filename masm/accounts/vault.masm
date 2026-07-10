@@ -27,22 +27,31 @@ use zoro_miden::lib::asset_utils
 #   The POOL is the native account during a swap; the VAULT is the native account during
 #   redeem flows. Because a foreign context may NOT call back into the native account, the
 #   VAULT-native redeem flows read their own values locally and pass them to the POOL
-#   `*_with_vault_values` procedures via a single-hop FPI. The caller supplies the POOL
-#   procedure MAST root on the stack; the POOL account id is read from storage.
+#   `*_with_vault_values` procedures via a single-hop FPI. The POOL procedure MAST root and
+#   the POOL account id are read from value slots set at deploy time.
 
 # STORAGE SLOTS
 const USER_ASSET_TOTAL_FUNDING_SLOT = word("zorovault::user_asset_total_funding")
 const USER_ASSET_TOTAL_REDEEMS_SLOT = word("zorovault::user_asset_total_redeems")
 const USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT = word("zorovault::user_asset_total_initiated_redeems")
+const USER_PUBKEYS_SLOT = word("zorovault::user_pubkeys")
+const USER_INDICES_SLOT = word("zorovault::user_indices")
+const NEXT_USER_INDEX_SLOT = word("zorovault::next_user_index")
 const LP_ASSET_SHARES_SLOT = word("zorovault::lp_asset_shares")
 const POOL_ACCOUNT_ID_SLOT = word("zorovault::pool_account_id")
-const USER_POOL_BALANCE_DETAILS_PROC_ROOT = word("zorovault::user_pool_balance_details_proc_root")
+const USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT = word("zorovault::user_pool_balance_details_proc_root")
+
+# CONSTANTS
+const MAX_USERS = 128
 
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "VAULT: insufficient available balance to initiate redeem"
 const ERR_INSUFFICIENT_PENDING_REDEEM = "VAULT: user does not have enough pending redeem for asset"
 const ERR_INSUFFICIENT_POOL_BALANCE = "VAULT: pool user balance is lower than redeem amount"
 const ERR_LP_WITHDRAW_AMOUNT_EXCEEDS_USER_LP_SHARES = "VAULT: LP withdrawal amount exceeds user LP shares"
+const ERR_USER_NOT_REGISTERED = "VAULT: user is not registered"
+const ERR_USER_ALREADY_REGISTERED = "VAULT: user is already registered"
+const ERR_MAX_USERS_REACHED = "VAULT: maximum number of registered users reached"
 
 # ----------------------------------------------------------------------------------------------
 # ID / KEY HELPERS
@@ -70,6 +79,96 @@ pub proc set_pool_account_id
     push.POOL_ACCOUNT_ID_SLOT[0..2]
     exec.native_account::set_item
     dropw
+    exec.sys::truncate_stack
+end
+
+# ----------------------------------------------------------------------------------------------
+# USER REGISTRATION
+# ----------------------------------------------------------------------------------------------
+# Users register their trading pubkey commitment on the vault. Each registered user is
+# assigned a stable index 0..MAX_USERS-1; the POOL derives the user's trades slot from it.
+#
+# USER_KEY convention: [user_suffix, user_prefix, 0, 0]
+
+#! Returns 1 if the word on top of the stack is all zeros.
+#! Inputs:  [WORD]
+#! Outputs: [is_zero_word]
+proc is_zero_word
+    eq.0 swap eq.0 and swap eq.0 and swap eq.0 and
+end
+
+#! Returns the registered pubkey commitment for a user (EMPTY_WORD when unregistered).
+#! Inputs:  [USER_KEY]
+#! Outputs: [PK_COMM]
+pub proc get_user_pubkey
+    push.USER_PUBKEYS_SLOT[0..2]
+    exec.active_account::get_map_item
+end
+
+#! Returns the registered user index (only meaningful when the user is registered).
+#! Inputs:  [USER_KEY]
+#! Outputs: [index]
+pub proc get_user_index
+    push.USER_INDICES_SLOT[0..2]
+    exec.active_account::get_map_item
+    movdn.3 drop drop drop
+end
+
+#! Registers a user: stores the pubkey commitment and assigns the next free index.
+#!
+#! Inputs:  [PK_COMM, user_suffix, user_prefix]
+#! Outputs: []
+#!
+#! Panics if the user is already registered or MAX_USERS is reached.
+const RU_PK_LOCAL = 0
+const RU_USER_KEY_LOCAL = 4
+const RU_INDEX_LOCAL = 8
+@locals(9)
+pub proc register_user
+    loc_storew_be.RU_PK_LOCAL dropw
+    # => [user_suffix, user_prefix]
+    push.0.0 movup.3 movup.3
+    # => [USER_KEY] = [user_suffix, user_prefix, 0, 0]
+    loc_storew_be.RU_USER_KEY_LOCAL
+
+    # assert not already registered (stored pubkey must be the empty word)
+    exec.get_user_pubkey
+    # => [PK_OLD]
+    exec.is_zero_word assert.err=ERR_USER_ALREADY_REGISTERED
+    # => []
+
+    # index = next_user_index; assert index < MAX_USERS
+    push.NEXT_USER_INDEX_SLOT[0..2] exec.active_account::get_item
+    # => [index, 0, 0, 0]
+    movdn.3 drop drop drop
+    # => [index]
+    dup loc_store.RU_INDEX_LOCAL
+    push.MAX_USERS lt assert.err=ERR_MAX_USERS_REACHED
+    # => []
+
+    # USER_INDICES[USER_KEY] = [index, 0, 0, 0]
+    push.0.0.0 loc_load.RU_INDEX_LOCAL
+    # => [index, 0, 0, 0]
+    padw loc_loadw_be.RU_USER_KEY_LOCAL
+    # => [USER_KEY, VALUE]
+    push.USER_INDICES_SLOT[0..2]
+    exec.native_account::set_map_item dropw
+    # => []
+
+    # USER_PUBKEYS[USER_KEY] = PK_COMM
+    padw loc_loadw_be.RU_PK_LOCAL
+    padw loc_loadw_be.RU_USER_KEY_LOCAL
+    # => [USER_KEY, PK_COMM]
+    push.USER_PUBKEYS_SLOT[0..2]
+    exec.native_account::set_map_item dropw
+    # => []
+
+    # NEXT_USER_INDEX += 1
+    push.0.0.0 loc_load.RU_INDEX_LOCAL add.1
+    # => [index + 1, 0, 0, 0]
+    push.NEXT_USER_INDEX_SLOT[0..2] exec.native_account::set_item dropw
+
+    exec.sys::truncate_stack
 end
 
 # ----------------------------------------------------------------------------------------------
@@ -159,6 +258,48 @@ pub proc get_user_asset_funding_details(key: word) -> (felt, felt, felt)
     # => [KEY, total_funding, total_redeemed]
     exec.get_user_asset_pending_redeem_amount movdn.2
     # => [total_funding, total_redeemed, pending_redeem]
+    exec.sys::truncate_stack
+end
+
+#! Combined per-trader getter for the POOL's swap flow (invoked via FPI, POOL native).
+#! Returns the vault totals plus the user's registration (index + pubkey commitment) in a
+#! single foreign call.
+#!
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: [total_funding, total_redeemed, pending_redeem, user_index, PK_COMM]
+#!
+#! Panics if the user is not registered.
+const GUTD_KEY_LOCAL = 0
+const GUTD_PK_LOCAL = 4
+const GUTD_INDEX_LOCAL = 8
+@locals(9)
+pub proc get_user_trading_details
+    loc_storew_be.GUTD_KEY_LOCAL dropw
+    # => []
+
+    # USER_KEY = [user_suffix, user_prefix, 0, 0]
+    padw loc_loadw_be.GUTD_KEY_LOCAL drop drop
+    # => [user_suffix, user_prefix]
+    push.0.0 movup.3 movup.3
+    # => [USER_KEY]
+
+    # load + check registration
+    dupw exec.get_user_pubkey
+    # => [PK_COMM, USER_KEY]
+    dupw exec.is_zero_word not assert.err=ERR_USER_NOT_REGISTERED
+    loc_storew_be.GUTD_PK_LOCAL dropw
+    # => [USER_KEY]
+    exec.get_user_index loc_store.GUTD_INDEX_LOCAL
+    # => []
+
+    padw loc_loadw_be.GUTD_PK_LOCAL
+    # => [PK_COMM]
+    loc_load.GUTD_INDEX_LOCAL
+    # => [user_index, PK_COMM]
+    padw loc_loadw_be.GUTD_KEY_LOCAL
+    # => [KEY, user_index, PK_COMM]
+    exec.get_user_asset_funding_details
+    # => [total_funding, total_redeemed, pending_redeem, user_index, PK_COMM]
     exec.sys::truncate_stack
 end
 #! Inputs:  [KEY] = [asset_suffix, asset_prefix, lp_suffix, lp_prefix]
@@ -360,17 +501,18 @@ pub proc initiate_redeem
     # => [amount, KEY]
     loc_store.IR_AMOUNT_LOCAL loc_storew_be.IR_KEY_LOCAL
     # => [KEY]
-    dropw
 
-    # TODO: add back FPI (pool available-balance check) when we add the extra checks on the pool
-    # exec.fetch_user_asset_balance_details
-    # # => [balance, available_balance]
-    # ### assert available >= amount
-    # drop loc_load.IR_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+    # FPI: available = POOL balance (with fresh vault values) - pending
+    exec.fetch_user_asset_balance_details
+    # => [balance, available_balance, ...]
+    ### assert available >= amount
+    drop loc_load.IR_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+    # => [...]
 
     # USER_ASSET_TOTAL_INITIATED_REDEEMS += amount
     loc_load.IR_AMOUNT_LOCAL padw loc_loadw_be.IR_KEY_LOCAL
     exec.add_to_user_asset_total_initiated_redeems
+    exec.sys::truncate_stack
 end 
 
 #! VAULT::redeem(amount, userId, assetId)
@@ -393,19 +535,18 @@ pub proc redeem
     loc_load.R_AMOUNT_LOCAL exec.has_user_enough_pending_redeem_for_asset
     assert.err=ERR_INSUFFICIENT_PENDING_REDEEM
 
-    # TODO: add back FPI (pool balance check) when we add the extra checks on the pool
-    # padw loc_loadw_be.R_KEY_LOCAL exec.fetch_user_asset_balance_details
-    # # => [balance, available_balance]
-    # # assert pool_user_balance >= amount
-    # loc_load.R_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_POOL_BALANCE
-    # # => [available_balance]
-    # drop
+    # FPI: assert the POOL-derived user balance covers the redeem
+    padw loc_loadw_be.R_KEY_LOCAL exec.fetch_user_asset_balance_details
+    # => [balance, available_balance, ...]
+    # assert pool_user_balance >= amount
+    loc_load.R_AMOUNT_LOCAL gte assert.err=ERR_INSUFFICIENT_POOL_BALANCE
+    # => [available_balance, ...]
+    drop
 
     # USER_ASSET_TOTAL_REDEEMS += amount
     padw loc_loadw_be.R_KEY_LOCAL loc_load.R_AMOUNT_LOCAL
     exec.add_to_user_asset_total_redeems
-
-    # @todo create the bloody note
+    exec.sys::truncate_stack
 end
 
 
@@ -413,14 +554,46 @@ end
 # FPI CALLS
 # ----------------------------------------------------------------------------------------------
 
-#! VAULT::get_user_asset_balance_details_with_vault_values(key: word) -> (balance: felt, available_balance: felt)
-#! Inputs:  [KEY]
+#! Fetches the user's POOL balance details via single-hop FPI (VAULT native -> POOL foreign).
+#! The vault reads its own totals + the user's registered index locally and passes them to
+#! POOL::get_user_asset_balance_details_with_vault_values, so the POOL never calls back into
+#! the native VAULT.
+#!
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, user_suffix, user_prefix]
 #! Outputs: [balance, available_balance]
+#!
+#! Panics if the user is not registered.
+const FUABD_KEY_LOCAL = 0
+const FUABD_INDEX_LOCAL = 4
+@locals(5)
 pub proc fetch_user_asset_balance_details(key: word) -> (felt, felt)
-    dupw exec.get_user_asset_funding_details movdn.6 movdn.6 movdn.6
-    # => [KEY, total_funding, total_redeemed, pending_redeem]
-    push.USER_POOL_BALANCE_DETAILS_PROC_ROOT exec.get_pool_account_id 
-    # => [pool_id_suffix, pool_id_prefix, ROOT, KEY, total_funding, total_redeemed, pending_redeem]
+    loc_storew_be.FUABD_KEY_LOCAL dropw
+    # => []
+
+    # user_index (asserts registration through the pubkey check)
+    padw loc_loadw_be.FUABD_KEY_LOCAL drop drop
+    # => [user_suffix, user_prefix]
+    push.0.0 movup.3 movup.3
+    # => [USER_KEY]
+    dupw exec.get_user_pubkey exec.is_zero_word not assert.err=ERR_USER_NOT_REGISTERED
+    # => [USER_KEY]
+    exec.get_user_index loc_store.FUABD_INDEX_LOCAL
+    # => []
+
+    # local vault totals
+    padw loc_loadw_be.FUABD_KEY_LOCAL exec.get_user_asset_funding_details
+    # => [total_funding, total_redeemed, pending_redeem, pad...]  (truncated to depth 16)
+
+    # FPI inputs: [user_index, asset_suffix, asset_prefix, total_funding, total_redeemed, pending_redeem, pad(10)]
+    padw loc_loadw_be.FUABD_KEY_LOCAL movup.2 drop movup.2 drop
+    # => [asset_suffix, asset_prefix, total_funding, total_redeemed, pending_redeem, pad...]
+    loc_load.FUABD_INDEX_LOCAL
+    # => [user_index, asset_suffix, asset_prefix, total_funding, total_redeemed, pending_redeem, pad...]
+
+    push.USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT[0..2] exec.active_account::get_item
+    # => [ROOT, fpi_inputs(16), ...]
+    exec.get_pool_account_id
+    # => [pool_id_suffix, pool_id_prefix, ROOT, fpi_inputs(16), ...]
     exec.tx::execute_foreign_procedure
-    # => [balance, available_balance]
+    # => [balance, available_balance, pad(14), ...]
 end

@@ -16,6 +16,7 @@ use crate::{assembly_utils::link_all_note_libraries, asset_utils::asset_to_word}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum NoteKind {
+    Register,
     Fund,
     InitRedeem,
     Redeem,
@@ -26,6 +27,7 @@ pub enum NoteKind {
 impl NoteKind {
     pub fn masm_name(&self) -> &str {
         match self {
+            NoteKind::Register => "REGISTER.masm",
             NoteKind::Fund => "FUND.masm",
             NoteKind::InitRedeem => "INIT_REDEEM.masm",
             NoteKind::Redeem => "REDEEM.masm",
@@ -43,11 +45,19 @@ pub struct ZekeNote {
 }
 
 pub enum ZekeNoteInstructions {
+    Register(RegisterInstructions),
     Fund(FundInstructions),
     InitRedeem(InitRedeemInstructions),
     Redeem(RedeemInstructions),
     Deposit(DepositInstructions),
     Withdraw(WithdrawInstructions),
+}
+
+pub struct RegisterInstructions {
+    pub user_id: AccountId,
+    pub vault_id: AccountId,
+    /// Commitment of the user's trading pubkey, stored in the vault's registration map.
+    pub pubkey_commitment: Word,
 }
 
 pub struct FundInstructions {
@@ -103,6 +113,14 @@ impl ZekeNote {
         let mut note_assets = None;
         let mut note_storage_builder = NoteStorageBuilder::default();
         match note_instructions {
+            ZekeNoteInstructions::Register(instructions) => {
+                vault_id = instructions.vault_id;
+                sender_id = instructions.user_id;
+                note_kind = NoteKind::Register;
+                note_storage_builder = note_storage_builder
+                    .with_asset_compact(instructions.pubkey_commitment)
+                    .with_beneficiary(instructions.user_id);
+            }
             ZekeNoteInstructions::Fund(instructions) => {
                 vault_id = instructions.vault_id;
                 sender_id = instructions.user_id;
@@ -287,6 +305,22 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_build_register_note() -> Result<()> {
+        let user_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
+        let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2)?;
+        let code_builder = CodeBuilder::new();
+        ZekeNote::new(
+            ZekeNoteInstructions::Register(RegisterInstructions {
+                user_id,
+                vault_id,
+                pubkey_commitment: Word::new([Felt::new(7).unwrap(); 4]),
+            }),
+            code_builder.clone(),
+        )?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_build_fund_note() -> Result<()> {

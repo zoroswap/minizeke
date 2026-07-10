@@ -8,19 +8,31 @@ use miden_client::{
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
+    transaction::TransactionRequestBuilder,
 };
-use miden_core::Word;
+use miden_core::{Felt, Word};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 
 use crate::{
     assembly_utils::{
-        link_all_libraries_for_vault, print_contract_procedures, print_library_exports,
-        read_masm_file, storage_slot_name,
+        compile_vault_code, link_all_note_libraries, pool_balance_details_proc_root,
+        print_library_exports, storage_slot_name,
     },
     miden_env::MidenNetwork,
     test_utils::touch_account,
 };
+
+pub const USER_ASSET_TOTAL_FUNDING_SLOT: &str = "zorovault::user_asset_total_funding";
+pub const USER_ASSET_TOTAL_REDEEMS_SLOT: &str = "zorovault::user_asset_total_redeems";
+pub const USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT: &str =
+    "zorovault::user_asset_total_initiated_redeems";
+pub const USER_PUBKEYS_SLOT: &str = "zorovault::user_pubkeys";
+pub const USER_INDICES_SLOT: &str = "zorovault::user_indices";
+pub const NEXT_USER_INDEX_SLOT: &str = "zorovault::next_user_index";
+pub const POOL_ACCOUNT_ID_SLOT: &str = "zorovault::pool_account_id";
+pub const USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT: &str =
+    "zorovault::user_pool_balance_details_proc_root";
 
 pub async fn deploy_vault(client: &mut Client<FilesystemKeyStore>) -> Result<Account> {
     let mut init_seed = [0_u8; 32];
@@ -67,30 +79,70 @@ pub async fn deploy_vault(client: &mut Client<FilesystemKeyStore>) -> Result<Acc
 }
 
 pub fn build_vault_component(cb: CodeBuilder) -> Result<AccountComponent> {
-    let code = read_masm_file(&["accounts", "vault.masm"])?;
-    let cb = link_all_libraries_for_vault(cb)?;
-    let lib = cb.compile_component_code("zoro_miden::vault", code)?;
+    // storage-less pool build just to extract the FPI proc root (breaks the circular
+    // vault <-> pool dependency; MAST roots do not depend on storage)
+    let pool_proc_root = pool_balance_details_proc_root(cb.clone())?;
+
+    let lib = compile_vault_code(cb)?;
     print_library_exports(lib.as_library());
 
-    let slot_user_assets_total_funding =
-        StorageSlot::with_empty_map(storage_slot_name("zorovault::user_asset_total_funding"));
-    let slot_user_total_redeems =
-        StorageSlot::with_empty_map(storage_slot_name("zorovault::user_asset_total_redeems"));
-    let slot_user_asset_total_initiated_redeems = StorageSlot::with_empty_map(storage_slot_name(
-        "zorovault::user_asset_total_initiated_redeems",
-    ));
+    let zero_word = Word::new([Felt::ZERO; 4]);
 
     let component = AccountComponent::new(
         lib,
         vec![
-            slot_user_assets_total_funding,
-            slot_user_total_redeems,
-            slot_user_asset_total_initiated_redeems,
+            StorageSlot::with_empty_map(storage_slot_name(USER_ASSET_TOTAL_FUNDING_SLOT)),
+            StorageSlot::with_empty_map(storage_slot_name(USER_ASSET_TOTAL_REDEEMS_SLOT)),
+            StorageSlot::with_empty_map(storage_slot_name(
+                USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT,
+            )),
+            StorageSlot::with_empty_map(storage_slot_name(USER_PUBKEYS_SLOT)),
+            StorageSlot::with_empty_map(storage_slot_name(USER_INDICES_SLOT)),
+            StorageSlot::with_value(storage_slot_name(NEXT_USER_INDEX_SLOT), zero_word),
+            // set after the pool is deployed via `set_pool_account_id_on_vault`
+            StorageSlot::with_value(storage_slot_name(POOL_ACCOUNT_ID_SLOT), zero_word),
+            StorageSlot::with_value(
+                storage_slot_name(USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT),
+                pool_proc_root,
+            ),
         ],
         AccountComponentMetadata::new("zoro_miden::vault"),
     )?;
 
     Ok(component)
+}
+
+/// Stores the pool's account id on the vault (one tx script call). Must run after the pool
+/// is deployed, before any FPI-dependent flow (swap / init_redeem / redeem).
+pub async fn set_pool_account_id_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    pool_id: AccountId,
+) -> Result<()> {
+    let script_code = format!(
+        "
+        use miden::core::sys
+        use zoro_miden::vault
+
+        begin
+            push.{prefix}.{suffix}
+            # => [pool_id_suffix, pool_id_prefix]
+            call.vault::set_pool_account_id
+            exec.sys::truncate_stack
+        end
+        ",
+        prefix = pool_id.prefix().as_u64(),
+        suffix = pool_id.suffix().as_canonical_u64(),
+    );
+
+    let cb = link_all_note_libraries(client.code_builder())?;
+    let tx_script = cb.compile_tx_script(&script_code)?;
+    let tx_request = TransactionRequestBuilder::new()
+        .custom_script(tx_script)
+        .build()?;
+    client.submit_new_transaction(vault_id, tx_request).await?;
+    client.sync_state().await?;
+    Ok(())
 }
 
 /// Returns the vault's current on-chain [`AccountStorage`], as known by the client's local
@@ -104,6 +156,36 @@ pub async fn get_vault_storage(
         .await
         .map_err(|e| anyhow!("failed to fetch vault account {}: {e:?}", vault_id.to_hex()))?;
     Ok(account.storage().clone())
+}
+
+/// Builds the vault's registration map key for a user: `[user_suffix, user_prefix, 0, 0]`.
+pub fn vault_user_key(user_id: AccountId) -> Word {
+    Word::from([
+        user_id.suffix(),
+        user_id.prefix().as_felt(),
+        Felt::ZERO,
+        Felt::ZERO,
+    ])
+}
+
+/// Reads a user's registration from an already-fetched vault [`AccountStorage`].
+/// Returns `None` when the user is not registered, otherwise `(index, pubkey_commitment)`.
+pub fn vault_user_registration(
+    storage: &AccountStorage,
+    user_id: AccountId,
+) -> Result<Option<(u64, Word)>> {
+    let key = vault_user_key(user_id);
+    let pubkey = storage
+        .get_map_item(&storage_slot_name(USER_PUBKEYS_SLOT), key)
+        .map_err(|e| anyhow!("failed to read {USER_PUBKEYS_SLOT}: {e:?}"))?;
+    if pubkey == Word::new([Felt::ZERO; 4]) {
+        return Ok(None);
+    }
+    let index = storage
+        .get_map_item(&storage_slot_name(USER_INDICES_SLOT), key)
+        .map_err(|e| anyhow!("failed to read {USER_INDICES_SLOT}: {e:?}"))?[0]
+        .as_canonical_u64();
+    Ok(Some((index, pubkey)))
 }
 
 /// Builds the vault's per-user-per-asset storage map key: `[asset_suffix, asset_prefix,

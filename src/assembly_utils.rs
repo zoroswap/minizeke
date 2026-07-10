@@ -6,6 +6,8 @@ use miden_client::{
     account::{Account, StorageSlotName},
     assembly::CodeBuilder,
 };
+use miden_core::Word;
+use miden_protocol::account::AccountComponentCode;
 
 pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -85,6 +87,49 @@ pub fn link_all_note_libraries(code_builder: CodeBuilder) -> Result<CodeBuilder>
     let code_builder = link_all_libraries_for_vault(code_builder)?;
     let code_builder = link_vault(code_builder)?;
     Ok(code_builder)
+}
+
+/// Compiles the vault component code (no storage). Used both to build the actual vault
+/// component and to extract FPI proc roots for the pool without a circular dependency
+/// (MAST roots do not depend on storage).
+pub fn compile_vault_code(code_builder: CodeBuilder) -> Result<AccountComponentCode> {
+    let code = read_masm_file(&["accounts", "vault.masm"])?;
+    let cb = link_all_libraries_for_vault(code_builder)?;
+    Ok(cb.compile_component_code("zoro_miden::vault", code)?)
+}
+
+/// Compiles the pool component code (no storage). See [`compile_vault_code`].
+pub fn compile_pool_code(code_builder: CodeBuilder) -> Result<AccountComponentCode> {
+    let code = read_masm_file(&["accounts", "pool.masm"])?;
+    let cb = link_math(code_builder)?;
+    let cb = link_operator(cb)?;
+    Ok(cb.compile_component_code("zoro_miden::pool", code)?)
+}
+
+fn proc_root(lib: &Library, path: &str) -> Result<Word> {
+    lib.get_procedure_root_by_path(path)
+        .ok_or_else(|| anyhow!("procedure {path} not found in compiled library"))
+}
+
+/// MAST root of `VAULT::get_user_trading_details`, the per-trader FPI getter the pool calls
+/// during swaps. Stored in the pool's `zoropool::user_trading_details_proc_root` slot.
+pub fn vault_trading_details_proc_root(code_builder: CodeBuilder) -> Result<Word> {
+    let code = compile_vault_code(code_builder)?;
+    proc_root(
+        code.as_library(),
+        "zoro_miden::vault::get_user_trading_details",
+    )
+}
+
+/// MAST root of `POOL::get_user_asset_balance_details_with_vault_values`, the getter the
+/// vault FPIs into during redeem flows. Stored in the vault's
+/// `zorovault::user_pool_balance_details_proc_root` slot.
+pub fn pool_balance_details_proc_root(code_builder: CodeBuilder) -> Result<Word> {
+    let code = compile_pool_code(code_builder)?;
+    proc_root(
+        code.as_library(),
+        "zoro_miden::pool::get_user_asset_balance_details_with_vault_values",
+    )
 }
 
 pub fn print_contract_procedures(pool_contract: &Account) {

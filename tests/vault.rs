@@ -2,15 +2,17 @@ use std::time::Duration;
 
 use anyhow::Result;
 use miden_client::{
-    asset::FungibleAsset, testing::common::wait_for_blocks, transaction::TransactionRequestBuilder,
+    asset::FungibleAsset, auth::AuthSecretKey, testing::common::wait_for_blocks,
+    transaction::TransactionRequestBuilder,
 };
 use minizeke::{
     note::{
         FundInstructions, InitRedeemInstructions, RedeemInstructions, ZekeNote,
         ZekeNoteInstructions,
     },
-    test_utils::{get_client, get_funded_user, get_vault},
-    vault::get_vault_user_asset_info,
+    pool::deploy_pool,
+    test_utils::{get_client, get_faucet, get_funded_user, get_vault, pool_foreign_account, register_user_on_vault},
+    vault::{get_vault_user_asset_info, set_pool_account_id_on_vault},
 };
 use tracing::info;
 
@@ -24,6 +26,23 @@ async fn test_fund_redeem() -> Result<()> {
 
     info!("[TEST] creating a funded user");
     let (user_id, faucet_id) = get_funded_user(&mut client).await?;
+
+    info!("[TEST] deploying pool + wiring it to the vault");
+    let asset1 = get_faucet(&mut client, "TSTB").await?;
+    let pool = deploy_pool(&mut client, vault_id, faucet_id, asset1).await?;
+    let pool_id = pool.id();
+    set_pool_account_id_on_vault(&mut client, vault_id, pool_id).await?;
+
+    info!("[TEST] registering the user on the vault");
+    let trading_key = AuthSecretKey::new_ecdsa_k256_keccak();
+    register_user_on_vault(
+        &mut client,
+        vault_id,
+        user_id,
+        trading_key.public_key().to_commitment().into(),
+    )
+    .await?;
+    let user_index = 0;
 
     let user_balance_before_fund = client.account_reader(user_id).get_balance(faucet_id).await?;
 
@@ -90,6 +109,7 @@ async fn test_fund_redeem() -> Result<()> {
     info!("[TEST] consuming an INIT_REDEEM note");
     let tx_req = TransactionRequestBuilder::new()
         .input_notes(vec![(init_redeem_note.note().clone(), None)])
+        .foreign_accounts(vec![pool_foreign_account(pool_id, user_index)?])
         .build()?;
     client.submit_new_transaction(vault_id, tx_req).await?;
     client.sync_state().await?;
@@ -128,6 +148,7 @@ async fn test_fund_redeem() -> Result<()> {
     info!("[TEST] consuming a REDEEM note");
     let tx_req = TransactionRequestBuilder::new()
         .input_notes(vec![(redeem_note.note().clone(), None)])
+        .foreign_accounts(vec![pool_foreign_account(pool_id, user_index)?])
         .build()?;
     client.submit_new_transaction(vault_id, tx_req).await?;
     client.sync_state().await?;

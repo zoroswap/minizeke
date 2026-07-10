@@ -1,266 +1,375 @@
 use miden::protocol::active_account
 use miden::protocol::native_account
+use miden::protocol::tx
+use miden::core::sys
 
 use zoro_miden::operator
-# ZORO POOL (barebones standalone POC)
+use zoro_miden::lib::math
+
+# ZORO POOL (trading / accounting layer)
 #
-# Holds NO custody. Tracks virtual per-user balances, total asset balances and
-# per-asset pool balances. Executes swaps from off-chain messages (tx scripts).
+# Holds NO custody and persists NO vault state. Per user it stores only cumulative trade
+# deltas in a value slot `pool::user_{i}_trades` = [bought0, sold0, bought1, sold1].
+# Balances are always derived on the spot from fresh VAULT values:
 #
-# KEY CONVENTION:
-#   user-asset KEY = [asset_suffix, asset_prefix, user_suffix, user_prefix]
-#   asset-only KEY = [asset_suffix, asset_prefix, 0, 0]
+#   balance   = vault.total_funding - vault.total_redeems + bought - sold
+#   available = balance - vault.pending_redeems
+#
+# SWAP (POOL native): one FPI per trader into VAULT::get_user_trading_details returns
+# [total_funding, total_redeemed, pending_redeem, user_index, PK_COMM]. The pool verifies
+# the intent signature against the returned key, asserts available >= sell_amount and bumps
+# the bought/sold counters at the vault-assigned slot index.
+#
+# REDEEM flows (VAULT native): the vault passes its own totals + the user index into the
+# exported `get_user_asset_balance_details_with_vault_values` via single-hop FPI (a foreign
+# context may not call back into the native account).
+#
+# The user's trades slot is resolved at runtime through the deploy-time USER_SLOT_IDS map
+# (index -> hashed slot id), because slot ids are hashed names and cannot be derived in MASM.
 
 # STORAGE SLOTS
+const USER_SLOT_IDS_SLOT = word("zoropool::user_slot_ids")
+const ASSETS_SLOT = word("zoropool::assets")
+const VAULT_ACCOUNT_ID_SLOT = word("zoropool::vault_account_id")
+const USER_TRADING_DETAILS_PROC_ROOT_SLOT = word("zoropool::user_trading_details_proc_root")
 
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "POOL: insufficient available balance for swap"
-const ERR_INVALID_POOL_STATE_TRYING_TO_SUB_AND_ADD = "POOL: invalid pool state trying to sub AND add"
-
-
-const ERR_UNDERFLOW = "Underflow"
-const ERR_OVERFLOW = "Overflow"
-
+const ERR_UNKNOWN_ASSET = "POOL: asset is not one of the pool's assets"
 
 # ----------------------------------------------------------------------------------------------
-# USER ASSET BALANCE
+# ID HELPERS
 # ----------------------------------------------------------------------------------------------
 
-    
-#! USER_ASSET_BALANCES(assetId, userId) += amount
-#! Inputs:  [ slot_prefix, slot_suffix, idx, amount]
+#! Inputs:  []
+#! Outputs: [vault_id_suffix, vault_id_prefix]
+pub proc get_vault_account_id
+    push.VAULT_ACCOUNT_ID_SLOT[0..2]
+    exec.active_account::get_item
+    # => [vault_id_suffix, vault_id_prefix, 0, 0]
+    movup.2 drop movup.2 drop
+    # => [vault_id_suffix, vault_id_prefix]
+end
+
+#! Inputs:  [vault_id_suffix, vault_id_prefix]
 #! Outputs: []
-pub proc add_to_user_balance
-    exec.add_to_storage_item_at_idx
+pub proc set_vault_account_id
+    push.0.0 movup.3 movup.3
+    # => [vault_id_suffix, vault_id_prefix, 0, 0]
+    push.VAULT_ACCOUNT_ID_SLOT[0..2]
+    exec.native_account::set_item
+    dropw
+    exec.sys::truncate_stack
+end
+
+# ----------------------------------------------------------------------------------------------
+# ASSET HELPERS  (ASSETS slot value = [asset0_suffix, asset0_prefix, asset1_suffix, asset1_prefix])
+# ----------------------------------------------------------------------------------------------
+
+#! Returns the asset id for a pool asset index (0 or 1).
+#! Inputs:  [asset_idx]
+#! Outputs: [asset_suffix, asset_prefix]
+pub proc get_asset_id
+    push.ASSETS_SLOT[0..2]
+    exec.active_account::get_item
+    # => [a0_suffix, a0_prefix, a1_suffix, a1_prefix, asset_idx]
+    movup.4 eq.0
+    if.true
+        movup.2 drop movup.2 drop
+        # => [a0_suffix, a0_prefix]
+    else
+        drop drop
+        # => [a1_suffix, a1_prefix]
+    end
+end
+
+#! Returns the pool asset index (0 or 1) for an asset id. Panics for unknown assets.
+#! Inputs:  [asset_suffix, asset_prefix]
+#! Outputs: [asset_idx]
+const GAI_ASSET_SUFFIX_LOCAL = 0
+const GAI_ASSET_PREFIX_LOCAL = 1
+@locals(2)
+pub proc get_asset_index
+    loc_store.GAI_ASSET_SUFFIX_LOCAL loc_store.GAI_ASSET_PREFIX_LOCAL
+    push.ASSETS_SLOT[0..2]
+    exec.active_account::get_item
+    # => [a0_suffix, a0_prefix, a1_suffix, a1_prefix]
+    loc_load.GAI_ASSET_SUFFIX_LOCAL eq
+    # => [suffix_matches_0, a0_prefix, a1_suffix, a1_prefix]
+    swap loc_load.GAI_ASSET_PREFIX_LOCAL eq
+    # => [prefix_matches_0, suffix_matches_0, a1_suffix, a1_prefix]
+    and
+    # => [is_asset_0, a1_suffix, a1_prefix]
+    if.true
+        drop drop push.0
+    else
+        loc_load.GAI_ASSET_SUFFIX_LOCAL eq
+        swap loc_load.GAI_ASSET_PREFIX_LOCAL eq
+        and assert.err=ERR_UNKNOWN_ASSET
+        push.1
+    end
+    # => [asset_idx]
+end
+
+# ----------------------------------------------------------------------------------------------
+# USER TRADES SLOT ACCESS
+# ----------------------------------------------------------------------------------------------
+
+#! Resolves a user index to its trades slot id (deploy-time USER_SLOT_IDS map).
+#! Inputs:  [user_index]
+#! Outputs: [slot_suffix, slot_prefix]
+pub proc get_user_slot_id
+    push.0.0.0 movup.3
+    # => [user_index, 0, 0, 0]
+    push.USER_SLOT_IDS_SLOT[0..2]
+    exec.active_account::get_map_item
+    # => [slot_suffix, slot_prefix, 0, 0]
+    movup.2 drop movup.2 drop
+    # => [slot_suffix, slot_prefix]
+end
+
+#! Inputs:  [user_index]
+#! Outputs: [TRADES] = [bought0, sold0, bought1, sold1]
+pub proc get_user_trades_word
+    exec.get_user_slot_id
+    exec.active_account::get_item
+    # => [TRADES]
+end
+
+#! Selects the (bought, sold) pair of an asset from a trades word.
+#! Inputs:  [asset_idx, TRADES]
+#! Outputs: [bought, sold]
+pub proc select_trades_pair
+    eq.1
+    if.true
+        # asset 1
+        drop drop
+        # => [bought1, sold1]
+    else
+        # asset 0
+        movup.2 drop movup.2 drop
+        # => [bought0, sold0]
+    end
+end
+
+#! TRADES[sold(asset_idx)] += amount
+#! Inputs:  [amount, asset_idx, TRADES]
+#! Outputs: [TRADES']
+proc add_to_sold_field
+    swap eq.1
+    # => [is_asset_1, amount, bought0, sold0, bought1, sold1]
+    if.true
+        movup.4 exec.math::safe_add movdn.3
+        # => [bought0, sold0, bought1, sold1 + amount]
+    else
+        movup.2 exec.math::safe_add swap
+        # => [bought0, sold0 + amount, bought1, sold1]
+    end
+end
+
+#! TRADES[bought(asset_idx)] += amount
+#! Inputs:  [amount, asset_idx, TRADES]
+#! Outputs: [TRADES']
+proc add_to_bought_field
+    swap eq.1
+    # => [is_asset_1, amount, bought0, sold0, bought1, sold1]
+    if.true
+        movup.3 exec.math::safe_add movdn.2
+        # => [bought0, sold0, bought1 + amount, sold1]
+    else
+        exec.math::safe_add
+        # => [bought0 + amount, sold0, bought1, sold1]
+    end
+end
+
+#! Books a trade on the user's trades slot in a single read-modify-write:
+#!   sold[sell_idx] += sell_amount ; bought[buy_idx] += buy_amount
+#!
+#! Inputs:  [user_index, sell_idx, sell_amount, buy_idx, buy_amount]
+#! Outputs: []
+const ATUS_SLOT_SUFFIX_LOCAL = 0
+const ATUS_SLOT_PREFIX_LOCAL = 1
+@locals(2)
+pub proc apply_trade_to_user_slot
+    exec.get_user_slot_id
+    # => [slot_suffix, slot_prefix, sell_idx, sell_amount, buy_idx, buy_amount]
+    dup loc_store.ATUS_SLOT_SUFFIX_LOCAL dup.1 loc_store.ATUS_SLOT_PREFIX_LOCAL
+    # => [slot_suffix, slot_prefix, sell_idx, sell_amount, buy_idx, buy_amount]
+    exec.active_account::get_item
+    # => [TRADES, sell_idx, sell_amount, buy_idx, buy_amount]
+    movup.4 movup.5
+    # => [sell_amount, sell_idx, TRADES, buy_idx, buy_amount]
+    exec.add_to_sold_field
+    # => [TRADES', buy_idx, buy_amount]
+    movup.4 movup.5
+    # => [buy_amount, buy_idx, TRADES']
+    exec.add_to_bought_field
+    # => [TRADES'']
+    loc_load.ATUS_SLOT_PREFIX_LOCAL loc_load.ATUS_SLOT_SUFFIX_LOCAL
+    # => [slot_suffix, slot_prefix, TRADES'']
+    exec.native_account::set_item
+    dropw
     # => []
 end
 
-#! USER_ASSET_BALANCES(assetId, userId) -= amount
-#! Inputs:  [slot_prefix, slot_suffix, idx, amount]
-#! Outputs: []
-pub proc sub_from_user_balance
-    exec.sub_from_storage_item_at_idx
-    # => []
-end
-
-#! Raw local map value.
-#! Inputs:  [index]
-#! Outputs: [slot_prefix, slot_suffix, idx]
-pub proc get_user_asset_balance
-    exec.get_storage_item_at_idx
-    # => [amount]
-end
-
-
 # ----------------------------------------------------------------------------------------------
-# POOL BALANCE  (POOL_BALANCES value word = [poolBalance, 0, 0, 0])
+# BALANCE DERIVATION
 # ----------------------------------------------------------------------------------------------
 
-#! Inputs:  [amount]
-#! Outputs: []
+#! Derives (balance, available) from vault totals + local trade counters.
+#!
+#!   balance   = total_funding + bought - total_redeemed - sold
+#!   available = balance - pending_redeem
+#!
+#! Inputs:  [bought, sold, total_funding, total_redeemed, pending_redeem]
+#! Outputs: [balance, available_balance]
+const CBD_BALANCE_LOCAL = 0
+@locals(1)
+proc compute_balance_details
+    movup.2
+    # => [total_funding, bought, sold, total_redeemed, pending_redeem]
+    exec.math::safe_add
+    # => [funding + bought, sold, total_redeemed, pending_redeem]
+    swap exec.math::safe_sub
+    # => [funding + bought - sold, total_redeemed, pending_redeem]
+    swap exec.math::safe_sub
+    # => [balance, pending_redeem]
+    dup loc_store.CBD_BALANCE_LOCAL
+    # => [balance, pending_redeem]
+    swap exec.math::safe_sub
+    # => [available_balance]
+    loc_load.CBD_BALANCE_LOCAL
+    # => [balance, available_balance]
+end
 
+#! FPI export for the VAULT's redeem flows (VAULT native -> POOL foreign, single hop).
+#! The vault reads its own totals and the user's registered index locally and passes them in,
+#! so this proc only adds the pool-local trade deltas.
+#!
+#! Inputs:  [user_index, asset_suffix, asset_prefix, total_funding, total_redeemed, pending_redeem]
+#! Outputs: [balance, available_balance]
+pub proc get_user_asset_balance_details_with_vault_values
+    # => [user_index, asset_suffix, asset_prefix, totals(3)]
+    movdn.2
+    # => [asset_suffix, asset_prefix, user_index, totals(3)]
+    exec.get_asset_index
+    # => [asset_idx, user_index, totals(3)]
+    swap exec.get_user_trades_word
+    # => [TRADES, asset_idx, totals(3)]
+    movup.4
+    # => [asset_idx, TRADES, totals(3)]
+    exec.select_trades_pair
+    # => [bought, sold, total_funding, total_redeemed, pending_redeem]
+    exec.compute_balance_details
+    # => [balance, available_balance]
+    exec.sys::truncate_stack
+end
 
-#pub proc add_to_pool_0_balance
-#    push.POOL_0_BALANCE_SLOT[0..2] exec.add_to_storage_item
-#end
-#
-#pub proc sub_from_pool_0_balance
-#    push.POOL_0_BALANCE_SLOT[0..2] exec.sub_from_storage_item
-#end
-#
-#pub proc set_pool_0_balance(amount: felt)
-#    push.0.0.0 movup.3
-#    push.POOL_0_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
-#end
-#
-#pub proc set_pool_1_balance(amount: felt)
-#    push.0.0.0 movup.3
-#    push.POOL_1_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
-#end
-#
-#pub proc add_to_pool_1_balance
-#    push.POOL_1_BALANCE_SLOT[0..2] exec.add_to_storage_item
-#end
-#
-#pub proc sub_from_pool_1_balance
-#    push.POOL_1_BALANCE_SLOT[0..2] exec.sub_from_storage_item
-#end
-#
-#
-#
-#pub proc get_pool_0_balance
-#    push.POOL_0_BALANCE_SLOT[0..2]
-#    exec.active_account::get_item
-#    movdn.3 drop drop drop
-#    # => [poolBalance]
-#end
-#
-#
-#pub proc get_pool_1_balance
-#    push.POOL_1_BALANCE_SLOT[0..2]
-#    exec.active_account::get_item
-#    movdn.3 drop drop drop
-#    # => [poolBalance]
-#end
+# ----------------------------------------------------------------------------------------------
+# FPI CALLS
+# ----------------------------------------------------------------------------------------------
+
+#! Fetches the user's vault totals + registration via FPI (POOL native -> VAULT foreign).
+#!
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: [total_funding, total_redeemed, pending_redeem, user_index, PK_COMM, pad(8)]
+pub proc fetch_user_trading_details
+    # pad the FPI inputs to 16: [KEY, pad(12)]
+    padw padw padw movupw.3
+    # => [KEY, pad(12)]
+    push.USER_TRADING_DETAILS_PROC_ROOT_SLOT[0..2]
+    exec.active_account::get_item
+    # => [ROOT, KEY, pad(12)]
+    exec.get_vault_account_id
+    # => [vault_id_suffix, vault_id_prefix, ROOT, KEY, pad(12)]
+    exec.tx::execute_foreign_procedure
+    # => [total_funding, total_redeemed, pending_redeem, user_index, PK_COMM, pad(8)]
+end
 
 # ----------------------------------------------------------------------------------------------
 # SWAP
 # ----------------------------------------------------------------------------------------------
 
-pub proc execute_swap
-    # exec.operator::populate_adv_stack
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]
-    exec.operator::verify_signature
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]
-    drop drop dup.3 dup.3
-    # => [user_suffix, user_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
-    exec.sub_from_user_balance
-    # => [BUY_KEY]
-    exec.add_to_user_balance
-    # => []
-end
-
-# ----------------------------------------------------------------------------------------------
-# POOL BALANCE ACCOUNTING
-# ----------------------------------------------------------------------------------------------
-
-
-
-
-#! Atomically increments a storage map entry: map[KEY] += VALUE.
-#! Reads the current value via get_map_item, adds VALUE, writes back via set_map_item.
+#! Executes a single signed swap intent.
 #!
-#! Inputs: [slot_id_prefix, slot_id_suffix, KEY, VALUE]
+#! 1. FPI into the VAULT for the sell asset: fresh totals + registered index + pubkey.
+#! 2. Verify the intent signature against the vault-registered key.
+#! 3. available = funding + bought - redeemed - sold - pending; assert available >= sell_amount.
+#! 4. Book the trade: sold[sell_idx] += sell_amount, bought[buy_idx] += buy_amount.
+#!
+#! The intent's user_key felts are covered by the signature but NOT used for slot addressing;
+#! the vault-assigned index is authoritative.
+#!
+#! Inputs:  [user_suffix, user_prefix, sell_idx, sell_amount,
+#!           user_key_suffix, user_key_prefix, buy_idx, buy_amount, pad(8)]
+#! Advice:  [PK[9], SIG[17], ...]
 #! Outputs: []
-#pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word, sub_by: felt)
-#    # duplicate the map accessor inputs
-#    dup.5 dup.5 dup.5 dup.5 dup.5 dup.5
-#    # => [slot_id_prefix, slot_id_suffix, KEY, slot_id_prefix, slot_id_suffix, KEY,sub_by, ]
-#    exec.active_account::get_map_item
-#    movup.10
-#    # => [sub_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-#    sub
-#    # => [new_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-#    movdn.9 movdn.9 movdn.9 movdn.9
-#    ## set
-#    exec.native_account::set_map_item dropw
-#end
+#!
+#! Invocation: call
+const SW_INTENT0_LOCAL = 0    # [user_suffix, user_prefix, sell_idx, sell_amount]
+const SW_INTENT1_LOCAL = 4    # [user_key_suffix, user_key_prefix, buy_idx, buy_amount]
+const SW_FUNDING_LOCAL = 8
+const SW_REDEEMED_LOCAL = 9
+const SW_PENDING_LOCAL = 10
+const SW_INDEX_LOCAL = 11
+const SW_PK_LOCAL = 12        # PK_COMM word
+@locals(16)
+pub proc execute_swap
+    loc_storew_be.SW_INTENT0_LOCAL dropw
+    loc_storew_be.SW_INTENT1_LOCAL dropw
+    # => [pad(8)]
 
+    # --- 1. FPI: vault totals + registration for the SELL asset ---
+    padw loc_loadw_be.SW_INTENT0_LOCAL
+    # => [user_suffix, user_prefix, sell_idx, sell_amount, pad(8)]
+    movup.3 drop
+    # => [user_suffix, user_prefix, sell_idx, pad(8)]
+    movup.2
+    # => [sell_idx, user_suffix, user_prefix, pad(8)]
+    exec.get_asset_id
+    # => [asset_suffix, asset_prefix, user_suffix, user_prefix, pad(8)]
+    exec.fetch_user_trading_details
+    # => [total_funding, total_redeemed, pending_redeem, user_index, PK_COMM, pad(8), ...]
+    loc_store.SW_FUNDING_LOCAL loc_store.SW_REDEEMED_LOCAL loc_store.SW_PENDING_LOCAL loc_store.SW_INDEX_LOCAL
+    # => [PK_COMM, pad(8), ...]
+    loc_storew_be.SW_PK_LOCAL dropw
+    # => [pad(8), ...]
 
-#pub proc add_to_map_item #(increment_by: felt, slot_id_prefix: felt, slot_id_suffix: felt, key: Word)
-#    # duplicate the map accessor inputs
-#    dup.6 dup.6 dup.6 dup.6 dup.6 dup.6
-#    exec.active_account::get_map_item
-#    # => [old_value, 0, 0, 0, increment_by, slot_id_prefix, slot_id_suffix, KEY]
-#    #movdn.4 drop drop drop
-#    movup.4
-#    # => [increment_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-#    add
-#    ## set
-#    # => [new_value, 0,0,0,lot_id_prefix, slot_id_suffix, KEY]
-#    #movdn.7 push.0 movdn.8 push.0 movdn.8 push.0 movdn.8
-#    movdn.9 movdn.9 movdn.9 movdn.9
-#    # => [new_value, 0, 0, 0, lot_id_prefix, slot_id_suffix, KEY, new_value, 0, 0, 0]
-#    
-#    exec.native_account::set_map_item  dropw
-#end
+    # --- 2. verify the intent signature against the registered key ---
+    padw loc_loadw_be.SW_PK_LOCAL
+    padw loc_loadw_be.SW_INTENT1_LOCAL
+    padw loc_loadw_be.SW_INTENT0_LOCAL
+    # => [m0..m7, PK_COMM, ...]  (m0 = user_suffix on top)
+    exec.operator::verify_intent_signature
+    # => [...]
 
+    # --- 3. balance check on the sell asset ---
+    loc_load.SW_INDEX_LOCAL exec.get_user_trades_word
+    # => [TRADES, ...]
+    padw loc_loadw_be.SW_INTENT0_LOCAL drop drop swap drop
+    # => [sell_idx, TRADES, ...]
+    exec.select_trades_pair
+    # => [bought, sold, ...]
+    loc_load.SW_FUNDING_LOCAL exec.math::safe_add
+    # => [funding + bought, sold, ...]
+    swap exec.math::safe_sub
+    # => [funding + bought - sold, ...]
+    loc_load.SW_REDEEMED_LOCAL exec.math::safe_sub
+    loc_load.SW_PENDING_LOCAL exec.math::safe_sub
+    # => [available, ...]
+    padw loc_loadw_be.SW_INTENT0_LOCAL drop drop drop
+    # => [sell_amount, available, ...]
+    gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+    # => [...]
 
-# @todo: inline
-#pub proc set_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, value: felt) -> felt
-#    ### fill out value with 0 to full word
-#    push.0 movdn.7 push.0 movdn.7 push.0 movdn.7
-#    ### load slot id and key
-#    exec.native_account::set_map_item 
-#    dropw
-#end
-
-
-pub proc add_to_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, increment_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item
-    # => [current_value, 0,0,0, prefix, suffix, increment_by]
-    movup.6 add
-    # => [new_value, 0,0,0, prefix, suffix]
-    movdn.5 movdn.5 movdn.5 movdn.5
-    # => [ prefix, suffix, new_value, 0,0,0]
-    exec.native_account::set_item dropw
-    ### get current value
+    # --- 4. book the trade ---
+    padw loc_loadw_be.SW_INTENT1_LOCAL drop drop
+    # => [buy_idx, buy_amount, ...]
+    padw loc_loadw_be.SW_INTENT0_LOCAL drop drop
+    # => [sell_idx, sell_amount, buy_idx, buy_amount, ...]
+    loc_load.SW_INDEX_LOCAL
+    # => [user_index, sell_idx, sell_amount, buy_idx, buy_amount, ...]
+    exec.apply_trade_to_user_slot
+    # => [...]
+    exec.sys::truncate_stack
 end
-
-
-pub proc sub_from_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, decrement_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item
-    # => [current_value, 0,0,0, prefix, suffix, decrement_by]
-    movup.6 sub
-    # => [new_value, 0,0,0, prefix, suffix]
-    movdn.5 movdn.5 movdn.5 movdn.5
-    # => [ prefix, suffix, new_value, 0,0,0]
-    exec.native_account::set_item dropw
-end
-
-const BALANCES_TEMP_VALUE = 0
-#const BAL_1 = 0;
-#const BAL_2 = 1;
-#const BAL_3 = 2;
-#const BAL_4 = 3;
-
-pub proc sub_from_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt, decrement_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE dropw
-    # => [ prefix, suffix, idx, decrement_by]
-    movup.2 dup
-    # => [idx, idx, prefix, suffix, decrement_by]
-    mem_load
-    # => [value_at_idx, idx, prefix, suffix, decrement_by]
-    movup.4 sub
-    # => [new_val_at_idx, idx, prefix, suffix, ]
-    swap mem_store
-    # => [ prefix, suffix]
-    padw mem_loadw_le.BALANCES_TEMP_VALUE
-    # => [UPDATED_VALUE, prefix, suffix, ]
-    movup.5 movup.5
-     # => [prefix, suffix, UPDATED_VALUE]
-    exec.native_account::set_item dropw
-end
-
-pub proc add_to_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt, increment_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE dropw
-    # => [ prefix, suffix, idx, increment_by]
-    movup.2 dup
-    # => [idx, idx, prefix, suffix, increment_by]
-    mem_load
-    # => [value_at_idx, idx, prefix, suffix, increment_by]
-    movup.4 add
-    # => [new_val_at_idx, idx, prefix, suffix, ]
-    swap mem_store
-    # => [ prefix, suffix]
-    padw mem_loadw_le.BALANCES_TEMP_VALUE
-    # => [UPDATED_VALUE, prefix, suffix, ]
-    movup.5 movup.5
-     # => [prefix, suffix, UPDATED_VALUE]
-    exec.native_account::set_item dropw
-end
-
-pub proc get_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt,) -> felt
-    exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE
-    # => [idx]
-    mem_load
-end
-
-
-# ----------------------------------------------------------------------------------------------
-# GETTERS
-# ----------------------------------------------------------------------------------------------
-
-
-
-#pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) -> felt
-#    exec.active_account::get_map_item
-#    
-#    movdn.3 drop drop drop
-#    # => [value]
-#end
-
-
-
-
-

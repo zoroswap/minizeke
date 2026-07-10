@@ -7,38 +7,44 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use miden_client::{
-    Client, RemoteTransactionProver,
-    account::AccountId,
-    keystore::FilesystemKeyStore,
-    testing::account_id::{
-        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
-    },
+    Client, asset::FungibleAsset, account::AccountId, keystore::FilesystemKeyStore,
     transaction::TransactionRequestBuilder,
 };
-use miden_client_sqlite_store::SqliteStore;
 use miden_core::{Felt, Word};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
 use crate::{
-    assembly_utils::{link_operator, link_pool},
+    assembly_utils::{link_math, link_operator, link_pool},
     execution_script::make_exec_script,
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker},
     miden_env::MidenNetwork,
     order::{Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolState, deploy_pool, get_user_balance_storage_slot_name},
+    pool::{PoolState, USER_INITIAL_ON_CHAIN_BALANCE, deploy_pool, get_user_trades_slot_name},
+    test_utils::{
+        fund_user_on_vault, get_client, get_faucet, get_pool_client, mint_asset_to_user,
+        register_user_on_vault, vault_foreign_account,
+    },
     user::{Users, get_users},
+    vault::{deploy_vault, set_pool_account_id_on_vault},
 };
 
 pub struct MidenExecution {
     client: Client<FilesystemKeyStore>,
+    /// Separate client (own store) for pool-native swap txs. The vault must stay
+    /// untracked here: for tracked foreign accounts the client fetches the vault with
+    /// `VaultFetch::IfChangedFrom`, the node then omits the asset list and the
+    /// reconstructed foreign account fails the kernel's commitment check once the vault
+    /// holds assets.
+    pool_client: Client<FilesystemKeyStore>,
     message_broker: Arc<MessageBroker>,
     prover_timeout: Duration,
     cycle: u64,
     asset0: AccountId,
     asset1: AccountId,
     pool_id: AccountId,
+    vault_id: AccountId,
     orders: Orders,
     users: Users,
     pool_states: HashMap<AccountId, PoolState>,
@@ -59,25 +65,13 @@ impl MidenExecution {
 
         let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
 
-        let sqlite_store = SqliteStore::new(network.store_path().into()).await?;
-        let store = Arc::new(sqlite_store);
-        let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
-
-        let mut client_builder = MidenNetwork::client_builder()
-            .in_debug_mode(true.into())
-            .store(store)
-            .authenticator(keystore);
-
         if let Some(ref url) = tx_prover_url {
-            let remote_prover =
-                Arc::new(RemoteTransactionProver::new(url.clone()).with_timeout(prover_timeout));
             info!(
                 network = network.as_str(),
                 prover = %url,
                 timeout_secs = tx_prover_timeout_secs,
                 "Using Miden network with remote prover"
             );
-            client_builder = client_builder.prover(remote_prover);
         } else {
             info!(
                 network = network.as_str(),
@@ -85,42 +79,66 @@ impl MidenExecution {
             );
         }
 
-        let mut client = client_builder.build().await?;
-
+        let mut client = get_client().await?;
         client.ensure_genesis_in_place().await?;
         client.sync_state().await?;
 
-        println!("Client ready.");
+        let mut pool_client = get_pool_client().await?;
+        pool_client.ensure_genesis_in_place().await?;
+        pool_client.sync_state().await?;
 
-        // spawn the user accounts
-        let users = get_users(1, &mut client).await?;
+        println!("Clients ready.");
+
+        // custody layer
+        let vault = deploy_vault(&mut client).await?;
+        let vault_id = vault.id();
+        println!("Vault deployed: {}", vault_id.to_hex());
+
+        // pool assets
+        let asset0 = get_faucet(&mut client, "ASTA").await?;
+        let asset1 = get_faucet(&mut client, "ASTB").await?;
 
         let pool_0_balance = 10_000_000_000;
         let pool_1_balance = 10_000_000_000;
 
-        let (pool, _) = deploy_pool(&mut client, users.clone()).await?;
-
+        // trading layer, wired to the vault; deployed from the pool client so the vault
+        // stays untracked in the store that submits the FPI swap txs
+        let pool = deploy_pool(&mut pool_client, vault_id, asset0, asset1).await?;
         println!(
             "Pool deployed. BECH32: {}, HEX: {}",
             pool.id().to_bech32(network.endpoint().to_network_id()),
             pool.id().to_hex()
         );
+        set_pool_account_id_on_vault(&mut client, vault_id, pool.id()).await?;
+        println!("Pool account id set on the vault.");
 
-        let tx = TransactionRequestBuilder::new().build()?;
-        client.add_account(&pool, true).await?;
-        client.submit_new_transaction(pool.id(), tx).await?;
-        client.sync_state().await?;
+        // spawn the user accounts and put them through the register + fund flow
+        let users = get_users(1, &mut client).await?;
+        for user in &users {
+            let user_id = user.id();
+            register_user_on_vault(
+                &mut client,
+                vault_id,
+                user_id,
+                user.pubkey().to_commitment().into(),
+            )
+            .await?;
+            for asset in [asset0, asset1] {
+                mint_asset_to_user(&mut client, asset, user_id, USER_INITIAL_ON_CHAIN_BALANCE)
+                    .await?;
+                fund_user_on_vault(
+                    &mut client,
+                    vault_id,
+                    user_id,
+                    FungibleAsset::new(asset, USER_INITIAL_ON_CHAIN_BALANCE)
+                        .map_err(|e| anyhow!("invalid asset: {e:?}"))?,
+                )
+                .await?;
+            }
+            println!("User {} registered and funded.", user_id.to_hex());
+        }
 
-        // sleep(Duration::from_secs(4));
-
-        println!("Pool touched.");
-
-        let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-        let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
-
-        let user_amount = 1_000_000_000u64;
-
-        let users = Users::new(users, user_amount, vec![asset0, asset1]);
+        let users = Users::new(users, USER_INITIAL_ON_CHAIN_BALANCE, vec![asset0, asset1]);
 
         let mut pool_states = HashMap::with_capacity(2);
         pool_states.insert(
@@ -139,7 +157,9 @@ impl MidenExecution {
         Ok(Self {
             cycle: 0,
             pool_id: pool.id(),
+            vault_id,
             client,
+            pool_client,
             message_broker,
             prover_timeout,
             asset0,
@@ -249,22 +269,24 @@ impl MidenExecution {
 
         let mut intents = Vec::with_capacity(orders.len());
         let mut advice_data = vec![];
+        let mut fpi_asset_user_pairs = Vec::with_capacity(orders.len());
 
-        let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-        // let slot_names = get_user_balance_storage_slot_names();
+        let asset0 = self.asset0;
         for order in &orders {
             let user_id = order.user_id();
             let user_index = self.users.get_user_index(&order.user_id());
-            // let user_index = self.users.get_user_index(&user_id);
             let details = order.details();
 
             let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
             let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
             let amount_out = order.execution_result().amount_out;
 
+            // the swap FPIs into the vault for the sell asset's totals + the registration
+            fpi_asset_user_pairs.push((details.asset_in, user_id));
+
             let user_suffix: u64 = user_id.suffix().as_canonical_u64();
             let user_prefix: u64 = user_id.prefix().as_u64();
-            let user_slot_key = get_user_balance_storage_slot_name(user_index);
+            let user_slot_key = get_user_trades_slot_name(user_index);
 
             let intent = Intent {
                 user_suffix,
@@ -305,7 +327,12 @@ impl MidenExecution {
 
         info!("SCRIPT \n\n{tx_script}\n\n");
 
-        let cb = link_operator(self.client.code_builder())?;
+        // refresh the pool client's anchor block so the vault FPI proof covers the
+        // latest funding state
+        self.pool_client.sync_state().await?;
+
+        let cb = link_math(self.pool_client.code_builder())?;
+        let cb = link_operator(cb)?;
         let cb = link_pool(cb)?;
         let tx_script = cb.compile_tx_script(tx_script)?;
 
@@ -314,12 +341,16 @@ impl MidenExecution {
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
             .extend_advice_map([(advice_map_key, advice_data)])
+            .foreign_accounts(vec![vault_foreign_account(
+                self.vault_id,
+                &fpi_asset_user_pairs,
+            )?])
             .build()?;
 
         let submit_started = Instant::now();
         let pool_id = self.pool_id;
 
-        let tx_result = self.client.execute_transaction(pool_id, tx_req).await?;
+        let tx_result = self.pool_client.execute_transaction(pool_id, tx_req).await?;
         let measurements = tx_result.executed_transaction().measurements();
         info!(
             total_cycles = measurements.total_cycles(),
@@ -328,19 +359,19 @@ impl MidenExecution {
         );
         let prove_started = Instant::now();
         let proven_transaction = self
-            .client
-            .prove_transaction_with(&tx_result, self.client.prover())
+            .pool_client
+            .prove_transaction_with(&tx_result, self.pool_client.prover())
             .await?;
         let prove_elapsed = prove_started.elapsed();
         let submission_height = self
-            .client
+            .pool_client
             .submit_proven_transaction(proven_transaction, &tx_result)
             .await?;
-        self.client
+        self.pool_client
             .apply_transaction(&tx_result, submission_height)
             .await?;
         println!("Elapsed: {prove_elapsed:?}");
-        self.client.sync_state().await?;
+        self.pool_client.sync_state().await?;
 
         // let res = self
         //     .client
@@ -360,7 +391,7 @@ impl MidenExecution {
 
         let tx_hash = tx_result.id().to_hex().to_string();
 
-        self.client.sync_state().await?;
+        self.pool_client.sync_state().await?;
         info!(%tx_hash, "Client state synced");
 
         let mut executed_count = 0usize;
@@ -393,6 +424,18 @@ impl MidenExecution {
 
     pub fn pool_id(&self) -> AccountId {
         self.pool_id
+    }
+
+    pub fn vault_id(&self) -> AccountId {
+        self.vault_id
+    }
+
+    pub fn asset0(&self) -> AccountId {
+        self.asset0
+    }
+
+    pub fn asset1(&self) -> AccountId {
+        self.asset1
     }
 
     pub fn users(&self) -> Users {

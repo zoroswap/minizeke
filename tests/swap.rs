@@ -4,11 +4,8 @@ use anyhow::Result;
 use minizeke::{
     intent::Intent,
     order::{Order, OrderDetails, OrderExecutionResult},
-    pool::{
-        USER_INITIAL_ON_CHAIN_BALANCE, get_user_balance_from_pool,
-        get_user_balance_storage_slot_name,
-    },
-    test_utils::{get_asset0, get_asset1, get_miden_execution},
+    pool::{USER_INITIAL_ON_CHAIN_BALANCE, get_user_balance_from_pool, get_user_trades_slot_name},
+    test_utils::get_miden_execution,
 };
 
 #[tokio::test]
@@ -19,14 +16,14 @@ async fn test_swap() -> Result<()> {
     let users = miden_execution.users();
     let users_by_id = users.by_account_id();
     let mut orders = Vec::with_capacity(users_by_id.len());
-    let asset0 = get_asset0();
-    let asset1 = get_asset1();
+    let asset0 = miden_execution.asset0();
+    let asset1 = miden_execution.asset1();
 
     for (user_id, user) in users.by_account_id() {
         let user_suffix: u64 = user_id.suffix().as_canonical_u64();
         let user_prefix: u64 = user_id.prefix().as_u64();
         let user_index = users.get_user_index(&user_id);
-        let user_key_slot = get_user_balance_storage_slot_name(user_index);
+        let user_key_slot = get_user_trades_slot_name(user_index);
 
         let intent = Intent {
             user_suffix,
@@ -64,10 +61,10 @@ async fn test_swap() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let pool_id = miden_execution.pool_id();
+    let vault_id = miden_execution.vault_id();
     for (user_id, _) in users.by_account_id() {
-        let user_index = users.get_user_index(&user_id);
-        let asset0_bal = get_user_balance_from_pool(pool_id, user_index, 0).await?;
-        let asset1_bal = get_user_balance_from_pool(pool_id, user_index, 1).await?;
+        let asset0_bal = get_user_balance_from_pool(pool_id, vault_id, asset0, 0, user_id).await?;
+        let asset1_bal = get_user_balance_from_pool(pool_id, vault_id, asset1, 1, user_id).await?;
         assert_eq!(asset0_bal, USER_INITIAL_ON_CHAIN_BALANCE - 10);
         assert_eq!(asset1_bal, USER_INITIAL_ON_CHAIN_BALANCE + 10);
     }

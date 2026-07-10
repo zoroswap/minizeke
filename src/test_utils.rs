@@ -1,11 +1,11 @@
 use std::{cell::OnceCell, env, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use dotenv::dotenv;
 use miden_client::{
     Client, RemoteTransactionProver,
     account::{
-        AccountBuilder, AccountId, AccountType,
+        AccountBuilder, AccountId, AccountType, StorageMapKey,
         component::{
             BasicWallet, BurnPolicyConfig, FungibleFaucet, MintPolicyConfig, PolicyRegistration,
             TokenName, TokenPolicyManager,
@@ -16,19 +16,30 @@ use miden_client::{
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
     note::NoteType,
+    rpc::domain::account::AccountStorageRequirements,
     testing::{
         account_id::{ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2},
         common::wait_for_blocks,
     },
-    transaction::TransactionRequestBuilder,
+    transaction::{ForeignAccount, TransactionRequestBuilder},
 };
 use miden_client_sqlite_store::SqliteStore;
+use miden_core::{Felt, Word};
 use rand::RngCore;
 use tracing::info;
 
 use crate::{
-    message_broker::message_broker::MessageBroker, miden_env::MidenNetwork,
-    miden_execution::MidenExecution, vault::deploy_vault,
+    assembly_utils::storage_slot_name,
+    message_broker::message_broker::MessageBroker,
+    miden_env::MidenNetwork,
+    miden_execution::MidenExecution,
+    note::{FundInstructions, RegisterInstructions, ZekeNote, ZekeNoteInstructions},
+    pool::USER_SLOT_IDS_SLOT,
+    vault::{
+        USER_ASSET_TOTAL_FUNDING_SLOT, USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT,
+        USER_ASSET_TOTAL_REDEEMS_SLOT, USER_INDICES_SLOT, USER_PUBKEYS_SLOT, deploy_vault,
+        vault_user_asset_key, vault_user_key,
+    },
 };
 
 const ASSET_0: OnceCell<AccountId> = OnceCell::new();
@@ -45,6 +56,25 @@ pub fn get_asset1() -> AccountId {
 }
 
 pub async fn get_client() -> Result<Client<FilesystemKeyStore>> {
+    let network = MidenNetwork::from_env();
+    build_client(network.store_path()).await
+}
+
+/// Client with a separate store for pool-native transactions (swaps).
+///
+/// The swap tx FPIs into the vault, and `miden-client`'s foreign-account fetch uses
+/// `VaultFetch::IfChangedFrom(local_vault_root)` for accounts tracked in the local store.
+/// When the root matches, the node omits the asset list and the client reconstructs the
+/// foreign vault as empty, which breaks the kernel's foreign-account commitment check as
+/// soon as the vault holds assets. Keeping the vault untracked in the swap-submitting
+/// client forces `VaultFetch::Always`, so the full asset list is fetched. This also
+/// mirrors the production topology where the pool operator does not custody the vault.
+pub async fn get_pool_client() -> Result<Client<FilesystemKeyStore>> {
+    let network = MidenNetwork::from_env();
+    build_client(format!("pool.{}", network.store_path())).await
+}
+
+async fn build_client(store_path: String) -> Result<Client<FilesystemKeyStore>> {
     dotenv().ok();
 
     const DEFAULT_TX_PROVER_TIMEOUT_SECS: u64 = 30;
@@ -60,7 +90,7 @@ pub async fn get_client() -> Result<Client<FilesystemKeyStore>> {
 
     let prover_timeout = Duration::from_secs(tx_prover_timeout_secs);
 
-    let sqlite_store = SqliteStore::new(network.store_path().into()).await?;
+    let sqlite_store = SqliteStore::new(store_path.into()).await?;
     let store = Arc::new(sqlite_store);
     let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
@@ -251,4 +281,171 @@ pub async fn touch_account(
     client.sync_state().await?;
     wait_for_blocks(client, 1).await;
     Ok(())
+}
+
+/// Mints `amount` of `faucet_id` to `user_id` and consumes the mint note as the user.
+pub async fn mint_asset_to_user(
+    client: &mut Client<FilesystemKeyStore>,
+    faucet_id: AccountId,
+    user_id: AccountId,
+    amount: u64,
+) -> Result<()> {
+    let fungible_asset =
+        FungibleAsset::new(faucet_id, amount).map_err(|e| anyhow!("invalid asset: {e:?}"))?;
+    let transaction_request = TransactionRequestBuilder::new()
+        .build_mint_fungible_asset(fungible_asset, user_id, NoteType::Public, client.rng())
+        .map_err(|e| anyhow!("failed to build mint tx: {e:?}"))?;
+    client
+        .submit_new_transaction(faucet_id, transaction_request)
+        .await?;
+    consume_all_notes_for(client, user_id).await?;
+    Ok(())
+}
+
+/// Consumes every currently-consumable note addressed to `account_id`, waiting for at least
+/// one to show up.
+pub async fn consume_all_notes_for(
+    client: &mut Client<FilesystemKeyStore>,
+    account_id: AccountId,
+) -> Result<()> {
+    loop {
+        client.sync_state().await?;
+
+        let consumable_notes = client.get_consumable_notes(Some(account_id)).await?;
+        let notes = consumable_notes
+            .iter()
+            .map(|(note, _)| note.clone().try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !notes.is_empty() {
+            let tx_req = TransactionRequestBuilder::new().build_consume_notes(notes)?;
+            client.submit_new_transaction(account_id, tx_req).await?;
+            client.sync_state().await?;
+            wait_for_blocks(client, 1).await;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Sends a note from `sender_id` and consumes it on `consumer_id`, optionally declaring
+/// foreign accounts on the consuming transaction (needed when the note's script FPIs).
+pub async fn send_and_consume_note(
+    client: &mut Client<FilesystemKeyStore>,
+    note: &ZekeNote,
+    sender_id: AccountId,
+    consumer_id: AccountId,
+    foreign_accounts: Vec<ForeignAccount>,
+) -> Result<()> {
+    let tx_req = TransactionRequestBuilder::new()
+        .own_output_notes(vec![note.note().clone()])
+        .build()?;
+    client.submit_new_transaction(sender_id, tx_req).await?;
+    client.sync_state().await?;
+    wait_for_blocks(client, 1).await;
+
+    let tx_req = TransactionRequestBuilder::new()
+        .input_notes(vec![(note.note().clone(), None)])
+        .foreign_accounts(foreign_accounts)
+        .build()?;
+    client.submit_new_transaction(consumer_id, tx_req).await?;
+    client.sync_state().await?;
+    wait_for_blocks(client, 1).await;
+    Ok(())
+}
+
+/// Registers `user_id`'s trading pubkey commitment on the vault via a REGISTER note.
+pub async fn register_user_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    user_id: AccountId,
+    pubkey_commitment: Word,
+) -> Result<()> {
+    let note = ZekeNote::new(
+        ZekeNoteInstructions::Register(RegisterInstructions {
+            user_id,
+            vault_id,
+            pubkey_commitment,
+        }),
+        client.code_builder(),
+    )?;
+    send_and_consume_note(client, &note, user_id, vault_id, vec![]).await
+}
+
+/// Funds the user's trading balance on the vault via a FUND note carrying `asset`.
+pub async fn fund_user_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    user_id: AccountId,
+    asset: FungibleAsset,
+) -> Result<()> {
+    let note = ZekeNote::new(
+        ZekeNoteInstructions::Fund(FundInstructions {
+            user_id,
+            vault_id,
+            note_assets: vec![asset],
+        }),
+        client.code_builder(),
+    )?;
+    send_and_consume_note(client, &note, user_id, vault_id, vec![]).await
+}
+
+/// Foreign-account declaration for vault-native transactions that FPI into the pool
+/// (INIT_REDEEM / REDEEM consumption): requests the user's entry of the pool's
+/// index -> trades-slot-id map.
+pub fn pool_foreign_account(pool_id: AccountId, user_index: u64) -> Result<ForeignAccount> {
+    let index_key = StorageMapKey::new(Word::new([
+        Felt::new(user_index).map_err(|e| anyhow!("invalid user index: {e:?}"))?,
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+    ]));
+    let requirements = AccountStorageRequirements::new([(
+        storage_slot_name(USER_SLOT_IDS_SLOT),
+        [&index_key],
+    )]);
+    ForeignAccount::public(pool_id, requirements)
+        .map_err(|e| anyhow!("failed to build pool foreign account: {e:?}"))
+}
+
+/// Foreign-account declaration for pool-native swap transactions that FPI into the vault:
+/// requests the funding/initiated/redeems entries for every (asset, user) pair plus the
+/// registration entries (pubkey + index) for every user.
+pub fn vault_foreign_account(
+    vault_id: AccountId,
+    asset_user_pairs: &[(AccountId, AccountId)],
+) -> Result<ForeignAccount> {
+    let asset_user_keys: Vec<StorageMapKey> = asset_user_pairs
+        .iter()
+        .map(|(asset_id, user_id)| StorageMapKey::new(vault_user_asset_key(*asset_id, *user_id)))
+        .collect();
+    let user_keys: Vec<StorageMapKey> = asset_user_pairs
+        .iter()
+        .map(|(_, user_id)| StorageMapKey::new(vault_user_key(*user_id)))
+        .collect();
+
+    let requirements = AccountStorageRequirements::new([
+        (
+            storage_slot_name(USER_ASSET_TOTAL_FUNDING_SLOT),
+            asset_user_keys.iter().collect::<Vec<_>>(),
+        ),
+        (
+            storage_slot_name(USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT),
+            asset_user_keys.iter().collect::<Vec<_>>(),
+        ),
+        (
+            storage_slot_name(USER_ASSET_TOTAL_REDEEMS_SLOT),
+            asset_user_keys.iter().collect::<Vec<_>>(),
+        ),
+        (
+            storage_slot_name(USER_PUBKEYS_SLOT),
+            user_keys.iter().collect::<Vec<_>>(),
+        ),
+        (
+            storage_slot_name(USER_INDICES_SLOT),
+            user_keys.iter().collect::<Vec<_>>(),
+        ),
+    ]);
+    ForeignAccount::public(vault_id, requirements)
+        .map_err(|e| anyhow!("failed to build vault foreign account: {e:?}"))
 }

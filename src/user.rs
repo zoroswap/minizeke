@@ -7,12 +7,12 @@ use miden_client::{
     Client, Serializable,
     account::{AccountBuilder, AccountId, AccountType, component::BasicWallet},
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKey, Signature},
-    keystore::FilesystemKeyStore,
+    keystore::{FilesystemKeyStore, Keystore},
 };
 use miden_core::Word;
 use rand::RngCore;
 
-use crate::pool::get_user_balance_storage_slot_name;
+use crate::pool::get_user_trades_slot_name;
 
 #[derive(Debug, Clone)]
 pub struct Users {
@@ -144,7 +144,7 @@ impl TryFrom<User> for SerializedUser {
     type Error = anyhow::Error;
     fn try_from(value: User) -> std::result::Result<Self, Self::Error> {
         let signing_key = general_purpose::STANDARD.encode(value.key_pair.to_bytes());
-        let user_slot_key = get_user_balance_storage_slot_name(value.index);
+        let user_slot_key = get_user_trades_slot_name(value.index);
         Ok(Self {
             id: value.id.to_hex(),
             index: value.index,
@@ -169,8 +169,9 @@ pub struct SerializedUser {
 }
 
 pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Result<Vec<User>> {
+    let keystore = FilesystemKeyStore::new("keystore".into())?;
     let mut users = Vec::with_capacity(n as usize);
-    println!("Making up {n} users");
+    println!("Creating {n} user accounts");
     for i in 0..n {
         // Draw a fresh seed per account, otherwise every account is built from the
         // same seed and ends up with an identical AccountId.
@@ -187,11 +188,19 @@ pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Resul
             .with_component(BasicWallet);
         let account = builder.build()?;
 
+        // deploy: users need on-chain accounts to send REGISTER/FUND notes
+        client.add_account(&account, false).await?;
+        keystore
+            .add_key(&key_pair, account.id())
+            .await
+            .map_err(|e| anyhow!("failed to add user key: {e:?}"))?;
+
         users.push(User {
             id: account.id(),
             key_pair,
             index: i as u16,
         });
     }
+    client.sync_state().await?;
     Ok(users)
 }
