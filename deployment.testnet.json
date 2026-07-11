@@ -1,0 +1,18 @@
+{
+  "network": "testnet",
+  "vault_id": "0x8020c95510acfeb156e5646e5aef09",
+  "pool_id": "0xfc53c22d706df29179e5a9f34b202d",
+  "asset0": "0x3163688bc5b579512b52621f5e4694",
+  "asset1": "0x15f0a191fbca9c91184b7a66ebb73d",
+  "lp_account_id": "0x6f77ecec69df05911b25c898b61339",
+  "deposits": [
+    {
+      "faucet_id": "0x3163688bc5b579512b52621f5e4694",
+      "amount": 100000000
+    },
+    {
+      "faucet_id": "0x15f0a191fbca9c91184b7a66ebb73d",
+      "amount": 100000000
+    }
+  ]
+}

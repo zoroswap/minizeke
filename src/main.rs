@@ -16,9 +16,17 @@ use crate::{
     pool::PoolState,
     processing::Processing,
     store::Store,
-    user::Users,
     websocket::connection_manager::ConnectionManager,
 };
+
+/// Deployment ids + initial pool states handed from the Miden init thread to the server.
+struct InitData {
+    pool_states: HashMap<AccountId, PoolState>,
+    pool_id: AccountId,
+    vault_id: AccountId,
+    asset0: AccountId,
+    asset1: AccountId,
+}
 
 fn main() {
     dotenv().ok();
@@ -51,11 +59,13 @@ fn main() {
                     .unwrap();
 
                 init_tx
-                    .send((
-                        miden_execution.users(),
-                        miden_execution.pool_states(),
-                        miden_execution.pool_id(),
-                    ))
+                    .send(InitData {
+                        pool_states: miden_execution.pool_states(),
+                        pool_id: miden_execution.pool_id(),
+                        vault_id: miden_execution.vault_id(),
+                        asset0: miden_execution.asset0(),
+                        asset1: miden_execution.asset1(),
+                    })
                     .unwrap();
 
                 println!("[RUN] Starting Miden execution");
@@ -66,21 +76,16 @@ fn main() {
             });
         });
 
-        let (initial_users, initial_pool_states, pool_id) = init_rx
+        let init_data = init_rx
             .recv()
             .expect("Miden init thread failed before sending init data");
 
-        let _ = main_tokio(initial_users, initial_pool_states, pool_id, message_broker);
+        let _ = main_tokio(init_data, message_broker);
     });
 }
 
 #[tokio::main]
-async fn main_tokio(
-    initial_users: Users,
-    initial_pool_states: HashMap<AccountId, PoolState>,
-    pool_id: AccountId,
-    message_broker: Arc<MessageBroker>,
-) -> Result<()> {
+async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> Result<()> {
     println!("[INIT] Connection manager");
     let connection_manager = Arc::new(ConnectionManager::with_message_broker(
         message_broker.clone(),
@@ -88,9 +93,10 @@ async fn main_tokio(
 
     println!("[INIT] Initializing Store");
     let store = Arc::new(Store::new(
-        pool_id,
-        initial_users.clone(),
-        initial_pool_states.clone(),
+        init_data.pool_id,
+        init_data.asset0,
+        init_data.asset1,
+        init_data.pool_states.clone(),
     ));
 
     let mut oracle_client = OracleSSEClient::new(store.clone(), message_broker.clone());
@@ -100,8 +106,11 @@ async fn main_tokio(
     println!("[INIT] Initializing Processing");
     let mut processing = Processing::new(
         message_broker.clone(),
-        initial_users.clone(),
-        initial_pool_states.clone(),
+        init_data.pool_states.clone(),
+        init_data.pool_id,
+        init_data.vault_id,
+        init_data.asset0,
+        init_data.asset1,
     )
     .await?;
 

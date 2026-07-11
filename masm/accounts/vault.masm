@@ -14,7 +14,12 @@ use zoro_miden::lib::asset_utils
 #   - cumulative funding              (USER_ASSET_TOTAL_FUNDING)
 #   - cumulative initiated redeems    (USER_ASSET_TOTAL_INITIATED_REDEEMS)
 #   - cumulative completed redeems    (USER_ASSET_TOTAL_REDEEMS)
-#   - LP provider shares              (LP_ASSET_SHARES)
+#
+# And, per LP provider per asset (LP shares themselves live on the server only):
+#   - cumulative entitlement          (LP_ENTITLEMENTS: principal + checkpointed fees)
+#   - cumulative withdrawn            (LP_WITHDRAWN)
+# withdrawable = entitlement - withdrawn; both counters are monotonic so operator
+# checkpoints are race-free against concurrent self-custodial withdrawals.
 #
 # Stores the POOL account id so it can FPI into the POOL for read-only checks.
 #
@@ -37,7 +42,8 @@ const USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT = word("zorovault::user_asset_tota
 const USER_PUBKEYS_SLOT = word("zorovault::user_pubkeys")
 const USER_INDICES_SLOT = word("zorovault::user_indices")
 const NEXT_USER_INDEX_SLOT = word("zorovault::next_user_index")
-const LP_ASSET_SHARES_SLOT = word("zorovault::lp_asset_shares")
+const LP_ENTITLEMENTS_SLOT = word("zorovault::lp_entitlements")
+const LP_WITHDRAWN_SLOT = word("zorovault::lp_withdrawn")
 const POOL_ACCOUNT_ID_SLOT = word("zorovault::pool_account_id")
 const USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT = word("zorovault::user_pool_balance_details_proc_root")
 
@@ -48,7 +54,8 @@ const MAX_USERS = 128
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "VAULT: insufficient available balance to initiate redeem"
 const ERR_INSUFFICIENT_PENDING_REDEEM = "VAULT: user does not have enough pending redeem for asset"
 const ERR_INSUFFICIENT_POOL_BALANCE = "VAULT: pool user balance is lower than redeem amount"
-const ERR_LP_WITHDRAW_AMOUNT_EXCEEDS_USER_LP_SHARES = "VAULT: LP withdrawal amount exceeds user LP shares"
+const ERR_LP_WITHDRAW_EXCEEDS_ENTITLEMENT = "VAULT: LP withdrawal amount exceeds withdrawable entitlement"
+const ERR_LP_CHECKPOINT_DECREASES_ENTITLEMENT = "VAULT: LP entitlement checkpoint must not decrease the entitlement"
 const ERR_USER_NOT_REGISTERED = "VAULT: user is not registered"
 const ERR_USER_ALREADY_REGISTERED = "VAULT: user is already registered"
 const ERR_MAX_USERS_REACHED = "VAULT: maximum number of registered users reached"
@@ -203,22 +210,22 @@ pub proc add_to_user_asset_total_redeems
     exec.storage_utils::add_to_map_item drop
 end
 
-#! LP_ASSET_SHARES(assetId, lpProviderId) += shares
-#! Inputs:  [shares, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! LP_ENTITLEMENTS(assetId, lpProviderId) += amount
+#! Inputs:  [amount, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
 #! Outputs: []
-pub proc add_to_lp_asset_shares
+pub proc add_to_lp_entitlement
     movdn.4
-    push.LP_ASSET_SHARES_SLOT[0..2]
+    push.LP_ENTITLEMENTS_SLOT[0..2]
     exec.storage_utils::add_to_map_item drop
 end
 
-#! LP_ASSET_SHARES(assetId, lpProviderId) -= shares
-#! Inputs:  [shares, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! LP_WITHDRAWN(assetId, lpProviderId) += amount
+#! Inputs:  [amount, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
 #! Outputs: []
-pub proc sub_from_lp_asset_shares
+pub proc add_to_lp_withdrawn
     movdn.4
-    push.LP_ASSET_SHARES_SLOT[0..2]
-    exec.storage_utils::sub_from_map_item drop
+    push.LP_WITHDRAWN_SLOT[0..2]
+    exec.storage_utils::add_to_map_item drop
 end
 
 # ----------------------------------------------------------------------------------------------
@@ -303,11 +310,35 @@ pub proc get_user_trading_details
     exec.sys::truncate_stack
 end
 #! Inputs:  [KEY] = [asset_suffix, asset_prefix, lp_suffix, lp_prefix]
-#! Outputs: [shares]
-pub proc get_lp_asset_shares
-    push.LP_ASSET_SHARES_SLOT[0..2]
+#! Outputs: [entitlement]
+pub proc get_lp_entitlement
+    push.LP_ENTITLEMENTS_SLOT[0..2]
     exec.active_account::get_map_item
     swap.3 drop drop drop
+end
+
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! Outputs: [withdrawn]
+pub proc get_lp_withdrawn
+    push.LP_WITHDRAWN_SLOT[0..2]
+    exec.active_account::get_map_item
+    swap.3 drop drop drop
+end
+
+#! withdrawable = entitlement - withdrawn
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! Outputs: [withdrawable]
+pub proc get_lp_withdrawable
+    dupw
+    # => [KEY, KEY]
+    exec.get_lp_entitlement
+    # => [entitlement, KEY]
+    movdn.4
+    # => [KEY, entitlement]
+    exec.get_lp_withdrawn
+    # => [withdrawn, entitlement]
+    exec.math::safe_sub
+    # => [entitlement - withdrawn]
 end
 
 #! pending = total_initiated_redeems - total_redeems
@@ -360,98 +391,103 @@ pub proc address_from_asset
     swap.2 drop
 end
 
-#! Returns asset-only LP map key: [asset_suffix, asset_prefix, 0, 0].
-#! Inputs:  [ASSET]
-#! Outputs: [KEY]
-proc get_lp_total_supply_key
-    exec.address_word_from_asset
-end
-
-#! Inputs:  [ASSET]
-#! Outputs: [asset_suffix, asset_prefix, 0, 0]
-proc address_word_from_asset
-    push.0 swap.3 drop
-    push.0 swap.4 drop
-end
-
-#! Builds per-user LP key: [asset_suffix, asset_prefix, user_suffix, user_prefix].
-#! Inputs:  [ASSET, user_suffix, user_prefix]
+#! Builds per-LP key: [asset_suffix, asset_prefix, lp_suffix, lp_prefix].
+#! Inputs:  [ASSET, lp_suffix, lp_prefix]
 #! Outputs: [KEY]
 proc build_lp_key
     exec.address_from_asset
-    # => [asset_suffix, asset_prefix, user_suffix, user_prefix]
-end
-
-#! Reads LP shares for a composite key.
-#! Inputs:  [KEY]
-#! Outputs: [shares]
-proc get_lp_shares_for_key
-    push.LP_ASSET_SHARES_SLOT[0..2]
-    exec.active_account::get_map_item
-    swap.3 drop drop drop
+    # => [asset_suffix, asset_prefix, lp_suffix, lp_prefix]
 end
 
 # ----------------------------------------------------------------------------------------------
 # LP DEPOSIT / WITHDRAW
 # ----------------------------------------------------------------------------------------------
+# Liquidity custody sits in the vault; LP shares are accounted on the server only. On-chain
+# the vault keeps two monotonic counters per (asset, lp):
+#   LP_ENTITLEMENTS - cumulative amount ever owed (principal, raised by operator checkpoints
+#                     to include accrued fees)
+#   LP_WITHDRAWN    - cumulative amount paid out
+# so LPs can always self-custodially withdraw up to entitlement - withdrawn even if the
+# operator disappears.
 
-#! Records LP shares for a provider deposit. Custody is handled by the consuming note.
+#! VAULT::deposit_liquidity(assetId, lpId)
+#! Receives the note's asset into the vault and credits the LP's entitlement with the
+#! deposited amount (principal is recoverable immediately, without any operator action).
 #!
-#! Inputs:  [ASSET, user_suffix, user_prefix, lp_amount]
+#! Inputs:  [ASSET, lp_suffix, lp_prefix]
 #! Outputs: []
-const VD_USER_LP_KEY_LOCAL = 0
-const VD_LP_AMOUNT_LOCAL = 4
-@locals(5)
-pub proc deposit
-    exec.build_lp_key
-    # => [USER_LP_KEY, lp_amount]
-    loc_storew_be.VD_USER_LP_KEY_LOCAL
-    movup.4
-    # => [lp_amount, KEY]
-    dup loc_store.VD_LP_AMOUNT_LOCAL
-    movdn.4
-    # => [USER_LP_KEY, lp_amount]
-    push.LP_ASSET_SHARES_SLOT[0..2]
-    exec.storage_utils::add_to_map_item drop
-    # => []
+const DL_ASSET_LOCAL = 0
+@locals(4)
+pub proc deposit_liquidity
+    loc_storew_be.DL_ASSET_LOCAL
+    # => [ASSET, lp_suffix, lp_prefix]
+    exec.wallet::add_assets_to_account
 
-    # total supply += lp_amount
-    loc_load.VD_LP_AMOUNT_LOCAL padw loc_loadw_be.VD_USER_LP_KEY_LOCAL
-    exec.get_lp_total_supply_key
-    push.LP_ASSET_SHARES_SLOT[0..2]
-    exec.storage_utils::add_to_map_item drop
+    loc_loadw_be.DL_ASSET_LOCAL
+    exec.address_from_asset
+    # => [asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+    padw loc_loadw_be.DL_ASSET_LOCAL exec.asset_utils::get_amount_c
+    # => [amount, KEY]
+    exec.add_to_lp_entitlement
     exec.sys::truncate_stack
 end
 
-#! Burns LP shares for a provider withdrawal. Custody release is handled by the consuming note.
+#! VAULT::checkpoint_lp_entitlement(newEntitlement, assetId, lpId)
+#! Operator-signed maintenance call: raises the LP's entitlement to `new_entitlement`
+#! (principal + accrued fees, computed by the server from the LP's shares). The entitlement
+#! is monotonic: a checkpoint below the current value panics.
 #!
-#! Inputs:  [ASSET, user_suffix, user_prefix, lp_withdraw_amount]
-#!         (same stack layout as zoropool::withdraw from the WITHDRAW note)
+#! Inputs:  [new_entitlement, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
 #! Outputs: []
-const VW_USER_SUFFIX_LOCAL = 0
-const VW_USER_PREFIX_LOCAL = 1
-const VW_LP_WITHDRAW_AMOUNT_LOCAL = 2
-const VW_USER_LP_SHARES_LOCAL = 3
-const VW_ASSET_LOCAL = 4
-const VW_USER_LP_KEY_LOCAL = 8
-@locals(12)
-pub proc withdraw
-    loc_store.VW_USER_SUFFIX_LOCAL loc_store.VW_USER_PREFIX_LOCAL loc_store.VW_LP_WITHDRAW_AMOUNT_LOCAL loc_storew_be.VW_ASSET_LOCAL dropw
-    loc_load.VW_USER_PREFIX_LOCAL loc_load.VW_USER_SUFFIX_LOCAL padw loc_loadw_be.VW_ASSET_LOCAL
-    exec.build_lp_key loc_storew_be.VW_USER_LP_KEY_LOCAL dropw
-    padw loc_loadw_be.VW_USER_LP_KEY_LOCAL exec.get_lp_shares_for_key loc_store.VW_USER_LP_SHARES_LOCAL
-    loc_load.VW_USER_LP_SHARES_LOCAL loc_load.VW_LP_WITHDRAW_AMOUNT_LOCAL
-    sub
-    dup loc_load.VW_USER_LP_SHARES_LOCAL
-    lt assert.err=ERR_LP_WITHDRAW_AMOUNT_EXCEEDS_USER_LP_SHARES
+const CLE_KEY_LOCAL = 0
+const CLE_NEW_ENTITLEMENT_LOCAL = 4
+@locals(5)
+pub proc checkpoint_lp_entitlement
+    loc_store.CLE_NEW_ENTITLEMENT_LOCAL loc_storew_be.CLE_KEY_LOCAL
+    # => [KEY]
 
-    padw loc_loadw_be.VW_USER_LP_KEY_LOCAL push.LP_ASSET_SHARES_SLOT[0..2]
+    # assert new_entitlement >= current entitlement
+    exec.get_lp_entitlement
+    # => [current_entitlement]
+    loc_load.CLE_NEW_ENTITLEMENT_LOCAL swap
+    # => [current_entitlement, new_entitlement]
+    gte assert.err=ERR_LP_CHECKPOINT_DECREASES_ENTITLEMENT
+    # => []
+
+    loc_load.CLE_NEW_ENTITLEMENT_LOCAL padw loc_loadw_be.CLE_KEY_LOCAL
+    # => [KEY, new_entitlement]
+    push.LP_ENTITLEMENTS_SLOT[0..2]
     exec.storage_utils::set_map_item drop
+    exec.sys::truncate_stack
+end
 
-    loc_load.VW_LP_WITHDRAW_AMOUNT_LOCAL
-    padw loc_loadw_be.VW_ASSET_LOCAL exec.get_lp_total_supply_key
-    push.LP_ASSET_SHARES_SLOT[0..2]
-    exec.storage_utils::sub_from_map_item drop
+#! VAULT::withdraw_liquidity(amount, assetId, lpId)
+#! Self-custodial LP withdrawal: asserts amount <= entitlement - withdrawn, then records
+#! the withdrawal. The asset payout (P2ID) is handled by the consuming note.
+#!
+#! Inputs:  [amount, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+#! Outputs: []
+const WL_KEY_LOCAL = 0
+const WL_AMOUNT_LOCAL = 4
+@locals(5)
+pub proc withdraw_liquidity
+    loc_store.WL_AMOUNT_LOCAL loc_storew_be.WL_KEY_LOCAL
+    # => [KEY]
+
+    # assert withdrawable >= amount
+    exec.get_lp_withdrawable
+    # => [withdrawable]
+    loc_load.WL_AMOUNT_LOCAL
+    # => [amount, withdrawable]
+    gte assert.err=ERR_LP_WITHDRAW_EXCEEDS_ENTITLEMENT
+    # => []
+
+    # LP_WITHDRAWN += amount
+    loc_load.WL_AMOUNT_LOCAL padw loc_loadw_be.WL_KEY_LOCAL
+    # => [KEY, amount]
+    movup.4
+    # => [amount, KEY]
+    exec.add_to_lp_withdrawn
     exec.sys::truncate_stack
 end
 

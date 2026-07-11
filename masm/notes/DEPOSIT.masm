@@ -1,0 +1,27 @@
+use miden::core::sys
+
+use zoro_miden::vault
+use zoro_miden::note::common
+use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
+
+# LP liquidity deposit: moves the note's asset into the vault and credits the LP's
+# entitlement with the deposited amount (LP shares are minted server-side).
+#
+# Note storage layout (same as FUND):
+# word 0: EXPECTED_ASSET [0, 0, 0, 0]
+# word 1: METADATA [0, 0, 0, 0]
+# word 2: BENEFICIARY [lp_id_suffix, lp_id_prefix, 0, 0]
+proc execute_DEPOSIT
+    exec.common::get_beneficiary_id
+    padw exec.common::get_input_asset
+    # => [ASSET, lp_suffix, lp_prefix]
+    call.vault::deposit_liquidity
+end
+
+@note_script
+pub proc main
+    push.DEFAULT_NUMBER_OF_STORAGE_ITEMS exec.common::store_storage_to_memory drop
+    exec.common::store_asset_to_memory
+    exec.execute_DEPOSIT
+    exec.sys::truncate_stack
+end

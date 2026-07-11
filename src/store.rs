@@ -1,7 +1,6 @@
 use crate::{
     order::{OrderUpdate, Orders},
     pool::PoolState,
-    user::{SerializedUser, Users},
 };
 use dashmap::DashMap;
 use miden_client::account::AccountId;
@@ -11,21 +10,24 @@ use uuid::Uuid;
 pub struct Store {
     orders: Orders,
     pool_account_id: AccountId,
+    asset0: AccountId,
+    asset1: AccountId,
     pool_states: DashMap<AccountId, PoolState>,
-    users: Users,
 }
 
 impl Store {
     pub fn new(
         pool_acc: AccountId,
-        users: Users,
+        asset0: AccountId,
+        asset1: AccountId,
         pool_states: HashMap<AccountId, PoolState>,
     ) -> Self {
         let store = Self {
             pool_account_id: pool_acc,
+            asset0,
+            asset1,
             orders: Orders::default(),
             pool_states: DashMap::new(),
-            users,
         };
         store.set_pool_states(pool_states);
         store
@@ -60,7 +62,11 @@ impl Store {
             .collect::<HashMap<AccountId, PoolState>>()
     }
 
-    pub fn serialized_users(&self) -> Vec<SerializedUser> {
-        self.users.serialized_users()
+    pub fn asset0(&self) -> AccountId {
+        self.asset0
+    }
+
+    pub fn asset1(&self) -> AccountId {
+        self.asset1
     }
 }

@@ -31,8 +31,8 @@ impl NoteKind {
             NoteKind::Fund => "FUND.masm",
             NoteKind::InitRedeem => "INIT_REDEEM.masm",
             NoteKind::Redeem => "REDEEM.masm",
-            NoteKind::Deposit => "REDEEM.masm",
-            NoteKind::Withdraw => "REDEEM.masm",
+            NoteKind::Deposit => "DEPOSIT.masm",
+            NoteKind::Withdraw => "WITHDRAW.masm",
         }
     }
 }
@@ -78,18 +78,20 @@ pub struct RedeemInstructions {
     pub min_expected_asset: FungibleAsset,
 }
 
+/// LP liquidity deposit: the note carries `asset` into the vault; the vault credits the
+/// LP's entitlement and the server mints LP shares off-chain.
 pub struct DepositInstructions {
-    pub user_id: AccountId,
+    pub lp_id: AccountId,
     pub vault_id: AccountId,
-    pub asset_in: FungibleAsset,
-    pub min_expected_lp: u64,
+    pub asset: FungibleAsset,
 }
 
+/// Self-custodial LP liquidity withdrawal: no assets attached; the vault checks
+/// `amount <= entitlement - withdrawn` and pays out `asset_out` via P2ID to the LP.
 pub struct WithdrawInstructions {
-    pub user_id: AccountId,
+    pub lp_id: AccountId,
     pub vault_id: AccountId,
     pub asset_out: FungibleAsset,
-    pub min_amount_out: u64,
 }
 
 impl ZekeNote {
@@ -148,20 +150,19 @@ impl ZekeNote {
             }
             ZekeNoteInstructions::Deposit(instructions) => {
                 vault_id = instructions.vault_id;
-                sender_id = instructions.user_id;
+                sender_id = instructions.lp_id;
+                note_assets = Some(vec![instructions.asset]);
                 note_kind = NoteKind::Deposit;
-                note_storage_builder =
-                    note_storage_builder.with_min_amount(instructions.min_expected_lp)?;
-                note_storage_builder = note_storage_builder.with_beneficiary(instructions.user_id);
+                note_storage_builder = note_storage_builder.with_beneficiary(instructions.lp_id);
             }
             ZekeNoteInstructions::Withdraw(instructions) => {
                 vault_id = instructions.vault_id;
-                sender_id = instructions.user_id;
-                note_kind = NoteKind::Deposit;
-                note_storage_builder =
-                    note_storage_builder.with_min_amount(instructions.min_amount_out)?;
-                note_storage_builder = note_storage_builder.with_asset(instructions.asset_out);
-                note_storage_builder = note_storage_builder.with_beneficiary(instructions.user_id);
+                sender_id = instructions.lp_id;
+                note_kind = NoteKind::Withdraw;
+                note_storage_builder = note_storage_builder
+                    .with_asset(instructions.asset_out)
+                    .with_beneficiary(instructions.lp_id)
+                    .with_p2id_tag(NoteTag::with_account_target(instructions.lp_id));
             }
         }
         let note_storage = note_storage_builder.build()?;
@@ -365,6 +366,40 @@ mod tests {
                 user_id,
                 vault_id,
                 min_expected_asset: FungibleAsset::new(faucet_id, 100)?,
+            }),
+            code_builder.clone(),
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_deposit() -> Result<()> {
+        let lp_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
+        let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2)?;
+        let faucet_id = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+        let code_builder = CodeBuilder::new();
+        ZekeNote::new(
+            ZekeNoteInstructions::Deposit(DepositInstructions {
+                lp_id,
+                vault_id,
+                asset: FungibleAsset::new(faucet_id, 500)?,
+            }),
+            code_builder.clone(),
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_withdraw() -> Result<()> {
+        let lp_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
+        let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2)?;
+        let faucet_id = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+        let code_builder = CodeBuilder::new();
+        ZekeNote::new(
+            ZekeNoteInstructions::Withdraw(WithdrawInstructions {
+                lp_id,
+                vault_id,
+                asset_out: FungibleAsset::new(faucet_id, 100)?,
             }),
             code_builder.clone(),
         )?;

@@ -268,6 +268,23 @@ impl Order<Processing> {
         }
     }
 
+    pub fn failed(self, reason: OrderFailureReason) -> Order<Failed> {
+        Order {
+            state: Failed {
+                reason,
+                execution_result: None,
+                tx_hash: None,
+            },
+            id: self.id,
+            order_type: self.order_type,
+            details: self.details,
+            user_id: self.user_id,
+            signed_order: self.signed_order,
+            timing: self.timing.failed(),
+            pubkey: self.pubkey,
+        }
+    }
+
     pub fn details(&self) -> OrderDetails {
         self.details.clone()
     }

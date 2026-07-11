@@ -20,7 +20,7 @@ use crate::{
         print_library_exports, storage_slot_name,
     },
     miden_env::MidenNetwork,
-    test_utils::touch_account,
+    test_utils::{submit_tx_resilient, touch_account},
 };
 
 pub const USER_ASSET_TOTAL_FUNDING_SLOT: &str = "zorovault::user_asset_total_funding";
@@ -33,6 +33,8 @@ pub const NEXT_USER_INDEX_SLOT: &str = "zorovault::next_user_index";
 pub const POOL_ACCOUNT_ID_SLOT: &str = "zorovault::pool_account_id";
 pub const USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT: &str =
     "zorovault::user_pool_balance_details_proc_root";
+pub const LP_ENTITLEMENTS_SLOT: &str = "zorovault::lp_entitlements";
+pub const LP_WITHDRAWN_SLOT: &str = "zorovault::lp_withdrawn";
 
 pub async fn deploy_vault(client: &mut Client<FilesystemKeyStore>) -> Result<Account> {
     let mut init_seed = [0_u8; 32];
@@ -105,6 +107,8 @@ pub fn build_vault_component(cb: CodeBuilder) -> Result<AccountComponent> {
                 storage_slot_name(USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT),
                 pool_proc_root,
             ),
+            StorageSlot::with_empty_map(storage_slot_name(LP_ENTITLEMENTS_SLOT)),
+            StorageSlot::with_empty_map(storage_slot_name(LP_WITHDRAWN_SLOT)),
         ],
         AccountComponentMetadata::new("zoro_miden::vault"),
     )?;
@@ -140,7 +144,7 @@ pub async fn set_pool_account_id_on_vault(
     let tx_request = TransactionRequestBuilder::new()
         .custom_script(tx_script)
         .build()?;
-    client.submit_new_transaction(vault_id, tx_request).await?;
+    submit_tx_resilient(client, vault_id, tx_request).await?;
     client.sync_state().await?;
     Ok(())
 }
@@ -246,4 +250,92 @@ pub async fn get_vault_user_asset_info(
 ) -> Result<VaultUserAssetInfo> {
     let storage = get_vault_storage(client, vault_id).await?;
     vault_user_asset_info_from_storage(&storage, asset_id, user_id)
+}
+
+/// An LP's cumulative entitlement/withdrawn counters for a single asset within the vault.
+/// LP shares themselves live on the server only; these on-chain counters guarantee the LP
+/// can self-custodially withdraw up to `withdrawable()` even without the operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VaultLpInfo {
+    /// Cumulative amount ever owed: principal + operator-checkpointed fees.
+    pub entitlement: u64,
+    /// Cumulative amount paid out.
+    pub withdrawn: u64,
+}
+
+impl VaultLpInfo {
+    pub fn withdrawable(&self) -> u64 {
+        self.entitlement.saturating_sub(self.withdrawn)
+    }
+}
+
+/// Extracts an LP's entitlement/withdrawn counters for `asset_id` from an already-fetched
+/// vault [`AccountStorage`]. Uses the same `[asset, lp]` key convention as the user maps.
+pub fn vault_lp_info_from_storage(
+    storage: &AccountStorage,
+    asset_id: AccountId,
+    lp_id: AccountId,
+) -> Result<VaultLpInfo> {
+    let key = vault_user_asset_key(asset_id, lp_id);
+    let read = |slot: &str| -> Result<u64> {
+        Ok(storage
+            .get_map_item(&storage_slot_name(slot), key)
+            .map_err(|e| anyhow!("failed to read {slot}: {e:?}"))?[0]
+            .as_canonical_u64())
+    };
+
+    Ok(VaultLpInfo {
+        entitlement: read(LP_ENTITLEMENTS_SLOT)?,
+        withdrawn: read(LP_WITHDRAWN_SLOT)?,
+    })
+}
+
+/// Fetches the vault's storage and extracts `lp_id`'s LP counters for `asset_id`.
+pub async fn get_vault_lp_info(
+    client: &Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    lp_id: AccountId,
+) -> Result<VaultLpInfo> {
+    let storage = get_vault_storage(client, vault_id).await?;
+    vault_lp_info_from_storage(&storage, asset_id, lp_id)
+}
+
+/// Operator-signed maintenance tx: raises `lp_id`'s entitlement for `asset_id` to
+/// `new_entitlement` (principal + accrued fees, computed by the server from LP shares).
+/// The vault panics if `new_entitlement` is below the current entitlement, so this can
+/// only ever raise the counter.
+pub async fn checkpoint_lp_entitlement_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    lp_id: AccountId,
+    new_entitlement: u64,
+) -> Result<()> {
+    let script_code = format!(
+        "
+        use miden::core::sys
+        use zoro_miden::vault
+
+        begin
+            push.{lp_prefix}.{lp_suffix}.{asset_prefix}.{asset_suffix}.{new_entitlement}
+            # => [new_entitlement, asset_suffix, asset_prefix, lp_suffix, lp_prefix]
+            call.vault::checkpoint_lp_entitlement
+            exec.sys::truncate_stack
+        end
+        ",
+        lp_prefix = lp_id.prefix().as_u64(),
+        lp_suffix = lp_id.suffix().as_canonical_u64(),
+        asset_prefix = asset_id.prefix().as_u64(),
+        asset_suffix = asset_id.suffix().as_canonical_u64(),
+    );
+
+    let cb = link_all_note_libraries(client.code_builder())?;
+    let tx_script = cb.compile_tx_script(&script_code)?;
+    let tx_request = TransactionRequestBuilder::new()
+        .custom_script(tx_script)
+        .build()?;
+    submit_tx_resilient(client, vault_id, tx_request).await?;
+    client.sync_state().await?;
+    Ok(())
 }

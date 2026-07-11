@@ -22,11 +22,11 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    faucet::{DEFAULT_FAUCET_SERVER_URL, MintRequest},
     message_broker::message_broker::MessageBroker,
     order::{Order, OrderDetails, OrderType, SerializableOrder},
     serde::{deserialize_account_id, serialize_account_id},
     store::Store,
-    test_utils::{get_asset0, get_asset1},
     websocket::{connection_manager::ConnectionManager, handlers::websocket_handler},
 };
 
@@ -35,6 +35,10 @@ pub struct AppState {
     pub connection_manager: Arc<ConnectionManager>,
     pub message_broker: Arc<MessageBroker>,
     pub store: Arc<Store>,
+    /// Fixed internal endpoint of the separately-run faucet process. The main server
+    /// never holds faucet keys or connects to its Miden client/store.
+    pub faucet_server_url: String,
+    pub faucet_http: reqwest::Client,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,10 +78,16 @@ pub async fn start(
     store: Arc<Store>,
 ) -> Result<()> {
     let server_url: &'static str = env::var("SERVER_URL").unwrap().leak();
+    let faucet_server_url = env::var("FAUCET_SERVER_URL")
+        .unwrap_or_else(|_| DEFAULT_FAUCET_SERVER_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
     let app = create_router(AppState {
         connection_manager,
         message_broker,
         store,
+        faucet_server_url,
+        faucet_http: reqwest::Client::new(),
     });
     let listener = tokio::net::TcpListener::bind(server_url)
         .await
@@ -86,11 +96,11 @@ pub async fn start(
     println!("\n🚀 Zoro server is running!");
     println!("📡 Available endpoints:");
     println!("  GET  /health                    - Health check");
-    println!("  GET  /users                     - List engine user account IDs");
+    println!("  GET  /pools/info                - Pool states and asset ids");
     println!("  GET  /stats                     - Order count statistics");
     println!("  POST /orders/new                - Submit a new order");
     println!("  POST /withdraw/submit           - Submit a new withdrawal");
-    println!("  POST /faucets/mint              - Mint from a faucet");
+    println!("  POST /mint                      - Request a faucet mint");
     println!("  GET  /ws                        - WebSocket connection");
     println!("🌐 Server address: {}", server_url);
     println!("📊 Example: {}/health", server_url);
@@ -110,8 +120,8 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/pools/info", get(pool_info))
-        .route("/users", get(users))
         .route("/stats", get(stats))
+        .route("/mint", post(proxy_mint))
         .route("/ws", get(websocket_handler))
         .route("/orders/new", post(order_new))
         .layer(CorsLayer::permissive())
@@ -129,30 +139,46 @@ async fn health_check() -> impl IntoResponse {
     (headers, Json(response))
 }
 
-async fn users(State(state): State<AppState>) -> impl IntoResponse {
-    let users: Vec<_> = state
-        .store
-        .serialized_users()
-        .into_iter()
-        .map(|user| {
-            serde_json::json!({
-                "user_id": user.id,
-                "private_key": user.signing_key,
-                "index": user.index,
-                "user_prefix": user.user_prefix.to_string(),
-                "user_suffix": user.user_suffix.to_string(),
-                "balance_slot_prefix": user.balance_slot_prefix.to_string(),
-                "balance_slot_suffix": user.balance_slot_suffix.to_string(),
-            })
-        })
-        .collect();
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("max-age=60, must-revalidate"),
-    );
-    (headers, Json(serde_json::json!({ "users": users })))
+/// Proxies mint requests to the separately-run faucet service. This boundary keeps the
+/// faucet's Miden client and signing keys out of the main trading/custody process.
+async fn proxy_mint(
+    State(state): State<AppState>,
+    Json(request): Json<MintRequest>,
+) -> Response<Body> {
+    let endpoint = format!("{}/mint", state.faucet_server_url);
+    match state.faucet_http.post(endpoint).json(&request).send().await {
+        Ok(response) => {
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            match response.text().await {
+                Ok(body) => (
+                    status,
+                    [(reqwest::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "message": format!("failed to read faucet response: {error}")
+                    })),
+                )
+                    .into_response(),
+            }
+        },
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "success": false,
+                "message": format!(
+                    "faucet service is unavailable at {}: {error}",
+                    state.faucet_server_url
+                )
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn stats(State(state): State<AppState>) -> impl IntoResponse {
@@ -182,8 +208,8 @@ async fn pool_info(State(state): State<AppState>) -> impl IntoResponse {
     let response = serde_json::json!({
         "pool_account_id": state.store.pool_id().to_hex(),
         "liq_pools": vec![(pool0_addr.to_hex(), pool0_state), (pool1_addr.to_hex(), pool1_state)],
-        "asset0": get_asset0().to_hex(),
-        "asset1": get_asset1().to_hex()
+        "asset0": state.store.asset0().to_hex(),
+        "asset1": state.store.asset1().to_hex()
     });
     let mut headers = HeaderMap::new();
     headers.insert(

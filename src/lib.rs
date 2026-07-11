@@ -1,7 +1,10 @@
 pub mod api;
 pub mod assembly_utils;
 pub mod asset_utils;
+pub mod curve;
+pub mod deployment;
 pub mod execution_script;
+pub mod faucet;
 pub mod intent;
 pub mod message_broker;
 pub mod miden_env;

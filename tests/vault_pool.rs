@@ -1,3 +1,4 @@
+use alloy_primitives::U256;
 use anyhow::Result;
 use miden_client::{
     Client,
@@ -11,18 +12,23 @@ use miden_client::{
 use miden_core::{Felt, Word};
 use minizeke::{
     assembly_utils::{link_math, link_operator, link_pool},
+    curve::get_curve_amount_out,
     execution_script::make_exec_script,
     intent::Intent,
     note::{InitRedeemInstructions, RedeemInstructions, ZekeNote, ZekeNoteInstructions},
-    pool::{deploy_pool, derive_balance_details, get_user_trades_slot_name, user_trades_from_storage},
+    pool::{
+        PoolState, deploy_pool, derive_balance_details, get_user_trades_slot_name,
+        user_trades_from_storage,
+    },
     test_utils::{
-        consume_all_notes_for, fund_user_on_vault, get_client, get_faucet, get_funded_user,
-        get_pool_client, get_user, get_vault, pool_foreign_account, register_user_on_vault,
-        vault_foreign_account,
+        consume_all_notes_for, deposit_liquidity_on_vault, fund_user_on_vault, get_client,
+        get_faucet, get_funded_user, get_pool_client, get_user, get_vault, mint_asset_to_user,
+        pool_foreign_account, register_user_on_vault, vault_foreign_account,
+        withdraw_liquidity_from_vault,
     },
     vault::{
-        get_vault_storage, get_vault_user_asset_info, set_pool_account_id_on_vault,
-        vault_user_registration,
+        checkpoint_lp_entitlement_on_vault, get_vault_lp_info, get_vault_storage,
+        get_vault_user_asset_info, set_pool_account_id_on_vault, vault_user_registration,
     },
 };
 use tracing::info;
@@ -465,6 +471,222 @@ async fn test_vault_pool_e2e() -> Result<()> {
         user_wallet,
         user_wallet_before_fund - FUND_AMOUNT + redeem_amount
     );
+
+    Ok(())
+}
+
+/// E2E for the LP liquidity flow: deposit (entitlement credited), operator checkpoint
+/// (fees become withdrawable), self-custodial withdraw with P2ID payout, plus the
+/// withdraw-above-entitlement and decreasing-checkpoint negative cases. Finishes with a
+/// swap whose buy amount comes from the server-side curve quote.
+#[tokio::test]
+async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
+    // try_init: test_vault_pool_e2e may have already installed the subscriber
+    let _ = tracing_subscriber::fmt().try_init();
+    let mut client = get_client().await?;
+    let mut pool_client = get_pool_client().await?;
+
+    const DEPOSIT_AMOUNT: u64 = 100_000;
+    const ACCRUED_FEES: u64 = 250;
+
+    // ------------------------------------------------------------------------------------------
+    // SETUP: vault, assets, pool, LP account
+    // ------------------------------------------------------------------------------------------
+    info!("[TEST] deploying vault + faucets + pool");
+    let vault_id = get_vault(&mut client).await?;
+    let (lp_id, asset0) = get_funded_user(&mut client).await?;
+    let asset1 = get_faucet(&mut client, "TSTB").await?;
+    let pool = deploy_pool(&mut pool_client, vault_id, asset0, asset1).await?;
+    let pool_id = pool.id();
+    set_pool_account_id_on_vault(&mut client, vault_id, pool_id).await?;
+
+    mint_asset_to_user(&mut client, asset0, lp_id, DEPOSIT_AMOUNT).await?;
+    mint_asset_to_user(&mut client, asset1, lp_id, DEPOSIT_AMOUNT).await?;
+    let lp_wallet_start = client.account_reader(lp_id).get_balance(asset0).await?;
+
+    // server-side pool states start empty; deposits initialize them via the curve math
+    let mut pool_state0 = PoolState::default();
+    let mut pool_state1 = PoolState::default();
+
+    // ------------------------------------------------------------------------------------------
+    // DEPOSIT liquidity in both assets
+    // ------------------------------------------------------------------------------------------
+    info!("[TEST] depositing {DEPOSIT_AMOUNT} of each asset");
+    for (asset_id, pool_state) in [(asset0, &mut pool_state0), (asset1, &mut pool_state1)] {
+        deposit_liquidity_on_vault(
+            &mut client,
+            vault_id,
+            lp_id,
+            FungibleAsset::new(asset_id, DEPOSIT_AMOUNT)?,
+        )
+        .await?;
+        let (lp_shares, new_supply, new_balances) =
+            pool_state.get_deposit_lp_amount_out(U256::from(DEPOSIT_AMOUNT))?;
+        pool_state.update_state(new_balances, new_supply);
+        // first deposit into an empty pool mints shares 1:1
+        assert_eq!(lp_shares, U256::from(DEPOSIT_AMOUNT));
+    }
+
+    let lp_info = get_vault_lp_info(&client, vault_id, asset0, lp_id).await?;
+    assert_eq!(lp_info.entitlement, DEPOSIT_AMOUNT);
+    assert_eq!(lp_info.withdrawn, 0);
+    assert_eq!(lp_info.withdrawable(), DEPOSIT_AMOUNT);
+
+    let vault_balance = client.account_reader(vault_id).get_balance(asset0).await?;
+    assert_eq!(vault_balance, DEPOSIT_AMOUNT);
+
+    // ------------------------------------------------------------------------------------------
+    // NEGATIVE: withdraw above entitlement
+    // ------------------------------------------------------------------------------------------
+    info!("[TEST] negative: withdraw above entitlement");
+    let result = withdraw_liquidity_from_vault(
+        &mut client,
+        vault_id,
+        lp_id,
+        FungibleAsset::new(asset0, DEPOSIT_AMOUNT + 1)?,
+    )
+    .await;
+    assert!(result.is_err(), "withdraw above entitlement should fail");
+
+    // ------------------------------------------------------------------------------------------
+    // WITHDRAW part of the principal (self-custodial: no operator involvement)
+    // ------------------------------------------------------------------------------------------
+    let first_withdraw = DEPOSIT_AMOUNT / 2;
+    info!("[TEST] withdrawing {first_withdraw}");
+    withdraw_liquidity_from_vault(
+        &mut client,
+        vault_id,
+        lp_id,
+        FungibleAsset::new(asset0, first_withdraw)?,
+    )
+    .await?;
+
+    let lp_info = get_vault_lp_info(&client, vault_id, asset0, lp_id).await?;
+    assert_eq!(lp_info.withdrawn, first_withdraw);
+    assert_eq!(lp_info.withdrawable(), DEPOSIT_AMOUNT - first_withdraw);
+
+    info!("[TEST] consuming P2ID payout");
+    consume_all_notes_for(&mut client, lp_id).await?;
+    let lp_wallet = client.account_reader(lp_id).get_balance(asset0).await?;
+    assert_eq!(lp_wallet, lp_wallet_start - DEPOSIT_AMOUNT + first_withdraw);
+
+    // ------------------------------------------------------------------------------------------
+    // CHECKPOINT: operator raises the entitlement with accrued fees
+    // ------------------------------------------------------------------------------------------
+    info!("[TEST] negative: checkpoint below current entitlement");
+    let result = checkpoint_lp_entitlement_on_vault(
+        &mut client,
+        vault_id,
+        asset0,
+        lp_id,
+        DEPOSIT_AMOUNT - 1,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "decreasing entitlement checkpoint should fail"
+    );
+
+    info!("[TEST] checkpointing entitlement with {ACCRUED_FEES} accrued fees");
+    checkpoint_lp_entitlement_on_vault(
+        &mut client,
+        vault_id,
+        asset0,
+        lp_id,
+        DEPOSIT_AMOUNT + ACCRUED_FEES,
+    )
+    .await?;
+
+    let lp_info = get_vault_lp_info(&client, vault_id, asset0, lp_id).await?;
+    assert_eq!(lp_info.entitlement, DEPOSIT_AMOUNT + ACCRUED_FEES);
+    assert_eq!(
+        lp_info.withdrawable(),
+        DEPOSIT_AMOUNT + ACCRUED_FEES - first_withdraw
+    );
+
+    // ------------------------------------------------------------------------------------------
+    // SWAP: quoted by the server-side curve against the deposited pool states
+    // ------------------------------------------------------------------------------------------
+    info!("[TEST] registering + funding trader");
+    let trader_id = get_user(&mut client).await?;
+    let trading_key = AuthSecretKey::new_ecdsa_k256_keccak();
+    let pk_comm: Word = trading_key.public_key().to_commitment().into();
+    register_user_on_vault(&mut client, vault_id, trader_id, pk_comm).await?;
+    mint_asset_to_user(&mut client, asset0, trader_id, FUND_AMOUNT).await?;
+    fund_user_on_vault(
+        &mut client,
+        vault_id,
+        trader_id,
+        FungibleAsset::new(asset0, FUND_AMOUNT)?,
+    )
+    .await?;
+
+    let swap_amount_in: u64 = 100;
+    // pair price 1.0, scaled by 1e12 like PriceData::quote_with
+    let price = U256::from(10).pow(U256::from(12));
+    let (amount_out, new_balances0, new_balances1) = get_curve_amount_out(
+        &pool_state0,
+        &pool_state1,
+        U256::from(pool_state0.metadata().asset_decimals),
+        U256::from(pool_state1.metadata().asset_decimals),
+        U256::from(swap_amount_in),
+        price,
+    )?;
+    let amount_out_u64 = amount_out.saturating_to::<u64>();
+    info!("[TEST] curve quote: {swap_amount_in} asset0 -> {amount_out_u64} asset1");
+    assert!(amount_out_u64 > 0, "curve quote should be non-zero");
+    assert!(
+        amount_out_u64 <= swap_amount_in,
+        "balanced pools at price 1.0 cannot pay out more than put in"
+    );
+    pool_state0.update_balances(new_balances0);
+    pool_state1.update_balances(new_balances1);
+
+    info!("[TEST] executing curve-quoted swap");
+    // the LP never registers (deposits don't need it), so the trader gets index 0
+    let (intent, advice) = signed_intent(
+        trader_id,
+        &trading_key,
+        0,
+        0,
+        swap_amount_in,
+        1,
+        amount_out_u64,
+    );
+    submit_swap(
+        &mut pool_client,
+        pool_id,
+        vault_id,
+        vec![intent],
+        advice,
+        &[(asset0, trader_id)],
+    )
+    .await?;
+
+    let pool_account = pool_client.try_get_account(pool_id).await?;
+    let trades = user_trades_from_storage(pool_account.storage(), 0)?;
+    assert_eq!(trades.sold, [swap_amount_in, 0]);
+    assert_eq!(trades.bought, [0, amount_out_u64]);
+
+    // ------------------------------------------------------------------------------------------
+    // FINAL WITHDRAW: the fee-covered remainder is self-custodially withdrawable
+    // ------------------------------------------------------------------------------------------
+    let final_withdraw = DEPOSIT_AMOUNT + ACCRUED_FEES - first_withdraw;
+    info!("[TEST] withdrawing the remaining {final_withdraw}");
+    withdraw_liquidity_from_vault(
+        &mut client,
+        vault_id,
+        lp_id,
+        FungibleAsset::new(asset0, final_withdraw)?,
+    )
+    .await?;
+
+    let lp_info = get_vault_lp_info(&client, vault_id, asset0, lp_id).await?;
+    assert_eq!(lp_info.withdrawable(), 0);
+
+    consume_all_notes_for(&mut client, lp_id).await?;
+    let lp_wallet = client.account_reader(lp_id).get_balance(asset0).await?;
+    assert_eq!(lp_wallet, lp_wallet_start + ACCRUED_FEES);
 
     Ok(())
 }

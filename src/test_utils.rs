@@ -3,7 +3,7 @@ use std::{cell::OnceCell, env, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Result, anyhow};
 use dotenv::dotenv;
 use miden_client::{
-    Client, RemoteTransactionProver,
+    Client, ClientError, RemoteTransactionProver,
     account::{
         AccountBuilder, AccountId, AccountType, StorageMapKey,
         component::{
@@ -21,7 +21,7 @@ use miden_client::{
         account_id::{ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2},
         common::wait_for_blocks,
     },
-    transaction::{ForeignAccount, TransactionRequestBuilder},
+    transaction::{ForeignAccount, TransactionId, TransactionRequest, TransactionRequestBuilder},
 };
 use miden_client_sqlite_store::SqliteStore;
 use miden_core::{Felt, Word};
@@ -33,7 +33,10 @@ use crate::{
     message_broker::message_broker::MessageBroker,
     miden_env::MidenNetwork,
     miden_execution::MidenExecution,
-    note::{FundInstructions, RegisterInstructions, ZekeNote, ZekeNoteInstructions},
+    note::{
+        DepositInstructions, FundInstructions, RegisterInstructions, WithdrawInstructions,
+        ZekeNote, ZekeNoteInstructions,
+    },
     pool::USER_SLOT_IDS_SLOT,
     vault::{
         USER_ASSET_TOTAL_FUNDING_SLOT, USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT,
@@ -72,6 +75,14 @@ pub async fn get_client() -> Result<Client<FilesystemKeyStore>> {
 pub async fn get_pool_client() -> Result<Client<FilesystemKeyStore>> {
     let network = MidenNetwork::from_env();
     build_client(format!("pool.{}", network.store_path())).await
+}
+
+/// Client with an independent store for the standalone faucet service. It shares the
+/// deployment keystore so it can sign faucet transactions, but never contends with the
+/// server's custody or pool-client SQLite stores.
+pub async fn get_faucet_client() -> Result<Client<FilesystemKeyStore>> {
+    let network = MidenNetwork::from_env();
+    build_client(format!("faucet.{}", network.store_path())).await
 }
 
 async fn build_client(store_path: String) -> Result<Client<FilesystemKeyStore>> {
@@ -118,6 +129,43 @@ async fn build_client(store_path: String) -> Result<Client<FilesystemKeyStore>> 
 
     let client = client_builder.build().await?;
     Ok(client)
+}
+
+/// Submits a transaction, surviving the upstream merkle-store race in `miden-client`:
+/// on `ApplyTransactionAfterSubmitFailed` the tx has already been accepted by the node
+/// and only the local store update failed, so we sync and retry the store update once.
+/// If it still fails, we log and continue — for public tracked accounts the accepted
+/// state arrives via a later sync anyway.
+pub async fn submit_tx_resilient(
+    client: &mut Client<FilesystemKeyStore>,
+    account_id: AccountId,
+    tx_req: TransactionRequest,
+) -> Result<TransactionId> {
+    match client.submit_new_transaction(account_id, tx_req).await {
+        Ok(tx_id) => Ok(tx_id),
+        Err(ClientError::ApplyTransactionAfterSubmitFailed {
+            pending_update,
+            source,
+        }) => {
+            let tx_id = pending_update.executed_transaction().id();
+            tracing::warn!(
+                %tx_id,
+                account = %account_id.to_hex(),
+                "local store update failed after submit ({source}); syncing and re-applying"
+            );
+            client.sync_state().await?;
+            if let Err(retry_err) = client.apply_transaction_update(*pending_update).await {
+                tracing::warn!(
+                    %tx_id,
+                    account = %account_id.to_hex(),
+                    "re-apply after sync failed too ({retry_err}); continuing — the accepted \
+                     state will arrive via sync"
+                );
+            }
+            Ok(tx_id)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub async fn get_miden_execution() -> Result<MidenExecution> {
@@ -238,9 +286,7 @@ pub async fn get_funded_user(
 
     println!("mint tx request built");
 
-    client
-        .submit_new_transaction(faucet_id, transaction_request)
-        .await?;
+    submit_tx_resilient(client, faucet_id, transaction_request).await?;
 
     loop {
         // Resync to get the latest data
@@ -258,9 +304,7 @@ pub async fn get_funded_user(
                 .build_consume_notes(notes)
                 .unwrap();
 
-            let tx_id = client
-                .submit_new_transaction(user_id, transaction_request)
-                .await?;
+            let tx_id = submit_tx_resilient(client, user_id, transaction_request).await?;
             println!("Consume minted tokens TX: {:?}", tx_id);
             break;
         } else {
@@ -277,7 +321,7 @@ pub async fn touch_account(
     account_id: &AccountId,
 ) -> Result<()> {
     let tx_req = TransactionRequestBuilder::new().build()?;
-    client.submit_new_transaction(*account_id, tx_req).await?;
+    submit_tx_resilient(client, *account_id, tx_req).await?;
     client.sync_state().await?;
     wait_for_blocks(client, 1).await;
     Ok(())
@@ -295,9 +339,7 @@ pub async fn mint_asset_to_user(
     let transaction_request = TransactionRequestBuilder::new()
         .build_mint_fungible_asset(fungible_asset, user_id, NoteType::Public, client.rng())
         .map_err(|e| anyhow!("failed to build mint tx: {e:?}"))?;
-    client
-        .submit_new_transaction(faucet_id, transaction_request)
-        .await?;
+    submit_tx_resilient(client, faucet_id, transaction_request).await?;
     consume_all_notes_for(client, user_id).await?;
     Ok(())
 }
@@ -319,7 +361,7 @@ pub async fn consume_all_notes_for(
 
         if !notes.is_empty() {
             let tx_req = TransactionRequestBuilder::new().build_consume_notes(notes)?;
-            client.submit_new_transaction(account_id, tx_req).await?;
+            submit_tx_resilient(client, account_id, tx_req).await?;
             client.sync_state().await?;
             wait_for_blocks(client, 1).await;
             return Ok(());
@@ -340,7 +382,7 @@ pub async fn send_and_consume_note(
     let tx_req = TransactionRequestBuilder::new()
         .own_output_notes(vec![note.note().clone()])
         .build()?;
-    client.submit_new_transaction(sender_id, tx_req).await?;
+    submit_tx_resilient(client, sender_id, tx_req).await?;
     client.sync_state().await?;
     wait_for_blocks(client, 1).await;
 
@@ -348,7 +390,7 @@ pub async fn send_and_consume_note(
         .input_notes(vec![(note.note().clone(), None)])
         .foreign_accounts(foreign_accounts)
         .build()?;
-    client.submit_new_transaction(consumer_id, tx_req).await?;
+    submit_tx_resilient(client, consumer_id, tx_req).await?;
     client.sync_state().await?;
     wait_for_blocks(client, 1).await;
     Ok(())
@@ -388,6 +430,45 @@ pub async fn fund_user_on_vault(
         client.code_builder(),
     )?;
     send_and_consume_note(client, &note, user_id, vault_id, vec![]).await
+}
+
+/// Deposits liquidity into the vault via a DEPOSIT note carrying `asset`; the vault
+/// credits `lp_id`'s entitlement with the deposited amount.
+pub async fn deposit_liquidity_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    lp_id: AccountId,
+    asset: FungibleAsset,
+) -> Result<()> {
+    let note = ZekeNote::new(
+        ZekeNoteInstructions::Deposit(DepositInstructions {
+            lp_id,
+            vault_id,
+            asset,
+        }),
+        client.code_builder(),
+    )?;
+    send_and_consume_note(client, &note, lp_id, vault_id, vec![]).await
+}
+
+/// Self-custodial LP withdrawal: sends a WITHDRAW note from `lp_id`, the vault checks the
+/// entitlement counters and pays `asset` out via a P2ID note to the LP.
+/// Does NOT consume the payout note; use `consume_all_notes_for(client, lp_id)` for that.
+pub async fn withdraw_liquidity_from_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    lp_id: AccountId,
+    asset: FungibleAsset,
+) -> Result<()> {
+    let note = ZekeNote::new(
+        ZekeNoteInstructions::Withdraw(WithdrawInstructions {
+            lp_id,
+            vault_id,
+            asset_out: asset,
+        }),
+        client.code_builder(),
+    )?;
+    send_and_consume_note(client, &note, lp_id, vault_id, vec![]).await
 }
 
 /// Foreign-account declaration for vault-native transactions that FPI into the pool
