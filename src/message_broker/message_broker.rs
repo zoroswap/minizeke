@@ -56,6 +56,18 @@ pub struct UserEvent {
     pub amount: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TradeEvent {
+    pub order_id: String,
+    pub pair: String,
+    pub asset_in: String,
+    pub asset_out: String,
+    pub amount_in: u64,
+    pub amount_out: u64,
+    pub price: u64,
+    pub timestamp: u64,
+}
+
 pub enum MessageBrokerEvent {
     Order(OrderUpdate),
     PoolState(PoolStateEvent),
@@ -63,6 +75,7 @@ pub enum MessageBrokerEvent {
     Stats(StatsEvent),
     Amm(AmmEvent),
     User(UserEvent),
+    Trade(TradeEvent),
 }
 
 #[derive(Clone)]
@@ -74,6 +87,7 @@ pub struct MessageBroker {
     pub user_tx: broadcast::Sender<UserEvent>,
     pub amm_tx: broadcast::Sender<AmmEvent>,
     pub processed_batch_tx: broadcast::Sender<Vec<Order<Processed>>>,
+    pub trades_tx: broadcast::Sender<TradeEvent>,
 }
 
 impl MessageBroker {
@@ -87,6 +101,7 @@ impl MessageBroker {
         let (amm_tx, _) = broadcast::channel(100);
         let (user_tx, _) = broadcast::channel(100);
         let (processed_batch_tx, _) = broadcast::channel(100);
+        let (trades_tx, _) = broadcast::channel(1000);
 
         Self {
             order_updates_tx,
@@ -96,6 +111,7 @@ impl MessageBroker {
             amm_tx,
             user_tx,
             processed_batch_tx,
+            trades_tx,
         }
     }
 
@@ -170,6 +186,13 @@ impl MessageBroker {
         }
     }
 
+    pub fn broadcast_trade(&self, event: TradeEvent) -> Result<()> {
+        if let Err(error) = self.trades_tx.send(event) {
+            warn!("Failed to broadcast trade event: {error}");
+        }
+        Ok(())
+    }
+
     /// Broadcast a batch of processed orders to the execution engine
     pub fn broadcast_processed_batch(&self, batch: Vec<Order<Processed>>) -> Result<()> {
         match self.processed_batch_tx.send(batch) {
@@ -214,6 +237,10 @@ impl MessageBroker {
     /// Subscribe to stats updates
     pub fn subscribe_user(&self) -> broadcast::Receiver<UserEvent> {
         self.user_tx.subscribe()
+    }
+
+    pub fn subscribe_trades(&self) -> broadcast::Receiver<TradeEvent> {
+        self.trades_tx.subscribe()
     }
 }
 

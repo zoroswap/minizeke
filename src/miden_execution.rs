@@ -24,16 +24,12 @@ use crate::{
     message_broker::message_broker::{AmmEvent, MessageBroker, PoolStateEvent},
     miden_env::MidenNetwork,
     order::{Order, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{
-        LpLedger, PoolState, fetch_account_storage_from_rpc, get_user_trades_slot_name,
-    },
+    pool::{LpLedger, PoolState, fetch_account_storage_from_rpc, get_user_trades_slot_name},
     test_utils::{
         consume_all_notes_for, deposit_liquidity_on_vault, get_client, get_pool_client,
         vault_foreign_account, withdraw_liquidity_from_vault,
     },
-    vault::{
-        checkpoint_lp_entitlement_on_vault, get_vault_lp_info, vault_user_registration,
-    },
+    vault::{checkpoint_lp_entitlement_on_vault, get_vault_lp_info, vault_user_registration},
 };
 
 /// How often the operator checkpoints LP entitlements on the vault (fees accrued since the
@@ -187,9 +183,8 @@ impl MidenExecution {
             return Ok(*index);
         }
         let storage = fetch_account_storage_from_rpc(self.vault_id).await?;
-        let (index, _pubkey) = vault_user_registration(&storage, user_id)?.ok_or_else(|| {
-            anyhow!("user {} is not registered on the vault", user_id.to_hex())
-        })?;
+        let (index, _pubkey) = vault_user_registration(&storage, user_id)?
+            .ok_or_else(|| anyhow!("user {} is not registered on the vault", user_id.to_hex()))?;
         let index = u16::try_from(index)
             .map_err(|_| anyhow!("user index {index} out of range for {}", user_id.to_hex()))?;
         self.user_indices.insert(user_id, index);
@@ -558,8 +553,7 @@ impl MidenExecution {
 
         let payout_asset = FungibleAsset::new(faucet_id, payout)
             .map_err(|e| anyhow!("invalid payout asset: {e:?}"))?;
-        withdraw_liquidity_from_vault(&mut self.client, self.vault_id, lp_id, payout_asset)
-            .await?;
+        withdraw_liquidity_from_vault(&mut self.client, self.vault_id, lp_id, payout_asset).await?;
         // consume the P2ID payout as the LP
         consume_all_notes_for(&mut self.client, lp_id).await?;
 

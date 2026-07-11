@@ -92,7 +92,11 @@ impl ZoroCurve {
         let quadratic_c = u256_to_i256(mul_u(self.beta, factor))
             - u256_to_i256(mul_u(i_capital_b - i_b, i_b + mul_u(self.c, i_l)));
 
-        let t = self.solve_quadratic(u256_to_i256(quadratic_a), u256_to_i256(quadratic_b), quadratic_c);
+        let t = self.solve_quadratic(
+            u256_to_i256(quadratic_a),
+            u256_to_i256(quadratic_b),
+            quadratic_c,
+        );
         self.convert_to_external_decimals(t, decimals)
     }
 
@@ -100,19 +104,31 @@ impl ZoroCurve {
     pub fn inverse_horizontal(&self, b: I256, l: I256, capital_b: I256, decimals: U256) -> U256 {
         let i_b = I256::from_str(
             &self
-                .convert_to_internal_decimals(U256::from_str(&b.to_string()).unwrap_or_else(|err| panic!("Failed to parse b: {err:?}")), decimals)
+                .convert_to_internal_decimals(
+                    U256::from_str(&b.to_string())
+                        .unwrap_or_else(|err| panic!("Failed to parse b: {err:?}")),
+                    decimals,
+                )
                 .to_string(),
         )
         .unwrap_or_else(|err| panic!("Failed to parse i_b: {err:?}"));
         let i_l = I256::from_str(
             &self
-                .convert_to_internal_decimals(U256::from_str(&l.to_string()).unwrap_or_else(|err| panic!("Failed to parse l: {err:?}")), decimals)
+                .convert_to_internal_decimals(
+                    U256::from_str(&l.to_string())
+                        .unwrap_or_else(|err| panic!("Failed to parse l: {err:?}")),
+                    decimals,
+                )
                 .to_string(),
         )
         .unwrap_or_else(|err| panic!("Failed to parse i_l: {err:?}"));
         let i_capital_b = I256::from_str(
             &self
-                .convert_to_internal_decimals(U256::from_str(&capital_b.to_string()).unwrap_or_else(|err| panic!("Failed to parse capital_b: {err:?}")), decimals)
+                .convert_to_internal_decimals(
+                    U256::from_str(&capital_b.to_string())
+                        .unwrap_or_else(|err| panic!("Failed to parse capital_b: {err:?}")),
+                    decimals,
+                )
                 .to_string(),
         )
         .unwrap_or_else(|err| panic!("Failed to parse i_capital_b: {err:?}"));

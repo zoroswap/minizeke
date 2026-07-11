@@ -307,7 +307,12 @@ impl LpLedger {
     }
 
     /// Burns up to `lp_amount` shares; errors if the depositor doesn't own enough.
-    pub fn burn(&mut self, faucet_id: AccountId, depositor: AccountId, lp_amount: u64) -> Result<()> {
+    pub fn burn(
+        &mut self,
+        faucet_id: AccountId,
+        depositor: AccountId,
+        lp_amount: u64,
+    ) -> Result<()> {
         let entry = self
             .shares
             .get_mut(&faucet_id)
@@ -528,7 +533,11 @@ pub fn build_pool_component(
         vault_proc_root,
     ));
 
-    let component = AccountComponent::new(lib, slots, AccountComponentMetadata::new("zoro_miden::pool"))?;
+    let component = AccountComponent::new(
+        lib,
+        slots,
+        AccountComponentMetadata::new("zoro_miden::pool"),
+    )?;
 
     Ok(component)
 }

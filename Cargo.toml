@@ -26,7 +26,7 @@ miden-tx = "0.15.3"
 rand = { version = "0.9" }
 reqwest = { version = "0.12", features = ["json"] }
 reqwest-eventsource = "0.6.0"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = "1.0.228"
 serde_json = "1.0.150"
 tokio = { version = "1.46", features = [

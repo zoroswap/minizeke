@@ -1,17 +1,17 @@
 {
   "network": "testnet",
-  "vault_id": "0x8020c95510acfeb156e5646e5aef09",
-  "pool_id": "0xfc53c22d706df29179e5a9f34b202d",
-  "asset0": "0x3163688bc5b579512b52621f5e4694",
-  "asset1": "0x15f0a191fbca9c91184b7a66ebb73d",
-  "lp_account_id": "0x6f77ecec69df05911b25c898b61339",
+  "vault_id": "0x04ef9e0a7e773271733e3eab435b7e",
+  "pool_id": "0xaa827e6f3544a331085cede73ddeaf",
+  "asset0": "0x0cd9017f7c0eadb134ed51fbe6524a",
+  "asset1": "0x325fb0e7e2dd001101083299e7db15",
+  "lp_account_id": "0x83e4e377973b6a915b7cd123220b20",
   "deposits": [
     {
-      "faucet_id": "0x3163688bc5b579512b52621f5e4694",
+      "faucet_id": "0x0cd9017f7c0eadb134ed51fbe6524a",
       "amount": 100000000
     },
     {
-      "faucet_id": "0x15f0a191fbca9c91184b7a66ebb73d",
+      "faucet_id": "0x325fb0e7e2dd001101083299e7db15",
       "amount": 100000000
     }
   ]

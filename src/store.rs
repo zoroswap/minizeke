@@ -13,6 +13,7 @@ pub struct Store {
     asset0: AccountId,
     asset1: AccountId,
     pool_states: DashMap<AccountId, PoolState>,
+    oracle_prices: DashMap<AccountId, u64>,
 }
 
 impl Store {
@@ -28,6 +29,7 @@ impl Store {
             asset1,
             orders: Orders::default(),
             pool_states: DashMap::new(),
+            oracle_prices: DashMap::new(),
         };
         store.set_pool_states(pool_states);
         store
@@ -68,5 +70,13 @@ impl Store {
 
     pub fn asset1(&self) -> AccountId {
         self.asset1
+    }
+
+    pub fn set_oracle_price(&self, faucet_id: AccountId, price: u64) {
+        self.oracle_prices.insert(faucet_id, price);
+    }
+
+    pub fn oracle_price(&self, faucet_id: AccountId) -> Option<u64> {
+        self.oracle_prices.get(&faucet_id).map(|price| *price)
     }
 }

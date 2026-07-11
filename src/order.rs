@@ -48,13 +48,13 @@ impl OrderDetails {
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct OrderTiming {
-    created_at: DateTime<Utc>,
-    last_updated_at: DateTime<Utc>,
-    started_processing: Option<DateTime<Utc>>,
-    processed: Option<DateTime<Utc>>,
-    failed: Option<DateTime<Utc>>,
-    executed: Option<DateTime<Utc>>,
-    settled: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub last_updated_at: DateTime<Utc>,
+    pub started_processing: Option<DateTime<Utc>>,
+    pub processed: Option<DateTime<Utc>>,
+    pub failed: Option<DateTime<Utc>>,
+    pub executed: Option<DateTime<Utc>>,
+    pub settled: Option<DateTime<Utc>>,
 }
 
 impl OrderTiming {
@@ -130,6 +130,87 @@ pub enum OrderStatus {
     Executed,
     Settled,
     Failed,
+}
+
+impl OrderStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Processing => "processing",
+            Self::Processed => "processed",
+            Self::Executed => "executed",
+            Self::Settled => "settled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderSnapshot {
+    pub id: Uuid,
+    pub details: OrderDetails,
+    pub order_type: OrderType,
+    pub user_id: AccountId,
+    pub timing: OrderTiming,
+    pub status: OrderStatus,
+    pub failure_reason: Option<OrderFailureReason>,
+    pub execution_result: Option<OrderExecutionResult>,
+    pub tx_hash: Option<String>,
+}
+
+impl OrderUpdate {
+    pub fn snapshot(&self) -> OrderSnapshot {
+        macro_rules! common {
+            ($order:expr, $status:expr, $failure:expr, $result:expr, $tx_hash:expr) => {
+                OrderSnapshot {
+                    id: $order.id,
+                    details: $order.details,
+                    order_type: $order.order_type,
+                    user_id: $order.user_id,
+                    timing: $order.timing.clone(),
+                    status: $status,
+                    failure_reason: $failure,
+                    execution_result: $result,
+                    tx_hash: $tx_hash,
+                }
+            };
+        }
+
+        match self {
+            Self::New(order) => common!(order, OrderStatus::Created, None, None, None),
+            Self::StartedProcessing(order) => {
+                common!(order, OrderStatus::Processing, None, None, None)
+            }
+            Self::Processed(order) => common!(
+                order,
+                OrderStatus::Processed,
+                None,
+                Some(order.state.execution_result.clone()),
+                None
+            ),
+            Self::Executed(order) => common!(
+                order,
+                OrderStatus::Executed,
+                None,
+                Some(order.state.execution_result.clone()),
+                Some(order.state.tx_hash.clone())
+            ),
+            Self::Settled(order) => common!(
+                order,
+                OrderStatus::Settled,
+                None,
+                Some(order.state.execution_result.clone()),
+                Some(order.state.tx_hash.clone())
+            ),
+            Self::Failed(order) => common!(
+                order,
+                OrderStatus::Failed,
+                Some(order.state.reason.clone()),
+                order.state.execution_result.clone(),
+                order.state.tx_hash.clone()
+            ),
+        }
+    }
 }
 
 // States of the order

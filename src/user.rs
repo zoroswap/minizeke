@@ -3,13 +3,13 @@
 //! register and sign for their own users.
 
 use anyhow::{Result, anyhow};
+use miden_client::account::AccountId;
 use miden_client::{
     Client,
     account::{AccountBuilder, AccountType, component::BasicWallet},
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig, PublicKey, Signature},
     keystore::{FilesystemKeyStore, Keystore},
 };
-use miden_client::account::AccountId;
 use miden_core::Word;
 use rand::RngCore;
 

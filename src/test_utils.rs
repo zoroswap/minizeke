@@ -481,10 +481,8 @@ pub fn pool_foreign_account(pool_id: AccountId, user_index: u64) -> Result<Forei
         Felt::ZERO,
         Felt::ZERO,
     ]));
-    let requirements = AccountStorageRequirements::new([(
-        storage_slot_name(USER_SLOT_IDS_SLOT),
-        [&index_key],
-    )]);
+    let requirements =
+        AccountStorageRequirements::new([(storage_slot_name(USER_SLOT_IDS_SLOT), [&index_key])]);
     ForeignAccount::public(pool_id, requirements)
         .map_err(|e| anyhow!("failed to build pool foreign account: {e:?}"))
 }

@@ -10,6 +10,7 @@ use tracing::warn;
 use minizeke::*;
 
 use crate::{
+    history::{HistoryStore, start_history_service},
     message_broker::message_broker::{MessageBroker, StatsEvent},
     miden_execution::MidenExecution,
     oracle_sse::OracleSSEClient,
@@ -99,6 +100,38 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
         init_data.pool_states.clone(),
     ));
 
+    println!("[INIT] Initializing history database");
+    let history = Arc::new(HistoryStore::open_from_env()?);
+    start_history_service(
+        history.clone(),
+        message_broker.clone(),
+        init_data.asset0,
+        init_data.asset1,
+    );
+
+    {
+        let store = store.clone();
+        let mut rx = message_broker.subscribe_oracle_prices();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => match AccountId::from_hex(&event.faucet_id) {
+                        Ok(faucet_id) => store.set_oracle_price(faucet_id, event.price),
+                        Err(error) => warn!(
+                            faucet_id = %event.faucet_id,
+                            %error,
+                            "ignoring oracle event with invalid faucet id"
+                        ),
+                    },
+                    Err(RecvError::Lagged(n)) => {
+                        warn!("oracle store updater lagged behind by {n} messages");
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     let mut oracle_client = OracleSSEClient::new(store.clone(), message_broker.clone());
     println!("[INIT] Initializing oracle prices");
     oracle_client.init_prices().await?;
@@ -156,8 +189,26 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
         });
     }
 
+    println!("[RUN] Starting pool-state store updater");
+    {
+        let store = store.clone();
+        let message_broker = message_broker.clone();
+        tokio::spawn(async move {
+            let mut rx = message_broker.subscribe_pool_state();
+            loop {
+                match rx.recv().await {
+                    Ok(event) => store.set_pool_states(event.pool_states),
+                    Err(RecvError::Lagged(n)) => {
+                        warn!("pool-state store updater lagged behind by {n} messages");
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     println!("[RUN] Starting ZEKE server");
-    api::start(connection_manager, message_broker, store).await?;
+    api::start(connection_manager, message_broker, store, history).await?;
 
     Ok(())
 }

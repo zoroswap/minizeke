@@ -95,9 +95,7 @@ pub fn build_vault_component(cb: CodeBuilder) -> Result<AccountComponent> {
         vec![
             StorageSlot::with_empty_map(storage_slot_name(USER_ASSET_TOTAL_FUNDING_SLOT)),
             StorageSlot::with_empty_map(storage_slot_name(USER_ASSET_TOTAL_REDEEMS_SLOT)),
-            StorageSlot::with_empty_map(storage_slot_name(
-                USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT,
-            )),
+            StorageSlot::with_empty_map(storage_slot_name(USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT)),
             StorageSlot::with_empty_map(storage_slot_name(USER_PUBKEYS_SLOT)),
             StorageSlot::with_empty_map(storage_slot_name(USER_INDICES_SLOT)),
             StorageSlot::with_value(storage_slot_name(NEXT_USER_INDEX_SLOT), zero_word),

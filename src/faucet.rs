@@ -14,6 +14,7 @@ use axum::{
 use miden_client::{
     Client,
     account::AccountId,
+    address::{Address, AddressId},
     asset::FungibleAsset,
     keystore::FilesystemKeyStore,
     note::NoteType,
@@ -97,16 +98,16 @@ pub async fn initialize() -> Result<FaucetService> {
             Err(error) => {
                 let _ = started_tx.send(Err(error.to_string()));
                 return;
-            },
+            }
         };
         match runtime.block_on(FaucetWorker::new(deployment, mint_amount, cooldown_secs)) {
             Ok(worker) => {
                 let _ = started_tx.send(Ok(()));
                 runtime.block_on(worker.run(receiver));
-            },
+            }
             Err(error) => {
                 let _ = started_tx.send(Err(error.to_string()));
-            },
+            }
         }
     });
     started_rx
@@ -118,11 +119,7 @@ pub async fn initialize() -> Result<FaucetService> {
 }
 
 impl FaucetWorker {
-    async fn new(
-        deployment: Deployment,
-        mint_amount: u64,
-        cooldown_secs: u64,
-    ) -> Result<Self> {
+    async fn new(deployment: Deployment, mint_amount: u64, cooldown_secs: u64) -> Result<Self> {
         let mut client = get_faucet_client().await?;
         client.ensure_genesis_in_place().await?;
         client.sync_state().await?;
@@ -168,7 +165,8 @@ impl FaucetWorker {
             }
         }
 
-        let asset = FungibleAsset::new(faucet_id, self.mint_amount).map_err(|error| error.to_string())?;
+        let asset =
+            FungibleAsset::new(faucet_id, self.mint_amount).map_err(|error| error.to_string())?;
         let request = TransactionRequestBuilder::new()
             .build_mint_fungible_asset(asset, recipient, NoteType::Public, self.client.rng())
             .map_err(|error| error.to_string())?;
@@ -205,13 +203,18 @@ async fn mint(
 ) -> impl IntoResponse {
     let recipient = match parse_account_id(&request.address) {
         Ok(account_id) => account_id,
-        Err(error) => return mint_error(StatusCode::BAD_REQUEST, format!("invalid address: {error}")),
+        Err(error) => {
+            return mint_error(StatusCode::BAD_REQUEST, format!("invalid address: {error}"));
+        }
     };
     let faucet_id = match parse_account_id(&request.faucet_id) {
         Ok(account_id) => account_id,
         Err(error) => {
-            return mint_error(StatusCode::BAD_REQUEST, format!("invalid faucet_id: {error}"));
-        },
+            return mint_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid faucet_id: {error}"),
+            );
+        }
     };
 
     let (response_tx, response_rx) = oneshot::channel();
@@ -225,31 +228,41 @@ async fn mint(
         .await
         .is_err()
     {
-        return mint_error(StatusCode::SERVICE_UNAVAILABLE, "faucet worker unavailable".to_string());
+        return mint_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "faucet worker unavailable".to_string(),
+        );
     }
 
     match response_rx.await {
-        Ok(Ok(transaction_id)) => {
-            (
-                StatusCode::ACCEPTED,
-                Json(MintResponse {
-                    success: true,
-                    transaction_id: Some(transaction_id),
-                    message: None,
-                }),
-            )
-                .into_response()
-        },
+        Ok(Ok(transaction_id)) => (
+            StatusCode::ACCEPTED,
+            Json(MintResponse {
+                success: true,
+                transaction_id: Some(transaction_id),
+                message: None,
+            }),
+        )
+            .into_response(),
         Ok(Err(error)) => mint_error(StatusCode::BAD_GATEWAY, error),
-        Err(_) => mint_error(StatusCode::SERVICE_UNAVAILABLE, "faucet worker stopped".to_string()),
+        Err(_) => mint_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "faucet worker stopped".to_string(),
+        ),
     }
 }
 
 fn parse_account_id(value: &str) -> Result<AccountId, String> {
-    AccountId::from_bech32(value)
-        .map(|(_, account_id)| account_id)
-        .or_else(|_| AccountId::from_hex(value))
-        .map_err(|error| error.to_string())
+    let value = value.trim();
+    if value.starts_with("0x") {
+        return AccountId::from_hex(value).map_err(|error| error.to_string());
+    }
+
+    let (_, address) = Address::decode(value).map_err(|error| error.to_string())?;
+    match address.id() {
+        AddressId::AccountId(account_id) => Ok(account_id),
+        _ => Err("address does not contain an account ID".to_string()),
+    }
 }
 
 fn mint_error(status: StatusCode, message: String) -> axum::response::Response {
@@ -264,3 +277,16 @@ fn mint_error(status: StatusCode, message: String) -> axum::response::Response {
         .into_response()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_account_id;
+
+    #[test]
+    fn parses_bech32_address_with_routing_parameters() {
+        let account_id =
+            parse_account_id("mtst1apdp0kf27ytzqcf5zn4dynclecpw7z8z_qr7qqq9wr6w").unwrap();
+        let plain_account_id = parse_account_id("mtst1apdp0kf27ytzqcf5zn4dynclecpw7z8z").unwrap();
+
+        assert_eq!(account_id, plain_account_id);
+    }
+}

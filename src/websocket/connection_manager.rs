@@ -388,7 +388,8 @@ impl ConnectionManager {
                     match rx.recv().await {
                         Ok(event) => {
                             let message = ServerMessage::AmmUpdate { status: event };
-                            conn_mgr.broadcast_to_channel(&SubscriptionChannel::AmmEvent {}, message);
+                            conn_mgr
+                                .broadcast_to_channel(&SubscriptionChannel::AmmEvent {}, message);
                         }
                         Err(RecvError::Lagged(n)) => warn!("Amm lagged, skipped {n}"),
                         Err(RecvError::Closed) => {
@@ -429,6 +430,37 @@ impl ConnectionManager {
                         Err(RecvError::Lagged(n)) => warn!("User updates lagged, skipped {n}"),
                         Err(RecvError::Closed) => {
                             error!("User channel closed");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Executed curve fills
+        {
+            let message_broker = message_broker.clone();
+            let conn_mgr = self.clone();
+            tokio::spawn(async move {
+                let mut rx = message_broker.subscribe_trades();
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let message = ServerMessage::Trade {
+                                order_id: event.order_id,
+                                pair: event.pair,
+                                asset_in: event.asset_in,
+                                asset_out: event.asset_out,
+                                amount_in: event.amount_in,
+                                amount_out: event.amount_out,
+                                price: event.price,
+                                timestamp: event.timestamp,
+                            };
+                            conn_mgr.broadcast_to_channel(&SubscriptionChannel::Trades, message);
+                        }
+                        Err(RecvError::Lagged(n)) => warn!("Trades lagged, skipped {n}"),
+                        Err(RecvError::Closed) => {
+                            error!("Trades channel closed");
                             break;
                         }
                     }

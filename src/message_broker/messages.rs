@@ -56,6 +56,16 @@ pub enum ServerMessage {
         faucet_id: String,
         amount: u64,
     },
+    Trade {
+        order_id: String,
+        pair: String,
+        asset_in: String,
+        asset_out: String,
+        amount_in: u64,
+        amount_out: u64,
+        price: u64,
+        timestamp: u64,
+    },
     AmmUpdate {
         status: AmmEvent,
     },
@@ -95,6 +105,8 @@ pub enum SubscriptionChannel {
     AmmEvent {},
     #[serde(rename = "stats")]
     Stats,
+    #[serde(rename = "trades")]
+    Trades,
 }
 
 impl SubscriptionChannel {
@@ -138,14 +150,11 @@ impl SubscriptionChannel {
                 SubscriptionChannel::OraclePrices { .. },
             ) => true,
             (SubscriptionChannel::Stats, SubscriptionChannel::Stats) => true,
+            (SubscriptionChannel::Trades, SubscriptionChannel::Trades) => true,
             (SubscriptionChannel::AmmEvent {}, SubscriptionChannel::AmmEvent {}) => true,
             (
-                SubscriptionChannel::UserEvent {
-                    user_id: Some(id1),
-                },
-                SubscriptionChannel::UserEvent {
-                    user_id: Some(id2),
-                },
+                SubscriptionChannel::UserEvent { user_id: Some(id1) },
+                SubscriptionChannel::UserEvent { user_id: Some(id2) },
             ) => id1 == id2,
             (
                 SubscriptionChannel::UserEvent { user_id: None },
