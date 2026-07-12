@@ -1,17 +1,22 @@
 use crate::{
     curve::get_curve_amount_out,
+    deployment::AssetInfo,
     message_broker::message_broker::{
         AmmEvent, MessageBroker, MessageBrokerEvent, PoolStateEvent, UserEvent,
     },
     oracle_sse::OraclePricing,
     order::{Created, Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders},
-    pool::{PoolState, get_user_balance_from_pool},
+    pool::{PoolState, fetch_account_storage_from_rpc, get_user_balance_from_pool},
+    vault::user_pool_from_storage,
 };
 
 use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
 use miden_client::account::AccountId;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::{select, sync::broadcast::error::RecvError};
 use tracing::{error, info, warn};
 
@@ -21,10 +26,10 @@ pub struct Processing {
     orders: Orders,
     pool_states: HashMap<AccountId, PoolState>,
     engine_busy: bool,
-    pool_id: AccountId,
     vault_id: AccountId,
-    asset0: AccountId,
-    asset1: AccountId,
+    asset_ids: HashSet<AccountId>,
+    pool_ids: HashSet<AccountId>,
+    user_pools: HashMap<AccountId, AccountId>,
     /// Lazy per-(user, faucet) balance mirror: the opening balance is derived from chain
     /// on first use, then deltas are applied locally. This is only a pre-flight check —
     /// the on-chain FPI assert in the swap tx remains the real enforcement.
@@ -35,12 +40,11 @@ impl Processing {
     pub async fn new(
         message_broker: Arc<MessageBroker>,
         pool_states: HashMap<AccountId, PoolState>,
-        pool_id: AccountId,
         vault_id: AccountId,
-        asset0: AccountId,
-        asset1: AccountId,
+        assets: Vec<AssetInfo>,
+        pools: Vec<AccountId>,
     ) -> Result<Self> {
-        let oracle_pricing = OraclePricing::new();
+        let oracle_pricing = OraclePricing::new(&assets);
         let orders = Orders::default();
 
         Ok(Self {
@@ -49,10 +53,10 @@ impl Processing {
             orders,
             pool_states,
             engine_busy: false,
-            pool_id,
             vault_id,
-            asset0,
-            asset1,
+            asset_ids: assets.into_iter().map(|asset| asset.faucet_id).collect(),
+            pool_ids: pools.into_iter().collect(),
+            user_pools: HashMap::new(),
             balances: HashMap::new(),
         })
     }
@@ -63,23 +67,39 @@ impl Processing {
         if let Some(balance) = self.balances.get(&(user_id, faucet_id)) {
             return Ok(*balance);
         }
-        let asset_index = if faucet_id == self.asset0 {
-            0
-        } else if faucet_id == self.asset1 {
-            1
-        } else {
-            return Err(anyhow!("unknown pool asset {}", faucet_id.to_hex()));
-        };
-        let balance = get_user_balance_from_pool(
-            self.pool_id,
-            self.vault_id,
-            faucet_id,
-            asset_index,
-            user_id,
-        )
-        .await?;
+        let balance = self.fetch_balance_from_chain(user_id, faucet_id).await?;
         self.balances.insert((user_id, faucet_id), balance);
         Ok(balance)
+    }
+
+    async fn fetch_balance_from_chain(
+        &mut self,
+        user_id: AccountId,
+        faucet_id: AccountId,
+    ) -> Result<u64> {
+        if !self.asset_ids.contains(&faucet_id) {
+            return Err(anyhow!("unknown pool asset {}", faucet_id.to_hex()));
+        }
+        let pool_id = self.resolve_user_pool(user_id).await?;
+        get_user_balance_from_pool(pool_id, self.vault_id, faucet_id, user_id).await
+    }
+
+    async fn resolve_user_pool(&mut self, user_id: AccountId) -> Result<AccountId> {
+        if let Some(pool_id) = self.user_pools.get(&user_id) {
+            return Ok(*pool_id);
+        }
+        let storage = fetch_account_storage_from_rpc(self.vault_id).await?;
+        let pool_id = user_pool_from_storage(&storage, user_id)?
+            .ok_or_else(|| anyhow!("user {} has no assigned pool", user_id.to_hex()))?;
+        if !self.pool_ids.contains(&pool_id) {
+            return Err(anyhow!(
+                "user {} is assigned to unlisted pool {}",
+                user_id.to_hex(),
+                pool_id.to_hex()
+            ));
+        }
+        self.user_pools.insert(user_id, pool_id);
+        Ok(pool_id)
     }
 
     pub async fn start(&mut self) {
@@ -241,12 +261,16 @@ impl Processing {
         ))
     }
 
+    fn publish_order_update(&self, update: OrderUpdate) -> Result<()> {
+        self.orders.apply_order_update(update.clone());
+        self.message_broker.broadcast_order_update(update)
+    }
+
     async fn process_orders(&mut self, batch: Vec<Order<Created>>) -> Result<()> {
         let orders: Vec<_> = batch.into_iter().map(|o| o.start_processing()).collect();
 
         for order in &orders {
-            self.message_broker
-                .broadcast_order_update(OrderUpdate::StartedProcessing(order.clone()))?;
+            self.publish_order_update(OrderUpdate::StartedProcessing(order.clone()))?;
         }
 
         let mut processed_batch = Vec::with_capacity(orders.len());
@@ -257,6 +281,19 @@ impl Processing {
             let sell_faucet = details.asset_in;
             let user_id = order.user_id();
 
+            if sell_faucet == buy_faucet
+                || !self.asset_ids.contains(&sell_faucet)
+                || !self.asset_ids.contains(&buy_faucet)
+            {
+                warn!(
+                    order_id = %order.id,
+                    "Order uses identical or unlisted assets"
+                );
+                let failed = order.failed(OrderFailureReason::ExecutionError);
+                self.publish_order_update(OrderUpdate::Failed(failed))?;
+                continue;
+            }
+
             // Quote the swap on the curve against the current pool states.
             let (amount_out, new_sell_balances, new_buy_balances) =
                 match self.quote_swap(sell_faucet, buy_faucet, details.amount_in) {
@@ -264,8 +301,7 @@ impl Processing {
                     Err(e) => {
                         warn!(order_id = %order.id, "Swap quote failed: {e:?}");
                         let failed = order.failed(OrderFailureReason::ExecutionError);
-                        self.message_broker
-                            .broadcast_order_update(OrderUpdate::Failed(failed))?;
+                        self.publish_order_update(OrderUpdate::Failed(failed))?;
                         continue;
                     }
                 };
@@ -278,48 +314,62 @@ impl Processing {
                     "Swap quote below min_amount_out"
                 );
                 let failed = order.failed(OrderFailureReason::MinOutNotMet);
-                self.message_broker
-                    .broadcast_order_update(OrderUpdate::Failed(failed))?;
+                self.publish_order_update(OrderUpdate::Failed(failed))?;
                 continue;
             }
 
-            // Pre-flight balance check against the lazily-fetched chain balance. A fetch
-            // failure or an insufficient balance fails only this order.
-            let (sell_balance, buy_balance) = match self
-                .balance_of(user_id, sell_faucet)
-                .await
-                .and_then(|sell| {
-                    if sell < details.amount_in {
-                        Err(anyhow!(
-                            "insufficient balance: has {sell}, selling {}",
-                            details.amount_in
-                        ))
-                    } else {
-                        Ok(sell)
+            // If a cached balance would reject the order, refresh it once. FUND and REDEEM
+            // notes change vault state without notifying this process.
+            let mut sell_balance = match self.balance_of(user_id, sell_faucet).await {
+                Ok(sell) => sell,
+                Err(e) => {
+                    warn!(order_id = %order.id, "Sell balance fetch failed: {e:?}");
+                    let failed = order.failed(OrderFailureReason::ExecutionError);
+                    self.publish_order_update(OrderUpdate::Failed(failed))?;
+                    continue;
+                }
+            };
+            if sell_balance < details.amount_in {
+                sell_balance = match self.fetch_balance_from_chain(user_id, sell_faucet).await {
+                    Ok(balance) => {
+                        self.balances.insert((user_id, sell_faucet), balance);
+                        balance
                     }
-                }) {
-                Ok(sell) => match self.balance_of(user_id, buy_faucet).await {
-                    Ok(buy) => (sell, buy),
                     Err(e) => {
-                        warn!(order_id = %order.id, "Buy balance fetch failed: {e:?}");
+                        warn!(order_id = %order.id, "Sell balance refresh failed: {e:?}");
                         let failed = order.failed(OrderFailureReason::ExecutionError);
-                        self.message_broker
-                            .broadcast_order_update(OrderUpdate::Failed(failed))?;
+                        self.publish_order_update(OrderUpdate::Failed(failed))?;
                         continue;
                     }
-                },
+                };
+            }
+            if sell_balance < details.amount_in {
+                warn!(
+                    order_id = %order.id,
+                    available = sell_balance,
+                    requested = details.amount_in,
+                    "Insufficient sell balance after chain refresh"
+                );
+                let failed = order.failed(OrderFailureReason::InsufficientBalance);
+                self.publish_order_update(OrderUpdate::Failed(failed))?;
+                continue;
+            }
+            let buy_balance = match self.balance_of(user_id, buy_faucet).await {
+                Ok(buy) => buy,
                 Err(e) => {
-                    warn!(order_id = %order.id, "Sell balance check failed: {e:?}");
+                    warn!(order_id = %order.id, "Buy balance fetch failed: {e:?}");
                     let failed = order.failed(OrderFailureReason::ExecutionError);
-                    self.message_broker
-                        .broadcast_order_update(OrderUpdate::Failed(failed))?;
+                    self.publish_order_update(OrderUpdate::Failed(failed))?;
                     continue;
                 }
             };
 
             // A swap debits the sell asset and credits the buy asset.
             let sell_balance = sell_balance - details.amount_in;
-            let buy_balance = buy_balance.saturating_add(amount_out);
+            // The signed intent binds the minimum output. Credit exactly that amount so
+            // the off-chain mirror, history, and on-chain counters all agree.
+            let executed_amount_out = details.min_amount_out;
+            let buy_balance = buy_balance.saturating_add(executed_amount_out);
             self.balances.insert((user_id, sell_faucet), sell_balance);
             self.balances.insert((user_id, buy_faucet), buy_balance);
 
@@ -344,9 +394,10 @@ impl Processing {
                 amount: sell_balance,
             })?;
 
-            let processed = order.processed(OrderExecutionResult { amount_out });
-            self.message_broker
-                .broadcast_order_update(OrderUpdate::Processed(processed.clone()))?;
+            let processed = order.processed(OrderExecutionResult {
+                amount_out: executed_amount_out,
+            });
+            self.publish_order_update(OrderUpdate::Processed(processed.clone()))?;
             processed_batch.push(processed);
         }
 

@@ -27,8 +27,10 @@ use crate::{
     market::derive_depth,
     message_broker::message_broker::MessageBroker,
     order::{Order, OrderDetails, OrderType, SerializableOrder},
+    pool::{fetch_account_storage_from_rpc, pool_cell_allocation_from_storage},
     serde::{deserialize_account_id, serialize_account_id},
     store::Store,
+    vault::user_placement_from_storage,
     websocket::{connection_manager::ConnectionManager, handlers::websocket_handler},
 };
 
@@ -97,26 +99,10 @@ pub async fn start(
         .await
         .unwrap_or_else(|err| panic!("Failed to bind TCP listener to {}: {err:?}", server_url));
     info!("Server listening on {}", server_url);
-    println!("\n🚀 Zoro server is running!");
-    println!("📡 Available endpoints:");
-    println!("  GET  /health                    - Health check");
-    println!("  GET  /pools/info                - Pool states and asset ids");
-    println!("  GET  /stats                     - Order count statistics");
-    println!("  GET  /candles                   - Historical OHLCV candles");
-    println!("  GET  /trades                    - Recent trade history");
-    println!("  GET  /orders                    - Historical orders");
-    println!("  GET  /orders/{{id}}             - Historical order by id");
-    println!("  GET  /depth                     - Curve-derived market depth");
-    println!("  POST /orders/new                - Submit a new order");
-    println!("  POST /withdraw/submit           - Submit a new withdrawal");
-    println!("  POST /mint                      - Request a faucet mint");
-    println!("  GET  /ws                        - WebSocket connection");
-    println!("🌐 Server address: {}", server_url);
-    println!("📊 Example: {}/health", server_url);
-    println!(
-        "🔌 WebSocket: ws://{}/ws\n",
-        server_url.replace("http://", "")
-    );
+    println!("Server: {server_url}");
+    println!("GET  /health /pools/info /stats /candles /trades /depth");
+    println!("GET  /orders /orders/{{id}} /users/{{id}}/placement /ws");
+    println!("POST /orders/new /mint");
 
     if let Err(e) = axum::serve(listener, app).await {
         error!("Critical error on server: {e}. Exiting with status 1.");
@@ -142,7 +128,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/candles", get(candles))
         .route("/trades", get(trades))
         .route("/orders", get(orders))
+        .route("/orders/{id}/events", get(order_events))
         .route("/orders/{id}", get(order_by_id))
+        .route("/users/{id}/placement", get(user_placement))
         .route("/depth", get(depth))
         .route("/mint", post(proxy_mint))
         .route("/ws", get(websocket_handler))
@@ -226,7 +214,7 @@ async fn stats(State(state): State<AppState>) -> Result<Response<Body>, ApiError
 struct CandlesQuery {
     #[serde(default = "default_candle_source")]
     source: String,
-    pair: Option<String>,
+    pair: String,
     #[serde(default = "default_interval")]
     interval: String,
     from: Option<u64>,
@@ -257,6 +245,9 @@ async fn candles(
     State(state): State<AppState>,
     Query(query): Query<CandlesQuery>,
 ) -> Response<Body> {
+    if query.pair.trim().is_empty() {
+        return bad_request("pair must not be empty");
+    }
     let Some(interval) = parse_interval(&query.interval) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -268,7 +259,7 @@ async fn candles(
     };
     match state.history.candles(
         &query.source,
-        query.pair.as_deref(),
+        Some(&query.pair),
         interval,
         query.from,
         query.to,
@@ -280,16 +271,21 @@ async fn candles(
 }
 
 #[derive(Debug, Deserialize)]
-struct PageQuery {
+struct TradesQuery {
+    pair: String,
     before: Option<u64>,
     limit: Option<u64>,
 }
 
-async fn trades(State(state): State<AppState>, Query(query): Query<PageQuery>) -> Response<Body> {
-    match state
-        .history
-        .trades(query.before, query.limit.unwrap_or(100).clamp(1, 1_000))
-    {
+async fn trades(State(state): State<AppState>, Query(query): Query<TradesQuery>) -> Response<Body> {
+    if query.pair.trim().is_empty() {
+        return bad_request("pair must not be empty");
+    }
+    match state.history.trades(
+        &query.pair,
+        query.before,
+        query.limit.unwrap_or(100).clamp(1, 1_000),
+    ) {
         Ok(trades) => Json(ApiResponse { data: trades }).into_response(),
         Err(error) => ApiError(error).into_response(),
     }
@@ -323,8 +319,17 @@ async fn order_by_id(State(state): State<AppState>, Path(id): Path<Uuid>) -> Res
     }
 }
 
+async fn order_events(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response<Body> {
+    match state.history.order_events(id) {
+        Ok(events) => Json(ApiResponse { data: events }).into_response(),
+        Err(error) => ApiError(error).into_response(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DepthQuery {
+    base: String,
+    quote: String,
     levels: Option<usize>,
 }
 
@@ -338,65 +343,167 @@ async fn depth(State(state): State<AppState>, Query(query): Query<DepthQuery>) -
             .into_response();
     }
 
-    let asset0 = state.store.asset0();
-    let asset1 = state.store.asset1();
+    let base = match AccountId::from_hex(&query.base) {
+        Ok(asset) => asset,
+        Err(error) => {
+            return bad_request(format!("invalid base account id: {error}"));
+        }
+    };
+    let quote = match AccountId::from_hex(&query.quote) {
+        Ok(asset) => asset,
+        Err(error) => {
+            return bad_request(format!("invalid quote account id: {error}"));
+        }
+    };
+    if base == quote {
+        return bad_request("base and quote must be distinct assets");
+    }
+    if !state
+        .store
+        .assets()
+        .iter()
+        .any(|asset| asset.faucet_id == base)
+    {
+        return bad_request("base asset is not listed");
+    }
+    if !state
+        .store
+        .assets()
+        .iter()
+        .any(|asset| asset.faucet_id == quote)
+    {
+        return bad_request("quote asset is not listed");
+    }
+
     let pools = state.store.pool_states();
-    let Some(pool0) = pools.get(&asset0) else {
-        return ApiError(anyhow!("base pool state unavailable")).into_response();
+    let Some(base_pool) = pools.get(&base) else {
+        return service_unavailable("base pool state unavailable");
     };
-    let Some(pool1) = pools.get(&asset1) else {
-        return ApiError(anyhow!("quote pool state unavailable")).into_response();
+    let Some(quote_pool) = pools.get(&quote) else {
+        return service_unavailable("quote pool state unavailable");
     };
-    let Some(price0) = state.store.oracle_price(asset0) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "base oracle price unavailable"})),
-        )
-            .into_response();
+    let Some(base_price) = state.store.oracle_price(base) else {
+        return service_unavailable("base oracle price unavailable");
     };
-    let Some(price1) = state.store.oracle_price(asset1) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "quote oracle price unavailable"})),
-        )
-            .into_response();
+    let Some(quote_price) = state.store.oracle_price(quote) else {
+        return service_unavailable("quote oracle price unavailable");
     };
 
     match derive_depth(
-        asset0.to_hex(),
-        asset1.to_hex(),
-        pool0,
-        pool1,
-        price0,
-        price1,
+        base.to_hex(),
+        quote.to_hex(),
+        base_pool,
+        quote_pool,
+        base_price,
+        quote_price,
         levels,
         Utc::now().timestamp_millis() as u64,
     ) {
         Ok(depth) => Json(ApiResponse { data: depth }).into_response(),
-        Err(error) => ApiError(error).into_response(),
+        Err(error) => service_unavailable(format!("market depth unavailable: {error}")),
     }
 }
 
-async fn pool_info(State(state): State<AppState>) -> impl IntoResponse {
-    let liq_pools = state.store.pool_states().clone();
-    let mut liq_pools = liq_pools.iter();
-    let pool0 = liq_pools.next();
-    let pool1 = liq_pools.next();
-    let (pool0_addr, pool0_state) = pool0.unwrap();
-    let (pool1_addr, pool1_state) = pool1.unwrap();
-
+async fn pool_info(State(state): State<AppState>) -> Response<Body> {
+    let pool_states = state.store.pool_states();
+    let mut assets = Vec::with_capacity(state.store.assets().len());
+    for asset in state.store.assets() {
+        let Some(pool_state) = pool_states.get(&asset.faucet_id) else {
+            return service_unavailable(format!(
+                "pool state unavailable for asset {}",
+                asset.faucet_id.to_hex()
+            ));
+        };
+        assets.push(serde_json::json!({
+            "asset": asset,
+            "pool_state": pool_state,
+        }));
+    }
     let response = serde_json::json!({
-        "pool_account_id": state.store.pool_id().to_hex(),
-        "liq_pools": vec![(pool0_addr.to_hex(), pool0_state), (pool1_addr.to_hex(), pool1_state)],
-        "asset0": state.store.asset0().to_hex(),
-        "asset1": state.store.asset1().to_hex()
+        "assets": assets,
+        "pool_shard_ids": state.store.pools().iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
     });
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("max-age=120, must-revalidate"),
     );
-    (headers, Json(response))
+    (headers, Json(response)).into_response()
+}
+
+async fn user_placement(State(state): State<AppState>, Path(id): Path<String>) -> Response<Body> {
+    let user_id = match AccountId::from_hex(&id) {
+        Ok(user_id) => user_id,
+        Err(error) => return bad_request(format!("invalid user account id: {error}")),
+    };
+    let vault_storage = match fetch_account_storage_from_rpc(state.store.vault_id()).await {
+        Ok(storage) => storage,
+        Err(error) => {
+            warn!(%error, "failed to fetch vault storage for placement");
+            return service_unavailable("vault storage is unavailable");
+        }
+    };
+    let pool_id = match user_placement_from_storage(&vault_storage, user_id) {
+        Ok(Some(pool_id)) => pool_id,
+        Ok(None) => return not_found("user is not registered"),
+        Err(error) => {
+            error!(%error, "invalid user placement in vault storage");
+            return service_unavailable("user placement is unavailable");
+        }
+    };
+    if !state.store.pools().contains(&pool_id) {
+        return service_unavailable("assigned pool shard is not configured");
+    }
+    let pool_storage = match fetch_account_storage_from_rpc(pool_id).await {
+        Ok(storage) => storage,
+        Err(error) => {
+            warn!(%error, "failed to fetch pool storage for placement");
+            return service_unavailable("assigned pool shard is unavailable");
+        }
+    };
+
+    let mut assets = Vec::with_capacity(state.store.assets().len());
+    for asset in state.store.assets() {
+        let allocation =
+            match pool_cell_allocation_from_storage(&pool_storage, asset.faucet_id, user_id) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    error!(%error, asset = %asset.faucet_id.to_hex(), "failed to read pool cell");
+                    return service_unavailable("pool placement storage is invalid");
+                }
+            };
+        assets.push(serde_json::json!({
+            "asset_id": asset.faucet_id.to_hex(),
+            "cell_slot_id": allocation.as_ref().map(|value| &value.slot_id),
+            "bought": allocation.as_ref().map(|value| value.bought),
+            "sold": allocation.as_ref().map(|value| value.sold),
+        }));
+    }
+
+    Json(ApiResponse {
+        data: serde_json::json!({
+            "user_id": user_id.to_hex(),
+            "pool_shard_id": pool_id.to_hex(),
+            "assets": assets,
+        }),
+    })
+    .into_response()
+}
+
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Body> {
+    (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+}
+
+fn bad_request(message: impl Into<String>) -> Response<Body> {
+    error_response(StatusCode::BAD_REQUEST, message)
+}
+
+fn not_found(message: impl Into<String>) -> Response<Body> {
+    error_response(StatusCode::NOT_FOUND, message)
+}
+
+fn service_unavailable(message: impl Into<String>) -> Response<Body> {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, message)
 }
 
 #[derive(Clone, Debug, Serialize)]

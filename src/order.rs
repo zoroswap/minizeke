@@ -253,6 +253,7 @@ pub struct OrderExecutionResult {
 pub enum OrderFailureReason {
     Expired,
     MinOutNotMet,
+    InsufficientBalance,
     ExecutionError,
 }
 
@@ -491,8 +492,10 @@ impl Orders {
                 self.settled.insert(order.id, order);
             }
             OrderUpdate::Failed(order) => {
+                self.new.remove(&order.id);
                 self.in_processing.remove(&order.id);
                 self.processed.remove(&order.id);
+                self.executed.remove(&order.id);
                 self.failed.insert(order.id, order);
             }
         }
@@ -711,5 +714,38 @@ impl From<Order<Failed>> for SerializableOrder {
             execution_result: value.state.execution_result,
             tx_hash: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use miden_client::auth::AuthSecretKey;
+    use miden_core::Word;
+
+    use super::*;
+
+    #[test]
+    fn failed_update_evicts_order_that_is_still_new() {
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let user_id = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
+        let asset_in = AccountId::from_hex("0x57a179f33b726c315fcfd5e0ff3309").unwrap();
+        let asset_out = AccountId::from_hex("0x1e7e8af77fc5f2f1631d5c5ce35471").unwrap();
+        let created = Order::new(
+            key.sign(Word::default()),
+            user_id,
+            OrderDetails::new(asset_in, 10, asset_out, u64::MAX),
+            key.public_key(),
+        );
+        let failed = created
+            .clone()
+            .start_processing()
+            .failed(OrderFailureReason::MinOutNotMet);
+        let orders = Orders::default();
+
+        orders.apply_order_update(OrderUpdate::New(created));
+        orders.apply_order_update(OrderUpdate::Failed(failed));
+
+        assert!(orders.orders_new().is_empty());
+        assert_eq!(orders.orders_failed().len(), 1);
     }
 }

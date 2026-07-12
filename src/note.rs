@@ -6,7 +6,10 @@ use miden_client::{
     account::AccountId,
     assembly::CodeBuilder,
     asset::FungibleAsset,
-    note::{Note, NoteAssets, NoteRecipient, NoteStorage, NoteTag, NoteType, PartialNoteMetadata},
+    note::{
+        NetworkAccountTarget, Note, NoteAssets, NoteAttachment, NoteAttachments, NoteExecutionHint,
+        NoteRecipient, NoteStorage, NoteTag, NoteType, PartialNoteMetadata,
+    },
 };
 use miden_protocol::note::NoteScript;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -22,9 +25,22 @@ pub enum NoteKind {
     Redeem,
     Withdraw,
     Deposit,
+    AddPool,
+    Checkpoint,
 }
 
 impl NoteKind {
+    pub const NETWORK_KINDS: [Self; 8] = [
+        Self::Register,
+        Self::Fund,
+        Self::InitRedeem,
+        Self::Redeem,
+        Self::Withdraw,
+        Self::Deposit,
+        Self::AddPool,
+        Self::Checkpoint,
+    ];
+
     pub fn masm_name(&self) -> &str {
         match self {
             NoteKind::Register => "REGISTER.masm",
@@ -33,6 +49,8 @@ impl NoteKind {
             NoteKind::Redeem => "REDEEM.masm",
             NoteKind::Deposit => "DEPOSIT.masm",
             NoteKind::Withdraw => "WITHDRAW.masm",
+            NoteKind::AddPool => "ADD_POOL.masm",
+            NoteKind::Checkpoint => "CHECKPOINT.masm",
         }
     }
 }
@@ -51,6 +69,8 @@ pub enum ZekeNoteInstructions {
     Redeem(RedeemInstructions),
     Deposit(DepositInstructions),
     Withdraw(WithdrawInstructions),
+    AddPool(AddPoolInstructions),
+    Checkpoint(CheckpointInstructions),
 }
 
 pub struct RegisterInstructions {
@@ -92,6 +112,20 @@ pub struct WithdrawInstructions {
     pub lp_id: AccountId,
     pub vault_id: AccountId,
     pub asset_out: FungibleAsset,
+}
+
+pub struct AddPoolInstructions {
+    pub operator_id: AccountId,
+    pub vault_id: AccountId,
+    pub pool_id: AccountId,
+}
+
+pub struct CheckpointInstructions {
+    pub operator_id: AccountId,
+    pub vault_id: AccountId,
+    pub asset_id: AccountId,
+    pub lp_id: AccountId,
+    pub new_entitlement: u64,
 }
 
 impl ZekeNote {
@@ -164,6 +198,38 @@ impl ZekeNote {
                     .with_beneficiary(instructions.lp_id)
                     .with_p2id_tag(NoteTag::with_account_target(instructions.lp_id));
             }
+            ZekeNoteInstructions::AddPool(instructions) => {
+                vault_id = instructions.vault_id;
+                sender_id = instructions.operator_id;
+                note_kind = NoteKind::AddPool;
+                note_storage_builder = note_storage_builder
+                    .with_asset_compact(Word::from([
+                        instructions.pool_id.suffix(),
+                        instructions.pool_id.prefix().as_felt(),
+                        Felt::ZERO,
+                        Felt::ZERO,
+                    ]))
+                    .with_beneficiary(instructions.operator_id);
+            }
+            ZekeNoteInstructions::Checkpoint(instructions) => {
+                vault_id = instructions.vault_id;
+                sender_id = instructions.operator_id;
+                note_kind = NoteKind::Checkpoint;
+                note_storage_builder = note_storage_builder
+                    .with_asset_compact(Word::from([
+                        instructions.asset_id.suffix(),
+                        instructions.asset_id.prefix().as_felt(),
+                        Felt::ZERO,
+                        Felt::new(instructions.new_entitlement)?,
+                    ]))
+                    .with_metadata(Word::from([
+                        instructions.lp_id.suffix(),
+                        instructions.lp_id.prefix().as_felt(),
+                        Felt::ZERO,
+                        Felt::ZERO,
+                    ]))
+                    .with_beneficiary(instructions.operator_id);
+            }
         }
         let note_storage = note_storage_builder.build()?;
         let serial_number = random_word();
@@ -178,7 +244,13 @@ impl ZekeNote {
                 .map(FungibleAsset::into)
                 .collect(),
         )?;
-        let note = Note::new(note_assets, note_metadata, recipient);
+        let network_target = NetworkAccountTarget::new(vault_id, NoteExecutionHint::Always)?;
+        let note = Note::with_attachments(
+            note_assets,
+            note_metadata,
+            recipient,
+            NoteAttachments::from(NoteAttachment::from(network_target)),
+        );
 
         Ok(Self {
             note,
@@ -403,6 +475,47 @@ mod tests {
             }),
             code_builder.clone(),
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_add_pool_network_note() -> Result<()> {
+        let operator_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
+        let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2)?;
+        let note = ZekeNote::new(
+            ZekeNoteInstructions::AddPool(AddPoolInstructions {
+                operator_id,
+                vault_id,
+                pool_id: operator_id,
+            }),
+            CodeBuilder::new(),
+        )?;
+        assert_eq!(
+            NetworkAccountTarget::try_from(note.note().attachments())?.target_id(),
+            vault_id
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_checkpoint_network_note() -> Result<()> {
+        let operator_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
+        let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2)?;
+        let asset_id = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
+        let note = ZekeNote::new(
+            ZekeNoteInstructions::Checkpoint(CheckpointInstructions {
+                operator_id,
+                vault_id,
+                asset_id,
+                lp_id: operator_id,
+                new_entitlement: 123,
+            }),
+            CodeBuilder::new(),
+        )?;
+        assert_eq!(
+            NetworkAccountTarget::try_from(note.note().attachments())?.target_id(),
+            vault_id
+        );
         Ok(())
     }
 }

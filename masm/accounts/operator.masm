@@ -25,6 +25,8 @@ const NUMBER_OF_HASHED_ELEMENTS_CAP = 0
 #! public key that does not hash to PK_COMM.
 #!
 #! Inputs:  [m0..m7, PK_COMM]   (m0 = first canonical intent felt, on top)
+#! Intent:  [user_suffix, user_prefix, sell_asset_suffix, sell_asset_prefix,
+#!           sell_amount, buy_asset_suffix, buy_asset_prefix, buy_amount]
 #! Outputs: []
 #! Advice:  [PK[9], SIG[17], ...]
 #!

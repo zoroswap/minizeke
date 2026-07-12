@@ -18,8 +18,9 @@ async fn main() -> Result<()> {
     dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,miden_core=off,log=warn")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,miden_core=off,log=warn")
+            }),
         )
         .with_target(false)
         .init();
@@ -32,4 +33,3 @@ async fn main() -> Result<()> {
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
-

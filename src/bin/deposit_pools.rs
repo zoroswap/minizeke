@@ -1,23 +1,22 @@
 //! Seeds initial pool liquidity: creates (or reuses) a server-owned LP account, mints
-//! from both faucets and sends DEPOSIT notes to the vault. Each deposit is recorded in
+//! every configured asset and sends DEPOSIT notes to the vault. Each deposit is recorded in
 //! the deployment file so the server can rebuild pool states on startup.
 //!
 //! ```sh
-//! cargo run --bin deposit_pools                       # default amount per pool
+//! cargo run --bin deposit_pools                       # assets.toml amount per pool
 //! DEPOSIT_AMOUNT=500000000 cargo run --bin deposit_pools
 //! ```
 
-use std::env;
+use std::{collections::HashMap, env};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dotenv::dotenv;
 use miden_client::asset::FungibleAsset;
 use minizeke::{
+    asset_config::{initial_liquidity_base_units, load_asset_configs},
     deployment::{Deployment, DepositRecord},
     test_utils::{deposit_liquidity_on_vault, get_client, get_user, mint_asset_to_user},
 };
-
-const DEFAULT_DEPOSIT_AMOUNT: u64 = 100_000_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,10 +30,15 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let amount = env::var("DEPOSIT_AMOUNT")
+    let amount_override = env::var("DEPOSIT_AMOUNT")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DEPOSIT_AMOUNT);
+        .map(|value| value.parse())
+        .transpose()
+        .context("DEPOSIT_AMOUNT must be an unsigned integer")?;
+    let asset_configs = load_asset_configs()?
+        .into_iter()
+        .map(|asset| (asset.symbol.to_ascii_uppercase(), asset))
+        .collect::<HashMap<_, _>>();
 
     let mut deployment = Deployment::load()?;
     println!(
@@ -61,14 +65,31 @@ async fn main() -> Result<()> {
         }
     };
 
-    for faucet_id in [deployment.asset0, deployment.asset1] {
+    for asset in deployment.assets.clone() {
+        let config = asset_configs
+            .get(&asset.symbol.to_ascii_uppercase())
+            .with_context(|| format!("{} is not defined in assets.toml", asset.symbol))?;
+        let amount = amount_override.unwrap_or(initial_liquidity_base_units(config)?);
+        let faucet_id = asset.faucet_id;
+        if deployment
+            .deposits
+            .iter()
+            .any(|deposit| deposit.faucet_id == faucet_id)
+        {
+            println!("[DEPOSIT] {} already seeded; skipping", asset.symbol);
+            continue;
+        }
         println!(
-            "[DEPOSIT] minting {amount} of {} to the LP",
+            "[DEPOSIT] minting {amount} {} ({}) to the LP",
+            asset.symbol,
             faucet_id.to_hex()
         );
         mint_asset_to_user(&mut client, faucet_id, lp_id, amount).await?;
 
-        println!("[DEPOSIT] depositing {amount} of {} into the vault", faucet_id.to_hex());
+        println!(
+            "[DEPOSIT] depositing {amount} {} into the vault",
+            asset.symbol
+        );
         deposit_liquidity_on_vault(
             &mut client,
             deployment.vault_id,
@@ -78,9 +99,14 @@ async fn main() -> Result<()> {
         .await?;
 
         // record after the on-chain leg succeeded so the file never over-reports
-        deployment.deposits.push(DepositRecord { faucet_id, amount });
+        deployment
+            .deposits
+            .push(DepositRecord { faucet_id, amount });
         deployment.save()?;
-        println!("[DEPOSIT] recorded deposit in {}", Deployment::path().display());
+        println!(
+            "[DEPOSIT] recorded deposit in {}",
+            Deployment::path().display()
+        );
     }
 
     println!("[DEPOSIT] done; the server can now be started with `cargo run`");

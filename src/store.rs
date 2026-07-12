@@ -1,4 +1,5 @@
 use crate::{
+    deployment::AssetInfo,
     order::{OrderUpdate, Orders},
     pool::PoolState,
 };
@@ -9,24 +10,24 @@ use uuid::Uuid;
 
 pub struct Store {
     orders: Orders,
-    pool_account_id: AccountId,
-    asset0: AccountId,
-    asset1: AccountId,
+    vault_id: AccountId,
+    assets: Vec<AssetInfo>,
+    pools: Vec<AccountId>,
     pool_states: DashMap<AccountId, PoolState>,
     oracle_prices: DashMap<AccountId, u64>,
 }
 
 impl Store {
     pub fn new(
-        pool_acc: AccountId,
-        asset0: AccountId,
-        asset1: AccountId,
+        vault_id: AccountId,
+        assets: Vec<AssetInfo>,
+        pools: Vec<AccountId>,
         pool_states: HashMap<AccountId, PoolState>,
     ) -> Self {
         let store = Self {
-            pool_account_id: pool_acc,
-            asset0,
-            asset1,
+            vault_id,
+            assets,
+            pools,
             orders: Orders::default(),
             pool_states: DashMap::new(),
             oracle_prices: DashMap::new(),
@@ -54,7 +55,19 @@ impl Store {
     }
 
     pub fn pool_id(&self) -> AccountId {
-        self.pool_account_id.clone()
+        self.pools[0]
+    }
+
+    pub fn vault_id(&self) -> AccountId {
+        self.vault_id
+    }
+
+    pub fn pools(&self) -> &[AccountId] {
+        &self.pools
+    }
+
+    pub fn assets(&self) -> &[AssetInfo] {
+        &self.assets
     }
 
     pub fn pool_states(&self) -> HashMap<AccountId, PoolState> {
@@ -62,14 +75,6 @@ impl Store {
             .clone()
             .into_iter()
             .collect::<HashMap<AccountId, PoolState>>()
-    }
-
-    pub fn asset0(&self) -> AccountId {
-        self.asset0
-    }
-
-    pub fn asset1(&self) -> AccountId {
-        self.asset1
     }
 
     pub fn set_oracle_price(&self, faucet_id: AccountId, price: u64) {

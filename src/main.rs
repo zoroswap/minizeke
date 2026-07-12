@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, env, fs, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use dotenv::dotenv;
@@ -6,10 +6,12 @@ use miden_client::account::AccountId;
 use tokio::runtime::Builder;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use minizeke::*;
 
 use crate::{
+    deployment::AssetInfo,
     history::{HistoryStore, start_history_service},
     message_broker::message_broker::{MessageBroker, StatsEvent},
     miden_execution::MidenExecution,
@@ -23,23 +25,44 @@ use crate::{
 /// Deployment ids + initial pool states handed from the Miden init thread to the server.
 struct InitData {
     pool_states: HashMap<AccountId, PoolState>,
-    pool_id: AccountId,
     vault_id: AccountId,
-    asset0: AccountId,
-    asset1: AccountId,
+    assets: Vec<AssetInfo>,
+    pools: Vec<AccountId>,
+}
+
+fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,minizeke=debug,miden_core=off,log=warn")
+    });
+    let log_dir = env::var("LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("logs"));
+    fs::create_dir_all(&log_dir).unwrap_or_else(|error| {
+        panic!(
+            "failed to create log directory {}: {error}",
+            log_dir.display()
+        )
+    });
+    let file_appender = tracing_appender::rolling::daily(log_dir, "minizeke.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(file_writer),
+        )
+        .init();
+    guard
 }
 
 fn main() {
     dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,minizeke=debug,miden_core=off,log=warn")
-            }),
-        )
-        .with_target(false)
-        .init();
+    let _log_guard = init_tracing();
 
     let message_broker = Arc::new(MessageBroker::new());
     let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
@@ -62,10 +85,9 @@ fn main() {
                 init_tx
                     .send(InitData {
                         pool_states: miden_execution.pool_states(),
-                        pool_id: miden_execution.pool_id(),
                         vault_id: miden_execution.vault_id(),
-                        asset0: miden_execution.asset0(),
-                        asset1: miden_execution.asset1(),
+                        assets: miden_execution.assets(),
+                        pools: miden_execution.pools(),
                     })
                     .unwrap();
 
@@ -94,20 +116,15 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
 
     println!("[INIT] Initializing Store");
     let store = Arc::new(Store::new(
-        init_data.pool_id,
-        init_data.asset0,
-        init_data.asset1,
+        init_data.vault_id,
+        init_data.assets.clone(),
+        init_data.pools.clone(),
         init_data.pool_states.clone(),
     ));
 
     println!("[INIT] Initializing history database");
     let history = Arc::new(HistoryStore::open_from_env()?);
-    start_history_service(
-        history.clone(),
-        message_broker.clone(),
-        init_data.asset0,
-        init_data.asset1,
-    );
+    start_history_service(history.clone(), message_broker.clone());
 
     {
         let store = store.clone();
@@ -132,7 +149,8 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
         });
     }
 
-    let mut oracle_client = OracleSSEClient::new(store.clone(), message_broker.clone());
+    let mut oracle_client =
+        OracleSSEClient::new(store.clone(), message_broker.clone(), &init_data.assets);
     println!("[INIT] Initializing oracle prices");
     oracle_client.init_prices().await?;
 
@@ -140,10 +158,9 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
     let mut processing = Processing::new(
         message_broker.clone(),
         init_data.pool_states.clone(),
-        init_data.pool_id,
         init_data.vault_id,
-        init_data.asset0,
-        init_data.asset1,
+        init_data.assets,
+        init_data.pools,
     )
     .await?;
 

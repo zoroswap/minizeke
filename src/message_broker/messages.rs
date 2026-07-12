@@ -209,7 +209,7 @@ mod tests {
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("OrderUpdate"));
-        assert!(json.contains("executed"));
+        assert!(json.contains("\"status\":\"Executed\""));
         assert!(json.contains("order_id"));
     }
 

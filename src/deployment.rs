@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::miden_env::MidenNetwork;
 
+pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 2;
+
+/// One fungible asset supported by this deployment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetInfo {
+    #[serde(with = "account_id_hex")]
+    pub faucet_id: AccountId,
+    pub symbol: String,
+    pub decimals: u8,
+    pub oracle_feed_id: String,
+}
+
 /// One recorded liquidity seeding deposit (see `deposit_pools` binary).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepositRecord {
@@ -18,15 +30,16 @@ pub struct DepositRecord {
 /// server at startup (attach-only: the server never deploys accounts itself).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deployment {
+    pub schema_version: u32,
     pub network: String,
+    /// Server-controlled account authorized to send vault maintenance notes.
+    #[serde(with = "account_id_hex")]
+    pub operator_account_id: AccountId,
     #[serde(with = "account_id_hex")]
     pub vault_id: AccountId,
-    #[serde(with = "account_id_hex")]
-    pub pool_id: AccountId,
-    #[serde(with = "account_id_hex")]
-    pub asset0: AccountId,
-    #[serde(with = "account_id_hex")]
-    pub asset1: AccountId,
+    pub assets: Vec<AssetInfo>,
+    #[serde(with = "account_id_hex_vec")]
+    pub pools: Vec<AccountId>,
     /// LP account used by `deposit_pools` to seed liquidity.
     #[serde(default, with = "account_id_hex_opt")]
     pub lp_account_id: Option<AccountId>,
@@ -61,7 +74,23 @@ impl Deployment {
                 path.display()
             )
         })?;
-        let deployment: Self = serde_json::from_str(&contents)
+        let value: serde_json::Value = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse deployment file {}", path.display()))?;
+        let schema_version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64);
+        if schema_version != Some(u64::from(DEPLOYMENT_SCHEMA_VERSION)) {
+            return Err(anyhow!(
+                "deployment file {} uses schema version {}; expected {}. Re-run `cargo run --bin \
+                 spawn` to create a new deployment",
+                path.display(),
+                schema_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "1 (legacy/unversioned)".to_string()),
+                DEPLOYMENT_SCHEMA_VERSION
+            ));
+        }
+        let deployment: Self = serde_json::from_value(value)
             .with_context(|| format!("failed to parse deployment file {}", path.display()))?;
 
         let network = MidenNetwork::from_env().as_str();
@@ -72,6 +101,12 @@ impl Deployment {
                 deployment.network,
                 network
             ));
+        }
+        if deployment.assets.len() < 2 {
+            return Err(anyhow!("deployment must contain at least two assets"));
+        }
+        if deployment.pools.is_empty() {
+            return Err(anyhow!("deployment must contain at least one pool"));
         }
         Ok(deployment)
     }
@@ -119,5 +154,26 @@ mod account_id_hex_opt {
         let hex: Option<String> = Option::deserialize(deserializer)?;
         hex.map(|h| AccountId::from_hex(&h).map_err(serde::de::Error::custom))
             .transpose()
+    }
+}
+
+mod account_id_hex_vec {
+    use miden_client::account::AccountId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(ids: &[AccountId], serializer: S) -> Result<S::Ok, S::Error> {
+        ids.iter()
+            .map(|id| id.to_hex())
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<AccountId>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|hex| AccountId::from_hex(&hex).map_err(serde::de::Error::custom))
+            .collect()
     }
 }

@@ -8,7 +8,6 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use dashmap::DashMap;
-use miden_client::account::AccountId;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::Serialize;
 use uuid::Uuid;
@@ -71,6 +70,17 @@ pub struct OrderRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct OrderEventRecord {
+    pub seq: u64,
+    pub order_id: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub amount_out: Option<u64>,
+    pub tx_hash: Option<String>,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AssetVolume {
     pub asset: String,
     pub volume: u64,
@@ -95,8 +105,6 @@ pub struct HistoryStore {
 pub fn start_history_service(
     history: std::sync::Arc<HistoryStore>,
     message_broker: std::sync::Arc<MessageBroker>,
-    asset0: AccountId,
-    asset1: AccountId,
 ) {
     let prices = std::sync::Arc::new(DashMap::<String, u64>::new());
     let mut order_rx = message_broker.subscribe_order_updates();
@@ -111,18 +119,20 @@ pub fn start_history_service(
                 match order_rx.recv().await {
                     Ok(update) => {
                         let snapshot = update.snapshot();
-                        if let Err(error) = history.upsert_order(&update) {
+                        if let Err(error) = history.persist_order_update(&update) {
                             tracing::error!(%error, order_id = %snapshot.id, "failed to persist order");
                             continue;
                         }
                         if snapshot.status == OrderStatus::Processed {
+                            let asset_in = snapshot.details.asset_in;
+                            let asset_out = snapshot.details.asset_out;
                             let oracle_price = prices
-                                .get(&asset0.to_hex())
-                                .zip(prices.get(&asset1.to_hex()))
-                                .and_then(|(price0, price1)| {
-                                    canonical_oracle_price(*price0, *price1)
+                                .get(&asset_in.to_hex())
+                                .zip(prices.get(&asset_out.to_hex()))
+                                .and_then(|(price_in, price_out)| {
+                                    canonical_oracle_price(*price_in, *price_out)
                                 });
-                            match history.record_trade(&snapshot, asset0, asset1, oracle_price) {
+                            match history.record_trade(&snapshot, oracle_price) {
                                 Ok(Some(trade)) => {
                                     let _ = message_broker.broadcast_trade(TradeEvent {
                                         order_id: trade.order_id,
@@ -210,6 +220,18 @@ impl HistoryStore {
             CREATE INDEX IF NOT EXISTS idx_orders_status_updated
                 ON orders(status, last_updated_at DESC);
 
+            CREATE TABLE IF NOT EXISTS order_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                failure_reason TEXT,
+                amount_out INTEGER,
+                tx_hash TEXT,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_order_events_order_seq
+                ON order_events(order_id, seq);
+
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id TEXT NOT NULL UNIQUE,
@@ -263,7 +285,7 @@ impl HistoryStore {
             .map_err(|_| anyhow!("history database lock poisoned"))
     }
 
-    pub fn upsert_order(&self, update: &OrderUpdate) -> Result<()> {
+    pub fn persist_order_update(&self, update: &OrderUpdate) -> Result<()> {
         let snapshot = update.snapshot();
         let failure_reason = snapshot
             .failure_reason
@@ -271,7 +293,9 @@ impl HistoryStore {
             .map(|reason| format!("{reason:?}").to_ascii_lowercase());
         let order_type = format!("{:?}", snapshot.order_type).to_ascii_lowercase();
         let timing = &snapshot.timing;
-        self.connection()?.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             r#"
             INSERT INTO orders (
                 id, user_id, asset_in, amount_in, asset_out, min_amount_out,
@@ -311,32 +335,48 @@ impl HistoryStore {
                 timing.last_updated_at.timestamp_millis(),
             ],
         )?;
+        transaction.execute(
+            r#"
+            INSERT INTO order_events (
+                order_id, status, failure_reason, amount_out, tx_hash, timestamp
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                snapshot.id.to_string(),
+                snapshot.status.as_str(),
+                failure_reason,
+                snapshot
+                    .execution_result
+                    .as_ref()
+                    .map(|result| to_i64(result.amount_out))
+                    .transpose()?,
+                snapshot.tx_hash,
+                timing.last_updated_at.timestamp_millis(),
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn record_trade(
         &self,
         snapshot: &OrderSnapshot,
-        asset0: AccountId,
-        asset1: AccountId,
         oracle_price: Option<u64>,
     ) -> Result<Option<TradeRecord>> {
         let Some(result) = &snapshot.execution_result else {
             return Ok(None);
         };
-        let price = canonical_trade_price(
-            snapshot.details.asset_in,
-            snapshot.details.amount_in,
-            snapshot.details.asset_out,
-            result.amount_out,
-            asset0,
-        )?;
+        let price = directed_trade_price(snapshot.details.amount_in, result.amount_out)?;
         let timestamp = snapshot
             .timing
             .processed
             .unwrap_or(snapshot.timing.last_updated_at)
             .timestamp_millis() as u64;
-        let pair = format!("{}/{}", asset0.to_hex(), asset1.to_hex());
+        let pair = format!(
+            "{}/{}",
+            snapshot.details.asset_in.to_hex(),
+            snapshot.details.asset_out.to_hex()
+        );
         let trade = TradeRecord {
             order_id: snapshot.id.to_string(),
             user_id: snapshot.user_id.to_hex(),
@@ -376,11 +416,7 @@ impl HistoryStore {
             return Ok(None);
         }
 
-        let volume = if snapshot.details.asset_in == asset0 {
-            snapshot.details.amount_in
-        } else {
-            result.amount_out
-        };
+        let volume = snapshot.details.amount_in;
         upsert_all_candles(&connection, "trades", &pair, timestamp, price, volume, 1)?;
         Ok(Some(trade))
     }
@@ -446,20 +482,22 @@ impl HistoryStore {
             .map_err(Into::into)
     }
 
-    pub fn trades(&self, before: Option<u64>, limit: u64) -> Result<Vec<TradeRecord>> {
+    pub fn trades(&self, pair: &str, before: Option<u64>, limit: u64) -> Result<Vec<TradeRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             r#"
             SELECT order_id, user_id, pair, asset_in, asset_out, amount_in,
                    amount_out, price, oracle_price, tx_hash, timestamp
             FROM trades
-            WHERE (?1 IS NULL OR timestamp < ?1)
+            WHERE pair = ?1
+              AND (?2 IS NULL OR timestamp < ?2)
             ORDER BY timestamp DESC
-            LIMIT ?2
+            LIMIT ?3
             "#,
         )?;
         let rows = statement.query_map(
             params![
+                pair,
                 before.map(timestamp_millis).map(to_i64).transpose()?,
                 to_i64(limit)?
             ],
@@ -516,6 +554,21 @@ impl HistoryStore {
                 map_order,
             )
             .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn order_events(&self, id: Uuid) -> Result<Vec<OrderEventRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT seq, order_id, status, failure_reason, amount_out, tx_hash, timestamp
+            FROM order_events
+            WHERE order_id = ?1
+            ORDER BY seq ASC
+            "#,
+        )?;
+        let rows = statement.query_map([id.to_string()], map_order_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
@@ -616,29 +669,14 @@ fn upsert_all_candles(
     Ok(())
 }
 
-fn canonical_trade_price(
-    asset_in: AccountId,
-    amount_in: u64,
-    asset_out: AccountId,
-    amount_out: u64,
-    asset0: AccountId,
-) -> Result<u64> {
+fn directed_trade_price(amount_in: u64, amount_out: u64) -> Result<u64> {
     if amount_in == 0 || amount_out == 0 {
         return Err(anyhow!("cannot calculate price for a zero-sized fill"));
     }
-    let value = if asset_in == asset0 {
-        (amount_out as u128)
-            .checked_mul(PRICE_SCALE)
-            .ok_or_else(|| anyhow!("trade price overflow"))?
-            / amount_in as u128
-    } else if asset_out == asset0 {
-        (amount_in as u128)
-            .checked_mul(PRICE_SCALE)
-            .ok_or_else(|| anyhow!("trade price overflow"))?
-            / amount_out as u128
-    } else {
-        return Err(anyhow!("trade does not contain the canonical base asset"));
-    };
+    let value = (amount_out as u128)
+        .checked_mul(PRICE_SCALE)
+        .ok_or_else(|| anyhow!("trade price overflow"))?
+        / amount_in as u128;
     u64::try_from(value).context("trade price does not fit in u64")
 }
 
@@ -712,6 +750,18 @@ fn map_order(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrderRecord> {
         executed_at: row.get::<_, Option<i64>>(13)?.map(to_u64).transpose()?,
         failed_at: row.get::<_, Option<i64>>(14)?.map(to_u64).transpose()?,
         last_updated_at: to_u64(row.get(15)?)?,
+    })
+}
+
+fn map_order_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrderEventRecord> {
+    Ok(OrderEventRecord {
+        seq: to_u64(row.get(0)?)?,
+        order_id: row.get(1)?,
+        status: row.get(2)?,
+        failure_reason: row.get(3)?,
+        amount_out: row.get::<_, Option<i64>>(4)?.map(to_u64).transpose()?,
+        tx_hash: row.get(5)?,
+        timestamp: to_u64(row.get(6)?)?,
     })
 }
 

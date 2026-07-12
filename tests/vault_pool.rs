@@ -1,12 +1,8 @@
 use alloy_primitives::U256;
 use anyhow::Result;
 use miden_client::{
-    Client,
-    account::AccountId,
-    asset::FungibleAsset,
-    auth::AuthSecretKey,
-    keystore::FilesystemKeyStore,
-    testing::common::wait_for_blocks,
+    Client, account::AccountId, asset::FungibleAsset, auth::AuthSecretKey,
+    keystore::FilesystemKeyStore, testing::common::wait_for_blocks,
     transaction::TransactionRequestBuilder,
 };
 use miden_core::{Felt, Word};
@@ -15,20 +11,24 @@ use minizeke::{
     curve::get_curve_amount_out,
     execution_script::make_exec_script,
     intent::Intent,
-    note::{InitRedeemInstructions, RedeemInstructions, ZekeNote, ZekeNoteInstructions},
+    note::{
+        CheckpointInstructions, InitRedeemInstructions, RedeemInstructions, WithdrawInstructions,
+        ZekeNote, ZekeNoteInstructions,
+    },
     pool::{
-        PoolState, deploy_pool, derive_balance_details, get_user_trades_slot_name,
-        user_trades_from_storage,
+        PoolState, deploy_pool, derive_balance_details, pool_cell_allocation_from_storage,
+        pool_cell_from_storage,
     },
     test_utils::{
         consume_all_notes_for, deposit_liquidity_on_vault, fund_user_on_vault, get_client,
         get_faucet, get_funded_user, get_pool_client, get_user, get_vault, mint_asset_to_user,
-        pool_foreign_account, register_user_on_vault, vault_foreign_account,
+        register_user_on_vault, send_note_to_network, vault_foreign_account,
         withdraw_liquidity_from_vault,
     },
     vault::{
-        checkpoint_lp_entitlement_on_vault, get_vault_lp_info, get_vault_storage,
-        get_vault_user_asset_info, set_pool_account_id_on_vault, vault_user_registration,
+        add_pool_to_vault, checkpoint_lp_entitlement_on_vault, get_user_pool, get_vault_lp_info,
+        get_vault_storage, get_vault_user_asset_info, user_pool_from_storage,
+        vault_user_registration,
     },
 };
 use tracing::info;
@@ -75,21 +75,19 @@ async fn submit_swap(
 fn signed_intent(
     user_id: AccountId,
     trading_key: &AuthSecretKey,
-    user_index: u16,
-    sell_idx: u64,
+    sell_asset: AccountId,
     sell_amount: u64,
-    buy_idx: u64,
+    buy_asset: AccountId,
     buy_amount: u64,
 ) -> (Intent, Vec<Felt>) {
-    let user_key_slot = get_user_trades_slot_name(user_index);
     let intent = Intent {
         user_suffix: user_id.suffix().as_canonical_u64(),
         user_prefix: user_id.prefix().as_u64(),
-        user_key_prefix: user_key_slot.id().prefix().as_canonical_u64(),
-        user_key_suffix: user_key_slot.id().suffix().as_canonical_u64(),
-        sell_idx,
-        buy_idx,
+        sell_asset_suffix: sell_asset.suffix().as_canonical_u64(),
+        sell_asset_prefix: sell_asset.prefix().as_u64(),
         sell_amount,
+        buy_asset_suffix: buy_asset.suffix().as_canonical_u64(),
+        buy_asset_prefix: buy_asset.prefix().as_u64(),
         buy_amount,
     };
     let msg = intent.message_word();
@@ -177,12 +175,12 @@ async fn test_swap_minimal() -> Result<()> {
     let mut client = get_client().await?;
     let mut pool_client = get_pool_client().await?;
 
-    let vault_id = get_vault(&mut client).await?;
+    let (vault_id, operator_id) = get_vault(&mut client).await?;
     let (user_id, asset0) = get_funded_user(&mut client).await?;
-    let asset1 = get_faucet(&mut client, "TSTB").await?;
-    let pool = deploy_pool(&mut pool_client, vault_id, asset0, asset1).await?;
+    let asset1 = get_faucet(&mut client, "TSTB", 8, 10_000_000_000).await?;
+    let pool = deploy_pool(&mut pool_client, vault_id).await?;
     let pool_id = pool.id();
-    set_pool_account_id_on_vault(&mut client, vault_id, pool_id).await?;
+    add_pool_to_vault(&mut client, operator_id, vault_id, pool_id).await?;
 
     let trading_key = AuthSecretKey::new_ecdsa_k256_keccak();
     let pk_comm: Word = trading_key.public_key().to_commitment().into();
@@ -196,7 +194,7 @@ async fn test_swap_minimal() -> Result<()> {
     )
     .await?;
 
-    let (intent, advice) = signed_intent(user_id, &trading_key, 0, 0, 10, 1, 7);
+    let (intent, advice) = signed_intent(user_id, &trading_key, asset0, 10, asset1, 7);
     submit_swap(
         &mut pool_client,
         pool_id,
@@ -208,9 +206,169 @@ async fn test_swap_minimal() -> Result<()> {
     .await?;
 
     let pool_account = pool_client.try_get_account(pool_id).await?;
-    let trades = user_trades_from_storage(pool_account.storage(), 0)?;
-    assert_eq!(trades.sold, [10, 0]);
-    assert_eq!(trades.bought, [0, 7]);
+    let asset0_cell = pool_cell_from_storage(pool_account.storage(), asset0, user_id)?;
+    let asset1_cell = pool_cell_from_storage(pool_account.storage(), asset1, user_id)?;
+    assert_eq!(asset0_cell.sold, 10);
+    assert_eq!(asset0_cell.bought, 0);
+    assert_eq!(asset1_cell.sold, 0);
+    assert_eq!(asset1_cell.bought, 7);
+    Ok(())
+}
+
+/// Exercises N-asset accounting across two independently authorized pool shards.
+#[tokio::test]
+async fn test_three_assets_two_shards_e2e() -> Result<()> {
+    let _ = tracing_subscriber::fmt().try_init();
+    let mut client = get_client().await?;
+    let mut pool_client = get_pool_client().await?;
+
+    let (vault_id, operator_id) = get_vault(&mut client).await?;
+    let (user1_id, asset0) = get_funded_user(&mut client).await?;
+    let asset1 = get_faucet(&mut client, "SHB1", 8, 10_000_000_000).await?;
+    let asset2 = get_faucet(&mut client, "SHC2", 8, 10_000_000_000).await?;
+
+    let shard1_id = deploy_pool(&mut pool_client, vault_id).await?.id();
+    let shard2_id = deploy_pool(&mut pool_client, vault_id).await?.id();
+
+    // The active pool at registration time determines the user's permanent shard.
+    add_pool_to_vault(&mut client, operator_id, vault_id, shard1_id).await?;
+    let user1_key = AuthSecretKey::new_ecdsa_k256_keccak();
+    register_user_on_vault(
+        &mut client,
+        vault_id,
+        user1_id,
+        user1_key.public_key().to_commitment().into(),
+    )
+    .await?;
+    let user1_wallet_before = client.account_reader(user1_id).get_balance(asset0).await?;
+    fund_user_on_vault(
+        &mut client,
+        vault_id,
+        user1_id,
+        FungibleAsset::new(asset0, FUND_AMOUNT)?,
+    )
+    .await?;
+
+    add_pool_to_vault(&mut client, operator_id, vault_id, shard2_id).await?;
+    let user2_id = get_user(&mut client).await?;
+    let user2_key = AuthSecretKey::new_ecdsa_k256_keccak();
+    register_user_on_vault(
+        &mut client,
+        vault_id,
+        user2_id,
+        user2_key.public_key().to_commitment().into(),
+    )
+    .await?;
+    mint_asset_to_user(&mut client, asset2, user2_id, FUND_AMOUNT).await?;
+    fund_user_on_vault(
+        &mut client,
+        vault_id,
+        user2_id,
+        FungibleAsset::new(asset2, FUND_AMOUNT)?,
+    )
+    .await?;
+
+    assert_eq!(
+        get_user_pool(&client, vault_id, user1_id).await?,
+        Some(shard1_id)
+    );
+    assert_eq!(
+        get_user_pool(&client, vault_id, user2_id).await?,
+        Some(shard2_id)
+    );
+
+    // Funding is vault-only: no pool cells exist until a swap first touches each key.
+    for (shard_id, user_id, sell_asset, buy_asset) in [
+        (shard1_id, user1_id, asset0, asset1),
+        (shard2_id, user2_id, asset2, asset0),
+    ] {
+        let pool = pool_client.try_get_account(shard_id).await?;
+        assert!(pool_cell_allocation_from_storage(pool.storage(), sell_asset, user_id)?.is_none());
+        assert!(pool_cell_allocation_from_storage(pool.storage(), buy_asset, user_id)?.is_none());
+    }
+
+    let (intent1, advice1) = signed_intent(user1_id, &user1_key, asset0, 11, asset1, 7);
+    submit_swap(
+        &mut pool_client,
+        shard1_id,
+        vault_id,
+        vec![intent1],
+        advice1,
+        &[(asset0, user1_id)],
+    )
+    .await?;
+    let (intent2, advice2) = signed_intent(user2_id, &user2_key, asset2, 13, asset0, 5);
+    submit_swap(
+        &mut pool_client,
+        shard2_id,
+        vault_id,
+        vec![intent2],
+        advice2,
+        &[(asset2, user2_id)],
+    )
+    .await?;
+
+    let shard1 = pool_client.try_get_account(shard1_id).await?;
+    let user1_sell = pool_cell_from_storage(shard1.storage(), asset0, user1_id)?;
+    let user1_buy = pool_cell_from_storage(shard1.storage(), asset1, user1_id)?;
+    assert_eq!((user1_sell.bought, user1_sell.sold), (0, 11));
+    assert_eq!((user1_buy.bought, user1_buy.sold), (7, 0));
+    assert!(
+        pool_cell_allocation_from_storage(shard1.storage(), asset2, user2_id)?.is_none(),
+        "the other shard's trader must not allocate a cell here"
+    );
+
+    let shard2 = pool_client.try_get_account(shard2_id).await?;
+    let user2_sell = pool_cell_from_storage(shard2.storage(), asset2, user2_id)?;
+    let user2_buy = pool_cell_from_storage(shard2.storage(), asset0, user2_id)?;
+    assert_eq!((user2_sell.bought, user2_sell.sold), (0, 13));
+    assert_eq!((user2_buy.bought, user2_buy.sold), (5, 0));
+    assert!(
+        pool_cell_allocation_from_storage(shard2.storage(), asset0, user1_id)?.is_none(),
+        "the other shard's trader must not allocate a cell here"
+    );
+
+    let user1_vault = get_vault_user_asset_info(&client, vault_id, asset0, user1_id).await?;
+    let user2_vault = get_vault_user_asset_info(&client, vault_id, asset2, user2_id).await?;
+    assert_eq!(
+        derive_balance_details(&user1_vault, user1_sell.bought, user1_sell.sold),
+        (FUND_AMOUNT - 11, FUND_AMOUNT - 11)
+    );
+    assert_eq!(
+        derive_balance_details(&user2_vault, user2_sell.bought, user2_sell.sold),
+        (FUND_AMOUNT - 13, FUND_AMOUNT - 13)
+    );
+
+    // Complete one redeem path to prove shard-local counters feed vault availability.
+    let redeem_amount = FUND_AMOUNT - 11;
+    let init_redeem = ZekeNote::new(
+        ZekeNoteInstructions::InitRedeem(InitRedeemInstructions {
+            user_id: user1_id,
+            vault_id,
+            min_expected_asset: FungibleAsset::new(asset0, redeem_amount)?,
+        }),
+        client.code_builder(),
+    )?;
+    send_note_to_network(&mut client, &init_redeem, user1_id).await?;
+    let redeem = ZekeNote::new(
+        ZekeNoteInstructions::Redeem(RedeemInstructions {
+            user_id: user1_id,
+            vault_id,
+            min_expected_asset: FungibleAsset::new(asset0, redeem_amount)?,
+        }),
+        client.code_builder(),
+    )?;
+    send_note_to_network(&mut client, &redeem, user1_id).await?;
+    consume_all_notes_for(&mut client, user1_id).await?;
+
+    let user1_vault = get_vault_user_asset_info(&client, vault_id, asset0, user1_id).await?;
+    assert_eq!(user1_vault.total_redeems, redeem_amount);
+    assert_eq!(user1_vault.pending_redeem(), 0);
+    assert_eq!(
+        client.account_reader(user1_id).get_balance(asset0).await?,
+        user1_wallet_before - FUND_AMOUNT + redeem_amount
+    );
+
     Ok(())
 }
 
@@ -226,16 +384,16 @@ async fn test_vault_pool_e2e() -> Result<()> {
     // SETUP: vault, assets, pool, cross-wiring
     // ------------------------------------------------------------------------------------------
     info!("[TEST] deploying vault");
-    let vault_id = get_vault(&mut client).await?;
+    let (vault_id, operator_id) = get_vault(&mut client).await?;
 
     info!("[TEST] creating funded user (asset0 faucet)");
     let (user_id, asset0) = get_funded_user(&mut client).await?;
-    let asset1 = get_faucet(&mut client, "TSTB").await?;
+    let asset1 = get_faucet(&mut client, "TSTB", 8, 10_000_000_000).await?;
 
     info!("[TEST] deploying pool");
-    let pool = deploy_pool(&mut pool_client, vault_id, asset0, asset1).await?;
+    let pool = deploy_pool(&mut pool_client, vault_id).await?;
     let pool_id = pool.id();
-    set_pool_account_id_on_vault(&mut client, vault_id, pool_id).await?;
+    add_pool_to_vault(&mut client, operator_id, vault_id, pool_id).await?;
 
     // ------------------------------------------------------------------------------------------
     // REGISTER
@@ -246,10 +404,13 @@ async fn test_vault_pool_e2e() -> Result<()> {
     register_user_on_vault(&mut client, vault_id, user_id, pk_comm).await?;
 
     let vault_storage = get_vault_storage(&client, vault_id).await?;
-    let (user_index, registered_pk) =
+    let registered_pk =
         vault_user_registration(&vault_storage, user_id)?.expect("user should be registered");
-    assert_eq!(user_index, 0);
     assert_eq!(registered_pk, pk_comm);
+    assert_eq!(
+        user_pool_from_storage(&vault_storage, user_id)?,
+        Some(pool_id)
+    );
 
     // double registration must fail
     info!("[TEST] negative: double registration");
@@ -276,7 +437,7 @@ async fn test_vault_pool_e2e() -> Result<()> {
     // SWAP: sell 10 asset0 for 7 asset1
     // ------------------------------------------------------------------------------------------
     info!("[TEST] executing swap batch");
-    let (intent, advice) = signed_intent(user_id, &trading_key, 0, 0, 10, 1, 7);
+    let (intent, advice) = signed_intent(user_id, &trading_key, asset0, 10, asset1, 7);
     submit_swap(
         &mut pool_client,
         pool_id,
@@ -288,12 +449,16 @@ async fn test_vault_pool_e2e() -> Result<()> {
     .await?;
 
     let pool_account = pool_client.try_get_account(pool_id).await?;
-    let trades = user_trades_from_storage(pool_account.storage(), 0)?;
-    assert_eq!(trades.sold, [10, 0]);
-    assert_eq!(trades.bought, [0, 7]);
+    let asset0_cell = pool_cell_from_storage(pool_account.storage(), asset0, user_id)?;
+    let asset1_cell = pool_cell_from_storage(pool_account.storage(), asset1, user_id)?;
+    assert_eq!(asset0_cell.sold, 10);
+    assert_eq!(asset0_cell.bought, 0);
+    assert_eq!(asset1_cell.sold, 0);
+    assert_eq!(asset1_cell.bought, 7);
 
     let vault_info = get_vault_user_asset_info(&client, vault_id, asset0, user_id).await?;
-    let (balance0, available0) = derive_balance_details(&vault_info, trades.bought[0], trades.sold[0]);
+    let (balance0, available0) =
+        derive_balance_details(&vault_info, asset0_cell.bought, asset0_cell.sold);
     assert_eq!(balance0, FUND_AMOUNT - 10);
     assert_eq!(available0, FUND_AMOUNT - 10);
 
@@ -301,7 +466,8 @@ async fn test_vault_pool_e2e() -> Result<()> {
     // NEGATIVE: swap above available
     // ------------------------------------------------------------------------------------------
     info!("[TEST] negative: swap above available");
-    let (intent, advice) = signed_intent(user_id, &trading_key, 0, 0, FUND_AMOUNT * 10, 1, 1);
+    let (intent, advice) =
+        signed_intent(user_id, &trading_key, asset0, FUND_AMOUNT * 10, asset1, 1);
     let result = submit_swap(
         &mut pool_client,
         pool_id,
@@ -319,7 +485,7 @@ async fn test_vault_pool_e2e() -> Result<()> {
     info!("[TEST] negative: unregistered user swap");
     let stranger_id = get_user(&mut client).await?;
     let stranger_key = AuthSecretKey::new_ecdsa_k256_keccak();
-    let (intent, advice) = signed_intent(stranger_id, &stranger_key, 1, 0, 1, 1, 1);
+    let (intent, advice) = signed_intent(stranger_id, &stranger_key, asset0, 1, asset1, 1);
     let result = submit_swap(
         &mut pool_client,
         pool_id,
@@ -348,14 +514,13 @@ async fn test_vault_pool_e2e() -> Result<()> {
         .build()?;
     client.submit_new_transaction(user_id, tx_req).await?;
     client.sync_state().await?;
-    wait_for_blocks(&mut client, 2).await;
-
-    let tx_req = TransactionRequestBuilder::new()
-        .input_notes(vec![(over_redeem_note.note().clone(), None)])
-        .foreign_accounts(vec![pool_foreign_account(pool_id, 0)?])
-        .build()?;
-    let result = client.submit_new_transaction(vault_id, tx_req).await;
-    assert!(result.is_err(), "init_redeem above available should fail");
+    wait_for_blocks(&mut client, 3).await;
+    client.sync_state().await?;
+    let vault_info = get_vault_user_asset_info(&client, vault_id, asset0, user_id).await?;
+    assert_eq!(
+        vault_info.total_initiated_redeems, 0,
+        "network builder must reject init_redeem above available"
+    );
 
     // ------------------------------------------------------------------------------------------
     // INIT_REDEEM the full available amount
@@ -370,20 +535,7 @@ async fn test_vault_pool_e2e() -> Result<()> {
         }),
         client.code_builder(),
     )?;
-    let tx_req = TransactionRequestBuilder::new()
-        .own_output_notes(vec![init_redeem_note.note().clone()])
-        .build()?;
-    client.submit_new_transaction(user_id, tx_req).await?;
-    client.sync_state().await?;
-    wait_for_blocks(&mut client, 2).await;
-
-    let tx_req = TransactionRequestBuilder::new()
-        .input_notes(vec![(init_redeem_note.note().clone(), None)])
-        .foreign_accounts(vec![pool_foreign_account(pool_id, 0)?])
-        .build()?;
-    client.submit_new_transaction(vault_id, tx_req).await?;
-    client.sync_state().await?;
-    wait_for_blocks(&mut client, 1).await;
+    send_note_to_network(&mut client, &init_redeem_note, user_id).await?;
 
     let vault_info = get_vault_user_asset_info(&client, vault_id, asset0, user_id).await?;
     assert_eq!(vault_info.total_initiated_redeems, redeem_amount);
@@ -391,7 +543,7 @@ async fn test_vault_pool_e2e() -> Result<()> {
 
     // pending funds are locked: available is now 0, so even a 1-token swap must fail
     info!("[TEST] negative: swap with pending redeem locking the balance");
-    let (intent, advice) = signed_intent(user_id, &trading_key, 0, 0, 1, 1, 1);
+    let (intent, advice) = signed_intent(user_id, &trading_key, asset0, 1, asset1, 1);
     let result = submit_swap(
         &mut pool_client,
         pool_id,
@@ -401,7 +553,10 @@ async fn test_vault_pool_e2e() -> Result<()> {
         &[(asset0, user_id)],
     )
     .await;
-    assert!(result.is_err(), "swap while balance is pending-locked should fail");
+    assert!(
+        result.is_err(),
+        "swap while balance is pending-locked should fail"
+    );
 
     // ------------------------------------------------------------------------------------------
     // REDEEM
@@ -415,20 +570,7 @@ async fn test_vault_pool_e2e() -> Result<()> {
         }),
         client.code_builder(),
     )?;
-    let tx_req = TransactionRequestBuilder::new()
-        .own_output_notes(vec![redeem_note.note().clone()])
-        .build()?;
-    client.submit_new_transaction(user_id, tx_req).await?;
-    client.sync_state().await?;
-    wait_for_blocks(&mut client, 2).await;
-
-    let tx_req = TransactionRequestBuilder::new()
-        .input_notes(vec![(redeem_note.note().clone(), None)])
-        .foreign_accounts(vec![pool_foreign_account(pool_id, 0)?])
-        .build()?;
-    client.submit_new_transaction(vault_id, tx_req).await?;
-    client.sync_state().await?;
-    wait_for_blocks(&mut client, 1).await;
+    send_note_to_network(&mut client, &redeem_note, user_id).await?;
 
     let vault_info = get_vault_user_asset_info(&client, vault_id, asset0, user_id).await?;
     assert_eq!(vault_info.total_redeems, redeem_amount);
@@ -451,14 +593,13 @@ async fn test_vault_pool_e2e() -> Result<()> {
         .build()?;
     client.submit_new_transaction(user_id, tx_req).await?;
     client.sync_state().await?;
-    wait_for_blocks(&mut client, 2).await;
-
-    let tx_req = TransactionRequestBuilder::new()
-        .input_notes(vec![(over_redeem_note.note().clone(), None)])
-        .foreign_accounts(vec![pool_foreign_account(pool_id, 0)?])
-        .build()?;
-    let result = client.submit_new_transaction(vault_id, tx_req).await;
-    assert!(result.is_err(), "redeem above pending should fail");
+    wait_for_blocks(&mut client, 3).await;
+    client.sync_state().await?;
+    let vault_info = get_vault_user_asset_info(&client, vault_id, asset0, user_id).await?;
+    assert_eq!(
+        vault_info.total_redeems, redeem_amount,
+        "network builder must reject redeem above pending"
+    );
 
     // ------------------------------------------------------------------------------------------
     // FINAL: the user consumes the P2ID payout
@@ -493,12 +634,12 @@ async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
     // SETUP: vault, assets, pool, LP account
     // ------------------------------------------------------------------------------------------
     info!("[TEST] deploying vault + faucets + pool");
-    let vault_id = get_vault(&mut client).await?;
+    let (vault_id, operator_id) = get_vault(&mut client).await?;
     let (lp_id, asset0) = get_funded_user(&mut client).await?;
-    let asset1 = get_faucet(&mut client, "TSTB").await?;
-    let pool = deploy_pool(&mut pool_client, vault_id, asset0, asset1).await?;
+    let asset1 = get_faucet(&mut client, "TSTB", 8, 10_000_000_000).await?;
+    let pool = deploy_pool(&mut pool_client, vault_id).await?;
     let pool_id = pool.id();
-    set_pool_account_id_on_vault(&mut client, vault_id, pool_id).await?;
+    add_pool_to_vault(&mut client, operator_id, vault_id, pool_id).await?;
 
     mint_asset_to_user(&mut client, asset0, lp_id, DEPOSIT_AMOUNT).await?;
     mint_asset_to_user(&mut client, asset1, lp_id, DEPOSIT_AMOUNT).await?;
@@ -539,14 +680,25 @@ async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
     // NEGATIVE: withdraw above entitlement
     // ------------------------------------------------------------------------------------------
     info!("[TEST] negative: withdraw above entitlement");
-    let result = withdraw_liquidity_from_vault(
-        &mut client,
-        vault_id,
-        lp_id,
-        FungibleAsset::new(asset0, DEPOSIT_AMOUNT + 1)?,
-    )
-    .await;
-    assert!(result.is_err(), "withdraw above entitlement should fail");
+    let over_withdraw_note = ZekeNote::new(
+        ZekeNoteInstructions::Withdraw(WithdrawInstructions {
+            lp_id,
+            vault_id,
+            asset_out: FungibleAsset::new(asset0, DEPOSIT_AMOUNT + 1)?,
+        }),
+        client.code_builder(),
+    )?;
+    let tx_req = TransactionRequestBuilder::new()
+        .own_output_notes(vec![over_withdraw_note.note().clone()])
+        .build()?;
+    client.submit_new_transaction(lp_id, tx_req).await?;
+    wait_for_blocks(&mut client, 3).await;
+    client.sync_state().await?;
+    let lp_info = get_vault_lp_info(&client, vault_id, asset0, lp_id).await?;
+    assert_eq!(
+        lp_info.withdrawn, 0,
+        "network builder must reject over-withdrawal"
+    );
 
     // ------------------------------------------------------------------------------------------
     // WITHDRAW part of the principal (self-custodial: no operator involvement)
@@ -574,22 +726,32 @@ async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
     // CHECKPOINT: operator raises the entitlement with accrued fees
     // ------------------------------------------------------------------------------------------
     info!("[TEST] negative: checkpoint below current entitlement");
-    let result = checkpoint_lp_entitlement_on_vault(
-        &mut client,
-        vault_id,
-        asset0,
-        lp_id,
-        DEPOSIT_AMOUNT - 1,
-    )
-    .await;
-    assert!(
-        result.is_err(),
-        "decreasing entitlement checkpoint should fail"
+    let decreasing_checkpoint = ZekeNote::new(
+        ZekeNoteInstructions::Checkpoint(CheckpointInstructions {
+            operator_id,
+            vault_id,
+            asset_id: asset0,
+            lp_id,
+            new_entitlement: DEPOSIT_AMOUNT - 1,
+        }),
+        client.code_builder(),
+    )?;
+    let tx_req = TransactionRequestBuilder::new()
+        .own_output_notes(vec![decreasing_checkpoint.note().clone()])
+        .build()?;
+    client.submit_new_transaction(operator_id, tx_req).await?;
+    wait_for_blocks(&mut client, 3).await;
+    client.sync_state().await?;
+    let lp_info = get_vault_lp_info(&client, vault_id, asset0, lp_id).await?;
+    assert_eq!(
+        lp_info.entitlement, DEPOSIT_AMOUNT,
+        "network builder must reject a decreasing checkpoint"
     );
 
     info!("[TEST] checkpointing entitlement with {ACCRUED_FEES} accrued fees");
     checkpoint_lp_entitlement_on_vault(
         &mut client,
+        operator_id,
         vault_id,
         asset0,
         lp_id,
@@ -643,14 +805,12 @@ async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
     pool_state1.update_balances(new_balances1);
 
     info!("[TEST] executing curve-quoted swap");
-    // the LP never registers (deposits don't need it), so the trader gets index 0
     let (intent, advice) = signed_intent(
         trader_id,
         &trading_key,
-        0,
-        0,
+        asset0,
         swap_amount_in,
-        1,
+        asset1,
         amount_out_u64,
     );
     submit_swap(
@@ -664,9 +824,12 @@ async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
     .await?;
 
     let pool_account = pool_client.try_get_account(pool_id).await?;
-    let trades = user_trades_from_storage(pool_account.storage(), 0)?;
-    assert_eq!(trades.sold, [swap_amount_in, 0]);
-    assert_eq!(trades.bought, [0, amount_out_u64]);
+    let asset0_cell = pool_cell_from_storage(pool_account.storage(), asset0, trader_id)?;
+    let asset1_cell = pool_cell_from_storage(pool_account.storage(), asset1, trader_id)?;
+    assert_eq!(asset0_cell.sold, swap_amount_in);
+    assert_eq!(asset0_cell.bought, 0);
+    assert_eq!(asset1_cell.sold, 0);
+    assert_eq!(asset1_cell.bought, amount_out_u64);
 
     // ------------------------------------------------------------------------------------------
     // FINAL WITHDRAW: the fee-covered remainder is self-custodially withdrawable

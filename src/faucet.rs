@@ -52,7 +52,7 @@ pub struct MintResponse {
 
 struct FaucetWorker {
     client: Client<FilesystemKeyStore>,
-    supported_faucets: [AccountId; 2],
+    supported_faucets: Vec<AccountId>,
     mint_amount: u64,
     cooldown: Duration,
     last_mint: HashMap<(AccountId, AccountId), tokio::time::Instant>,
@@ -71,7 +71,7 @@ pub struct FaucetService {
     commands: mpsc::Sender<FaucetCommand>,
 }
 
-/// Creates the independent faucet service state and imports only the two faucet accounts
+/// Creates the independent faucet service state and imports all faucet accounts
 /// in the active deployment. The `spawn` deployment must have written their keys into
 /// `./keystore`.
 pub async fn initialize() -> Result<FaucetService> {
@@ -123,19 +123,22 @@ impl FaucetWorker {
         let mut client = get_faucet_client().await?;
         client.ensure_genesis_in_place().await?;
         client.sync_state().await?;
-        client.import_account_by_id(deployment.asset0).await?;
-        client.import_account_by_id(deployment.asset1).await?;
+        let supported_faucets: Vec<_> = deployment
+            .assets
+            .iter()
+            .map(|asset| asset.faucet_id)
+            .collect();
+        for faucet_id in &supported_faucets {
+            client.import_account_by_id(*faucet_id).await?;
+        }
         client.sync_state().await?;
         info!(
-            asset0 = %deployment.asset0.to_hex(),
-            asset1 = %deployment.asset1.to_hex(),
-            mint_amount,
-            cooldown_secs,
-            "Standalone faucet service initialized"
+            assets = supported_faucets.len(),
+            mint_amount, cooldown_secs, "Standalone faucet service initialized"
         );
         Ok(Self {
             client,
-            supported_faucets: [deployment.asset0, deployment.asset1],
+            supported_faucets,
             mint_amount,
             cooldown: Duration::from_secs(cooldown_secs),
             last_mint: HashMap::new(),

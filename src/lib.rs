@@ -1,5 +1,6 @@
 pub mod api;
 pub mod assembly_utils;
+pub mod asset_config;
 pub mod asset_utils;
 pub mod curve;
 pub mod deployment;

@@ -96,17 +96,19 @@ async fn handle_client_message(msg: ClientMessage, conn_id: Uuid, state: &AppSta
             for channel in channels {
                 debug!(conn_id = %conn_id, channel = ?channel, "Subscribing to channel");
                 state.connection_manager.subscribe(conn_id, channel.clone());
-                state
-                    .connection_manager
-                    .send_to_connection(conn_id, ServerMessage::Subscribed { channel: channel.clone() });
+                state.connection_manager.send_to_connection(
+                    conn_id,
+                    ServerMessage::Subscribed {
+                        channel: channel.clone(),
+                    },
+                );
 
                 if matches!(channel, SubscriptionChannel::Stats) {
                     let stats = state.store.order_stats();
                     let timestamp = chrono::Utc::now().timestamp_millis() as u64;
-                    state.connection_manager.send_to_connection(
-                        conn_id,
-                        ServerMessage::stats_update(stats, timestamp),
-                    );
+                    state
+                        .connection_manager
+                        .send_to_connection(conn_id, ServerMessage::stats_update(stats, timestamp));
                 }
             }
         }

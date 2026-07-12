@@ -1,5 +1,5 @@
-//! One-time deployment script: deploys the vault, the two pool faucets and the pool
-//! account, wires the pool id into the vault, and writes `deployment.{network}.json`
+//! One-time deployment script: deploys asset faucets, the vault and its first pool shard,
+//! authorizes the shard, and writes `deployment.{network}.json`
 //! for the server to attach to. Run once per environment:
 //!
 //! ```sh
@@ -7,16 +7,18 @@
 //! SPAWN_FORCE=1 cargo run --bin spawn   # redeploy and overwrite the file
 //! ```
 
-use std::env;
+use std::{collections::HashSet, env};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use dotenv::dotenv;
 use minizeke::{
-    deployment::Deployment,
+    asset_config::load_asset_configs,
+    deployment::{AssetInfo, DEPLOYMENT_SCHEMA_VERSION, Deployment},
     miden_env::MidenNetwork,
+    oracle_sse::{fetch_price_feeds, oracle_base_url, resolve_feed_id},
     pool::deploy_pool,
-    test_utils::{get_client, get_faucet, get_pool_client},
-    vault::{deploy_vault, set_pool_account_id_on_vault},
+    test_utils::{get_client, get_faucet, get_operator, get_pool_client},
+    vault::{add_pool_to_vault, deploy_vault},
 };
 
 #[tokio::main]
@@ -40,6 +42,18 @@ async fn main() -> Result<()> {
     }
 
     let network = MidenNetwork::from_env();
+    let asset_configs = load_asset_configs()?;
+    let oracle_url = oracle_base_url()?;
+    let price_feeds = fetch_price_feeds(&oracle_url).await?;
+    let mut feed_ids = HashSet::with_capacity(asset_configs.len());
+    let mut resolved_assets = Vec::with_capacity(asset_configs.len());
+    for config in asset_configs {
+        let oracle_feed_id = resolve_feed_id(&price_feeds, &config.symbol)?;
+        if !feed_ids.insert(oracle_feed_id.clone()) {
+            bail!("multiple configured assets resolve to oracle feed {oracle_feed_id}");
+        }
+        resolved_assets.push((config, oracle_feed_id));
+    }
     println!("[SPAWN] network: {}", network.as_str());
 
     let mut client = get_client().await?;
@@ -50,26 +64,38 @@ async fn main() -> Result<()> {
     pool_client.ensure_genesis_in_place().await?;
     pool_client.sync_state().await?;
 
-    println!("[SPAWN] deploying vault");
-    let vault = deploy_vault(&mut client).await?;
+    println!("[SPAWN] deploying operator");
+    let operator_id = get_operator(&mut client).await?;
+    println!("[SPAWN] operator: {}", operator_id.to_hex());
+
+    let mut assets = Vec::with_capacity(resolved_assets.len());
+    for (config, oracle_feed_id) in resolved_assets {
+        println!("[SPAWN] deploying faucet {}", config.symbol);
+        let faucet_id = get_faucet(
+            &mut client,
+            &config.symbol,
+            config.decimals,
+            config.max_supply,
+        )
+        .await?;
+        println!("[SPAWN] faucet {}: {}", config.symbol, faucet_id.to_hex());
+        assets.push(AssetInfo {
+            faucet_id,
+            symbol: config.symbol,
+            decimals: config.decimals,
+            oracle_feed_id,
+        });
+    }
+
+    println!("[SPAWN] deploying network vault");
+    let vault = deploy_vault(&mut client, operator_id).await?;
     let vault_id = vault.id();
     println!("[SPAWN] vault: {}", vault_id.to_hex());
 
-    let symbol0 = env::var("ASSET0_SYMBOL").unwrap_or_else(|_| "ASTA".to_string());
-    let symbol1 = env::var("ASSET1_SYMBOL").unwrap_or_else(|_| "ASTB".to_string());
-    println!("[SPAWN] deploying faucets {symbol0} / {symbol1}");
-    let asset0 = get_faucet(&mut client, &symbol0).await?;
-    let asset1 = get_faucet(&mut client, &symbol1).await?;
-    println!(
-        "[SPAWN] asset0: {} asset1: {}",
-        asset0.to_hex(),
-        asset1.to_hex()
-    );
-
     // deployed from the pool client so the vault stays untracked in the store that
     // submits the FPI swap txs (see get_pool_client docs)
-    println!("[SPAWN] deploying pool");
-    let pool = deploy_pool(&mut pool_client, vault_id, asset0, asset1).await?;
+    println!("[SPAWN] deploying pool shard");
+    let pool = deploy_pool(&mut pool_client, vault_id).await?;
     let pool_id = pool.id();
     println!(
         "[SPAWN] pool: {} ({})",
@@ -77,15 +103,16 @@ async fn main() -> Result<()> {
         pool_id.to_bech32(network.endpoint().to_network_id())
     );
 
-    println!("[SPAWN] wiring pool id into the vault");
-    set_pool_account_id_on_vault(&mut client, vault_id, pool_id).await?;
+    println!("[SPAWN] authorizing pool shard");
+    add_pool_to_vault(&mut client, operator_id, vault_id, pool_id).await?;
 
     let deployment = Deployment {
+        schema_version: DEPLOYMENT_SCHEMA_VERSION,
         network: network.as_str().to_string(),
+        operator_account_id: operator_id,
         vault_id,
-        pool_id,
-        asset0,
-        asset1,
+        assets,
+        pools: vec![pool_id],
         lp_account_id: None,
         deposits: Vec::new(),
     };

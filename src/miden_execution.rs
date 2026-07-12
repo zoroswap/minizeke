@@ -12,24 +12,31 @@ use miden_client::{
 };
 use miden_core::{Felt, Word};
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use alloy_primitives::U256;
 
 use crate::{
     assembly_utils::{link_math, link_operator, link_pool},
-    deployment::Deployment,
+    deployment::{AssetInfo, Deployment},
     execution_script::make_exec_script,
     intent::Intent,
     message_broker::message_broker::{AmmEvent, MessageBroker, PoolStateEvent},
     miden_env::MidenNetwork,
+    oracle_sse::{fetch_price_feeds, oracle_base_url, validate_asset_feeds},
     order::{Order, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{LpLedger, PoolState, fetch_account_storage_from_rpc, get_user_trades_slot_name},
+    pool::{
+        LpLedger, PoolBalances, PoolMetadata, PoolSettings, PoolState,
+        fetch_account_storage_from_rpc,
+    },
     test_utils::{
         consume_all_notes_for, deposit_liquidity_on_vault, get_client, get_pool_client,
         vault_foreign_account, withdraw_liquidity_from_vault,
     },
-    vault::{checkpoint_lp_entitlement_on_vault, get_vault_lp_info, vault_user_registration},
+    vault::{
+        checkpoint_lp_entitlement_on_vault, get_vault_lp_info, user_pool_from_storage,
+        vault_user_registration,
+    },
 };
 
 /// How often the operator checkpoints LP entitlements on the vault (fees accrued since the
@@ -47,14 +54,13 @@ pub struct MidenExecution {
     message_broker: Arc<MessageBroker>,
     prover_timeout: Duration,
     cycle: u64,
-    asset0: AccountId,
-    asset1: AccountId,
-    pool_id: AccountId,
+    assets: Vec<AssetInfo>,
+    pools: Vec<AccountId>,
     vault_id: AccountId,
+    operator_id: AccountId,
     orders: Orders,
-    /// Vault-assigned user index per trader, filled lazily from the vault's registration
-    /// map (orders arrive fully signed; the server never holds user keys).
-    user_indices: HashMap<AccountId, u16>,
+    /// Vault-assigned pool shard per trader, filled lazily from vault storage.
+    user_pools: HashMap<AccountId, AccountId>,
     pool_states: HashMap<AccountId, PoolState>,
     /// Per-depositor LP shares, server-side only. On-chain the vault keeps entitlement /
     /// withdrawn counters per (asset, lp) so withdrawals stay self-custodial.
@@ -94,15 +100,17 @@ impl MidenExecution {
         // `spawn` / `deposit_pools` binaries. `Deployment::load` errors with a pointer to
         // `cargo run --bin spawn` when the file is missing.
         let deployment = Deployment::load()?;
+        let operator_id = deployment.operator_account_id;
         let vault_id = deployment.vault_id;
-        let pool_id = deployment.pool_id;
-        let asset0 = deployment.asset0;
-        let asset1 = deployment.asset1;
+        let assets = deployment.assets.clone();
+        let pools = deployment.pools.clone();
+        let oracle_url = oracle_base_url()?;
+        let price_feeds = fetch_price_feeds(&oracle_url).await?;
+        validate_asset_feeds(&assets, &price_feeds)?;
         info!(
             vault = %vault_id.to_hex(),
-            pool = %pool_id.to_hex(),
-            asset0 = %asset0.to_hex(),
-            asset1 = %asset1.to_hex(),
+            assets = assets.len(),
+            pools = pools.len(),
             "Loaded deployment config"
         );
 
@@ -119,25 +127,41 @@ impl MidenExecution {
         // Attach idempotently: `import_account_by_id` fetches the public account from the
         // network and overwrites any already-tracked copy. The vault must stay untracked
         // in the pool client (see the `pool_client` field docs).
+        client.import_account_by_id(operator_id).await?;
         client.import_account_by_id(vault_id).await?;
-        client.import_account_by_id(asset0).await?;
-        client.import_account_by_id(asset1).await?;
-        pool_client.import_account_by_id(pool_id).await?;
+        for asset in &assets {
+            client.import_account_by_id(asset.faucet_id).await?;
+        }
+        for pool_id in &pools {
+            pool_client.import_account_by_id(*pool_id).await?;
+        }
         client.sync_state().await?;
         pool_client.sync_state().await?;
         println!(
-            "Attached to vault {} and pool {}.",
+            "Attached to vault {} and {} pool shards.",
             vault_id.to_hex(),
-            pool_id.to_hex()
+            pools.len()
         );
 
         // Rebuild server-side pool state deterministically by replaying the recorded
         // liquidity deposits through the curve's deposit math.
         // Known limitation: pool state mutated by past swaps is not recovered on restart —
         // pool-state persistence is a follow-up.
-        let mut pool_states = HashMap::with_capacity(2);
-        pool_states.insert(asset0, PoolState::default());
-        pool_states.insert(asset1, PoolState::default());
+        let mut pool_states = HashMap::with_capacity(assets.len());
+        for asset in &assets {
+            pool_states.insert(
+                asset.faucet_id,
+                PoolState::new(
+                    PoolSettings::default(),
+                    PoolBalances::default(),
+                    0,
+                    PoolMetadata {
+                        name: "Deployment asset",
+                        asset_decimals: asset.decimals,
+                    },
+                ),
+            );
+        }
         let mut lp_ledger = LpLedger::default();
 
         for record in &deployment.deposits {
@@ -161,34 +185,40 @@ impl MidenExecution {
 
         Ok(Self {
             cycle: 0,
-            pool_id,
+            pools,
             vault_id,
+            operator_id,
             client,
             pool_client,
             message_broker,
             prover_timeout,
-            asset0,
-            asset1,
-            user_indices: HashMap::new(),
+            assets,
+            user_pools: HashMap::new(),
             orders: Orders::default(),
             pool_states,
             lp_ledger,
         })
     }
 
-    /// Resolves a trader's vault-assigned user index, caching the answer. On a cache miss
-    /// the vault's registration map is read over RPC; an unregistered user is an error.
-    async fn resolve_user_index(&mut self, user_id: AccountId) -> Result<u16> {
-        if let Some(index) = self.user_indices.get(&user_id) {
-            return Ok(*index);
+    /// Resolves a trader's vault-assigned pool shard, caching the answer.
+    async fn resolve_user_pool(&mut self, user_id: AccountId) -> Result<AccountId> {
+        if let Some(pool_id) = self.user_pools.get(&user_id) {
+            return Ok(*pool_id);
         }
         let storage = fetch_account_storage_from_rpc(self.vault_id).await?;
-        let (index, _pubkey) = vault_user_registration(&storage, user_id)?
+        vault_user_registration(&storage, user_id)?
             .ok_or_else(|| anyhow!("user {} is not registered on the vault", user_id.to_hex()))?;
-        let index = u16::try_from(index)
-            .map_err(|_| anyhow!("user index {index} out of range for {}", user_id.to_hex()))?;
-        self.user_indices.insert(user_id, index);
-        Ok(index)
+        let pool_id = user_pool_from_storage(&storage, user_id)?
+            .ok_or_else(|| anyhow!("user {} has no assigned pool", user_id.to_hex()))?;
+        if !self.pools.contains(&pool_id) {
+            return Err(anyhow!(
+                "user {} is assigned to unlisted pool {}",
+                user_id.to_hex(),
+                pool_id.to_hex()
+            ));
+        }
+        self.user_pools.insert(user_id, pool_id);
+        Ok(pool_id)
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -248,141 +278,100 @@ impl MidenExecution {
         Err(anyhow!("Termination of miden execution."))
     }
 
-    /// Execute a processed batch on the pool. On failure, mark every order in the
-    /// batch as failed and still release the processing gate so the engine never
-    /// deadlocks waiting for a settlement that will never come.
+    /// Route one logical batch to its pool shards and release the processing gate once all
+    /// shard submissions have succeeded or failed.
     pub async fn handle_batch(&mut self, orders: Vec<Order<Processed>>) {
         info!(
             count = orders.len(),
             "Received processed batch for execution"
         );
         let started = Instant::now();
-        if let Err(e) = self.execute_on_pool(orders.clone()).await {
-            error!(
-                elapsed = ?started.elapsed(),
-                "Batch execution failed: {e:?}"
-            );
-            for order in orders {
-                let failed = order.failed(OrderFailureReason::ExecutionError, None);
-                let _ = self
-                    .message_broker
-                    .broadcast_order_update(OrderUpdate::Failed(failed));
+        let mut shard_orders: HashMap<AccountId, Vec<Order<Processed>>> = HashMap::new();
+        for order in orders {
+            let user_id = order.user_id();
+            match self.resolve_user_pool(user_id).await {
+                Ok(pool_id) => shard_orders.entry(pool_id).or_default().push(order),
+                Err(e) => {
+                    error!(user = %user_id.to_hex(), "Failed to resolve user pool: {e:?}");
+                    let failed = order.failed(OrderFailureReason::ExecutionError, None);
+                    let _ = self
+                        .message_broker
+                        .broadcast_order_update(OrderUpdate::Failed(failed));
+                }
             }
-            // Always release the gate held by the Processing engine, even on failure,
-            // so the pipeline never deadlocks.
-            let _ = self.message_broker.broadcast_amm(AmmEvent::OrdersExecuted);
         }
+
+        // Deployment order gives deterministic sequential shard submission.
+        for pool_id in self.pools.clone() {
+            let Some(shard) = shard_orders.remove(&pool_id) else {
+                continue;
+            };
+            if let Err(e) = self.execute_shard(pool_id, shard.clone()).await {
+                error!(
+                    pool = %pool_id.to_hex(),
+                    count = shard.len(),
+                    "Shard execution failed: {e:?}"
+                );
+                for order in shard {
+                    let failed = order.failed(OrderFailureReason::ExecutionError, None);
+                    let _ = self
+                        .message_broker
+                        .broadcast_order_update(OrderUpdate::Failed(failed));
+                }
+            }
+        }
+
+        if let Err(e) = self.message_broker.broadcast_amm(AmmEvent::OrdersExecuted) {
+            error!("Failed to release processing gate: {e:?}");
+        }
+        info!(elapsed = ?started.elapsed(), "Logical batch execution finished");
     }
 
-    async fn execute_on_pool(&mut self, orders: Vec<Order<Processed>>) -> Result<()> {
+    async fn execute_shard(
+        &mut self,
+        pool_id: AccountId,
+        orders: Vec<Order<Processed>>,
+    ) -> Result<()> {
         info!(
             cycle = self.cycle,
+            pool = %pool_id.to_hex(),
             count = orders.len(),
-            "Executing batch on pool"
+            "Executing batch on pool shard"
         );
         self.cycle += 1;
 
         if orders.is_empty() {
-            // Nothing to execute; release the processing gate immediately.
-            self.message_broker
-                .broadcast_amm(AmmEvent::OrdersExecuted)?;
             return Ok(());
         }
 
         let instant = Instant::now();
-
-        // let pool_state_deltas = vec![
-        //     PoolStateDelta {
-        //         pool_index: sell_pool_index,
-        //         set_amount: sell_pool_balance,
-        //     },
-        //     PoolStateDelta {
-        //         pool_index: buy_pool_index,
-        //         set_amount: buy_pool_balance,
-        //     },
-        // ];
-
         let mut intents = Vec::with_capacity(orders.len());
         let mut advice_data = vec![];
         let mut fpi_asset_user_pairs = Vec::with_capacity(orders.len());
-        let mut executable = Vec::with_capacity(orders.len());
 
-        let asset0 = self.asset0;
-        for order in orders {
+        for order in &orders {
             let user_id = order.user_id();
-            // an unregistered (or unresolvable) user fails only its own order
-            let user_index = match self.resolve_user_index(user_id).await {
-                Ok(index) => index,
-                Err(e) => {
-                    error!(user = %user_id.to_hex(), "Failed to resolve user index: {e:?}");
-                    let failed = order.failed(OrderFailureReason::ExecutionError, None);
-                    self.message_broker
-                        .broadcast_order_update(OrderUpdate::Failed(failed))?;
-                    continue;
-                }
-            };
             let details = order.details();
-
-            let buy_idx = if details.asset_out.eq(&asset0) { 0 } else { 1 };
-            let sell_idx = if details.asset_in.eq(&asset0) { 0 } else { 1 };
-            let amount_out = order.execution_result().amount_out;
-
-            // the swap FPIs into the vault for the sell asset's totals + the registration
             fpi_asset_user_pairs.push((details.asset_in, user_id));
 
-            let user_suffix: u64 = user_id.suffix().as_canonical_u64();
-            let user_prefix: u64 = user_id.prefix().as_u64();
-            let user_slot_key = get_user_trades_slot_name(user_index);
-
             let intent = Intent {
-                user_suffix,
-                user_prefix,
-                user_key_prefix: user_slot_key.id().prefix().as_canonical_u64(),
-                user_key_suffix: user_slot_key.id().suffix().as_canonical_u64(),
-                sell_idx,
-                buy_idx,
+                user_suffix: user_id.suffix().as_canonical_u64(),
+                user_prefix: user_id.prefix().as_u64(),
+                sell_asset_suffix: details.asset_in.suffix().as_canonical_u64(),
+                sell_asset_prefix: details.asset_in.prefix().as_u64(),
                 sell_amount: details.amount_in,
-                buy_amount: amount_out,
+                buy_asset_suffix: details.asset_out.suffix().as_canonical_u64(),
+                buy_asset_prefix: details.asset_out.prefix().as_u64(),
+                buy_amount: details.min_amount_out,
             };
 
-            let signed_order = order.signed_order();
-            let pubkey = order.pubkey();
-
             let msg = intent.message_word();
-            let pk_comm: Word = pubkey.to_commitment().into();
-
-            info!(
-                "pk_comm: {pk_comm:?}, msg: {:?}, user suffix: {}, user prefix: {}",
-                intent.message_word(),
-                intent.user_suffix,
-                intent.user_prefix
-            );
-
-            let prepared: Vec<Felt> = signed_order.to_prepared_signature(msg); // [PK[9], SIG[17]]
-
-            info!("prepared len: {}", prepared.len());
-
-            // advice_data.extend_from_slice(msg.as_elements()); // MSG (4) — consumed first
-            // advice_data.extend_from_slice(pk_comm.as_elements()); // PK_COMM (4)
-            advice_data.extend_from_slice(&prepared); // PK[9], SIG[17]
-
+            let prepared: Vec<Felt> = order.signed_order().to_prepared_signature(msg);
+            advice_data.extend_from_slice(&prepared);
             intents.push(intent);
-            executable.push(order);
-        }
-
-        if executable.is_empty() {
-            // every order failed individually; release the processing gate
-            self.message_broker
-                .broadcast_amm(AmmEvent::OrdersExecuted)?;
-            return Ok(());
         }
 
         let tx_script = make_exec_script(intents);
-
-        info!("SCRIPT \n\n{tx_script}\n\n");
-
-        // refresh the pool client's anchor block so the vault FPI proof covers the
-        // latest funding state
         self.pool_client.sync_state().await?;
 
         let cb = link_math(self.pool_client.code_builder())?;
@@ -391,7 +380,6 @@ impl MidenExecution {
         let tx_script = cb.compile_tx_script(tx_script)?;
 
         let advice_map_key = Word::from([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]);
-
         let tx_req = TransactionRequestBuilder::new()
             .custom_script(tx_script)
             .extend_advice_map([(advice_map_key, advice_data)])
@@ -402,8 +390,6 @@ impl MidenExecution {
             .build()?;
 
         let submit_started = Instant::now();
-        let pool_id = self.pool_id;
-
         let tx_result = self
             .pool_client
             .execute_transaction(pool_id, tx_req)
@@ -424,53 +410,44 @@ impl MidenExecution {
             .pool_client
             .submit_proven_transaction(proven_transaction, &tx_result)
             .await?;
-        self.pool_client
+        if let Err(e) = self
+            .pool_client
             .apply_transaction(&tx_result, submission_height)
-            .await?;
-        println!("Elapsed: {prove_elapsed:?}");
-        self.pool_client.sync_state().await?;
-
-        // let res = self
-        //     .client
-        //     .submit_new_transaction(pool_id, tx_req)
-        //     .await
-        //     .map_err(|_| {
-        //         anyhow!(
-        //             "transaction prove/submit timed out after {:?}",
-        //             self.prover_timeout
-        //         )
-        //     })?;
-
+            .await
+        {
+            warn!(
+                pool = %pool_id.to_hex(),
+                transaction = %tx_result.id().to_hex(),
+                "Shard transaction was submitted but local apply failed: {e:?}"
+            );
+        }
         info!(
             elapsed = ?submit_started.elapsed(),
-            "Transaction proven and submitted"
+            prove_elapsed = ?prove_elapsed,
+            "Shard transaction proven and submitted"
         );
 
         let tx_hash = tx_result.id().to_hex().to_string();
-
-        self.pool_client.sync_state().await?;
-        info!(%tx_hash, "Client state synced");
-
-        let mut executed_count = 0usize;
-        for order in executable {
-            let execution_result = order.execution_result();
-            let executed = order.executed(tx_hash.clone(), execution_result);
-            self.message_broker
-                .broadcast_order_update(OrderUpdate::Executed(executed))?;
-            executed_count += 1;
+        if let Err(e) = self.pool_client.sync_state().await {
+            warn!(%tx_hash, "Shard transaction submitted but client sync failed: {e:?}");
         }
 
-        // Release the gate held by the Processing engine. We do not wait for
-        // on-chain settlement; the order lifecycle ends at Executed.
-        self.message_broker
-            .broadcast_amm(AmmEvent::OrdersExecuted)?;
+        for order in orders {
+            let execution_result = order.execution_result();
+            let executed = order.executed(tx_hash.clone(), execution_result);
+            if let Err(e) = self
+                .message_broker
+                .broadcast_order_update(OrderUpdate::Executed(executed))
+            {
+                error!(%tx_hash, "Failed to broadcast executed order: {e:?}");
+            }
+        }
 
         info!(
-            count = executed_count,
+            pool = %pool_id.to_hex(),
             elapsed = ?instant.elapsed(),
-            "Batch executed"
+            "Shard batch executed"
         );
-
         Ok(())
     }
 
@@ -543,6 +520,7 @@ impl MidenExecution {
         if lp_info.withdrawable() < payout {
             checkpoint_lp_entitlement_on_vault(
                 &mut self.client,
+                self.operator_id,
                 self.vault_id,
                 faucet_id,
                 lp_id,
@@ -576,7 +554,7 @@ impl MidenExecution {
     /// counter to `withdrawn + current value of the LP's shares` so accrued fees become
     /// self-custodially withdrawable even if the operator later disappears.
     pub async fn checkpoint_lp_entitlements(&mut self) -> Result<()> {
-        for faucet_id in [self.asset0, self.asset1] {
+        for faucet_id in self.assets.iter().map(|asset| asset.faucet_id) {
             let Some(pool) = self.pool_states.get(&faucet_id) else {
                 continue;
             };
@@ -598,6 +576,7 @@ impl MidenExecution {
                 }
                 checkpoint_lp_entitlement_on_vault(
                     &mut self.client,
+                    self.operator_id,
                     self.vault_id,
                     faucet_id,
                     lp_id,
@@ -628,7 +607,11 @@ impl MidenExecution {
     }
 
     pub fn pool_id(&self) -> AccountId {
-        self.pool_id
+        self.pools[0]
+    }
+
+    pub fn pools(&self) -> Vec<AccountId> {
+        self.pools.clone()
     }
 
     pub fn vault_id(&self) -> AccountId {
@@ -636,11 +619,15 @@ impl MidenExecution {
     }
 
     pub fn asset0(&self) -> AccountId {
-        self.asset0
+        self.assets[0].faucet_id
     }
 
     pub fn asset1(&self) -> AccountId {
-        self.asset1
+        self.assets[1].faucet_id
+    }
+
+    pub fn assets(&self) -> Vec<AssetInfo> {
+        self.assets.clone()
     }
 
     pub fn pool_states(&self) -> HashMap<AccountId, PoolState> {

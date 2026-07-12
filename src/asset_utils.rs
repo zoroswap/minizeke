@@ -18,8 +18,11 @@ pub fn asset_to_word(asset: FungibleAsset) -> Word {
 }
 
 pub fn word_to_asset(word: Word) -> Result<FungibleAsset> {
+    // AssetVaultKey metadata packs fungible composition in bits 0-1 and the callback flag
+    // in bit 2 of the faucet suffix.
+    let metadata = Felt::new(1 + (word[2].as_canonical_u64() << 2))?;
     let asset = FungibleAsset::from_key_value_words(
-        [Felt::ZERO, Felt::ZERO, word[0].add(word[2]), word[1]].into(),
+        [Felt::ZERO, Felt::ZERO, word[0].add(metadata), word[1]].into(),
         [word[3], Felt::ZERO, Felt::ZERO, Felt::ZERO].into(),
     )?;
     if word[2].as_canonical_u64().ne(&0) {
@@ -32,13 +35,18 @@ pub fn word_to_asset(word: Word) -> Result<FungibleAsset> {
 #[cfg(test)]
 mod tests {
     use miden_client::account::AccountId;
+    use miden_client::testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1;
     use miden_protocol::asset::AssetCallbackFlag;
 
     use super::*;
 
+    fn faucet_id() -> Result<AccountId> {
+        Ok(AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?)
+    }
+
     #[test]
     fn parse_asset_to_word() -> Result<()> {
-        let (_, faucet_id) = AccountId::from_bech32("mtst1aqv4yfn4fef8zgzfew6jeanydy8qdz0d")?;
+        let faucet_id = faucet_id()?;
         let asset = FungibleAsset::new(faucet_id, 10000)?;
         let word = asset_to_word(asset);
         assert_eq!(
@@ -56,34 +64,16 @@ mod tests {
 
     #[test]
     fn parse_word_to_asset() -> Result<()> {
-        let (_, faucet_id_parsed) =
-            AccountId::from_bech32("mtst1aqv4yfn4fef8zgzfew6jeanydy8qdz0d")?;
-        let prefix = faucet_id_parsed.prefix().as_u64();
-        let suffix = faucet_id_parsed.suffix().as_canonical_u64();
-        let amount = 10000;
-        let word: Word = [
-            Felt::new_unchecked(suffix),
-            Felt::new_unchecked(prefix),
-            Felt::ZERO,
-            Felt::new_unchecked(amount),
-        ]
-        .into();
-        let asset = word_to_asset(word)?;
-        assert_eq!(
-            asset.faucet_id().prefix().as_felt().as_canonical_u64(),
-            prefix
-        );
-
-        assert_eq!(asset.faucet_id().suffix().as_canonical_u64(), suffix);
+        let expected = FungibleAsset::new(faucet_id()?, 10000)?;
+        let asset = word_to_asset(asset_to_word(expected))?;
         assert_eq!(asset.callbacks().as_u8(), 0);
-        assert_eq!(asset.amount().as_u64(), amount);
-        assert_eq!(asset.faucet_id(), faucet_id_parsed);
+        assert_eq!(asset, expected);
         Ok(())
     }
 
     #[test]
     fn parse_asset_with_callback_to_word() -> Result<()> {
-        let (_, faucet_id) = AccountId::from_bech32("mtst1azsvnn4chyfkvgp8a46whpuhlsy50vns")?;
+        let faucet_id = faucet_id()?;
         let asset =
             FungibleAsset::new(faucet_id, 10000)?.with_callbacks(AssetCallbackFlag::Enabled);
         let word = asset_to_word(asset);
@@ -102,27 +92,11 @@ mod tests {
 
     #[test]
     fn parse_word_to_asset_with_callback() -> Result<()> {
-        let (_, faucet_id_parsed) =
-            AccountId::from_bech32("mtst1azsvnn4chyfkvgp8a46whpuhlsy50vns")?;
-        let prefix = faucet_id_parsed.prefix().as_u64();
-        let suffix = faucet_id_parsed.suffix().as_canonical_u64();
-        let amount = 10000;
-        let word: Word = [
-            Felt::new_unchecked(suffix),
-            Felt::new_unchecked(prefix),
-            Felt::new_unchecked(1),
-            Felt::new_unchecked(amount),
-        ]
-        .into();
-        let asset = word_to_asset(word)?;
-        assert_eq!(
-            asset.faucet_id().prefix().as_felt().as_canonical_u64(),
-            prefix
-        );
-        assert_eq!(asset.faucet_id().suffix().as_canonical_u64(), suffix);
+        let expected =
+            FungibleAsset::new(faucet_id()?, 10000)?.with_callbacks(AssetCallbackFlag::Enabled);
+        let asset = word_to_asset(asset_to_word(expected))?;
         assert_eq!(asset.callbacks().as_u8(), 1);
-        assert_eq!(asset.amount().as_u64(), amount);
-        assert_eq!(asset.faucet_id(), faucet_id_parsed);
+        assert_eq!(asset, expected);
         Ok(())
     }
 }

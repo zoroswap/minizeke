@@ -1,10 +1,6 @@
 use std::env;
 
-use miden_client::{
-    builder::ClientBuilder,
-    keystore::FilesystemKeyStore,
-    rpc::Endpoint,
-};
+use miden_client::{builder::ClientBuilder, keystore::FilesystemKeyStore, rpc::Endpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidenNetwork {
@@ -24,7 +20,10 @@ impl MidenNetwork {
             "devnet" => Self::Devnet,
             "testnet" => Self::Testnet,
             other => {
-                tracing::warn!(network = other, "unknown MIDEN_NETWORK, defaulting to testnet");
+                tracing::warn!(
+                    network = other,
+                    "unknown MIDEN_NETWORK, defaulting to testnet"
+                );
                 Self::Testnet
             }
         }

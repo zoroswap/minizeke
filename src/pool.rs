@@ -27,17 +27,21 @@ use crate::{
     curve::ZoroCurve,
     miden_env::MidenNetwork,
     test_utils::touch_account,
-    vault::{VaultUserAssetInfo, vault_user_asset_info_from_storage, vault_user_registration},
+    vault::{VaultUserAssetInfo, vault_user_asset_info_from_storage},
 };
 
-/// Maximum number of users a pool supports (one trades value slot per user).
-pub const MAX_POOL_USERS: usize = 128;
+/// Maximum number of lazily allocated `(asset, user)` accounting cells.
+///
+/// The pool component uses five additional slots, `AuthSingleSig` uses two, and
+/// `BasicWallet` uses none: `248 + 5 + 2 = 255`, the account storage limit.
+pub const MAX_POOL_CELLS: usize = 248;
 
 /// Amount of each asset a user funds into the vault before trading (service flow).
 pub const USER_INITIAL_ON_CHAIN_BALANCE: u64 = 1_000;
 
-pub const USER_SLOT_IDS_SLOT: &str = "zoropool::user_slot_ids";
-pub const ASSETS_SLOT: &str = "zoropool::assets";
+pub const CELL_SLOT_IDS_SLOT: &str = "zoropool::cell_slot_ids";
+pub const CELL_INDEX_SLOT: &str = "zoropool::cell_index";
+pub const NEXT_CELL_SLOT: &str = "zoropool::next_cell";
 pub const VAULT_ACCOUNT_ID_SLOT: &str = "zoropool::vault_account_id";
 pub const USER_TRADING_DETAILS_PROC_ROOT_SLOT: &str = "zoropool::user_trading_details_proc_root";
 
@@ -345,20 +349,27 @@ impl LpLedger {
     }
 }
 
-/// A user's cumulative trade counters for both pool assets:
-/// `[bought0, sold0, bought1, sold1]`.
+/// One asset-user shard: `[bought, sold, 0, 0]`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UserTrades {
-    pub bought: [u64; 2],
-    pub sold: [u64; 2],
+pub struct PoolCell {
+    pub bought: u64,
+    pub sold: u64,
 }
 
-impl UserTrades {
+/// An allocated `(asset, user)` cell and its concrete account-storage slot id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PoolCellAllocation {
+    pub slot_id: String,
+    pub bought: u64,
+    pub sold: u64,
+}
+
+impl PoolCell {
     pub fn from_word(word: Word) -> Self {
         let e = word.as_elements();
         Self {
-            bought: [e[0].as_canonical_u64(), e[2].as_canonical_u64()],
-            sold: [e[1].as_canonical_u64(), e[3].as_canonical_u64()],
+            bought: e[0].as_canonical_u64(),
+            sold: e[1].as_canonical_u64(),
         }
     }
 }
@@ -378,17 +389,78 @@ pub fn derive_balance_details(
     (balance, available)
 }
 
-pub fn get_user_trades_slot_name(index: u16) -> StorageSlotName {
-    storage_slot_name(format!("pool::user_{index}_trades").as_str())
+pub fn get_pool_cell_slot_name(index: u16) -> StorageSlotName {
+    storage_slot_name(format!("zoropool::cell_{index}").as_str())
 }
 
-/// Reads a user's trade counters from an already-fetched pool [`AccountStorage`].
-pub fn user_trades_from_storage(storage: &AccountStorage, user_index: u16) -> Result<UserTrades> {
-    let slot_name = get_user_trades_slot_name(user_index);
-    let word = storage
-        .get_item(&slot_name)
-        .map_err(|e| anyhow!("failed to read storage slot {}: {e:?}", slot_name.as_str()))?;
-    Ok(UserTrades::from_word(word))
+fn asset_user_key(asset_id: AccountId, user_id: AccountId) -> Word {
+    Word::new([
+        asset_id.suffix(),
+        asset_id.prefix().as_felt(),
+        user_id.suffix(),
+        user_id.prefix().as_felt(),
+    ])
+}
+
+/// Reads one `(asset, user)` allocation from fetched pool storage.
+///
+/// `None` means no cell has been allocated. An allocated zero-valued cell is returned as
+/// `Some` with both counters set to zero.
+pub fn pool_cell_allocation_from_storage(
+    storage: &AccountStorage,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<Option<PoolCellAllocation>> {
+    let slot_id_word = storage
+        .get_map_item(
+            &storage_slot_name(CELL_INDEX_SLOT),
+            asset_user_key(asset_id, user_id),
+        )
+        .map_err(|e| anyhow!("failed to read pool cell index: {e:?}"))?;
+
+    if slot_id_word == Word::new([Felt::ZERO; 4]) {
+        return Ok(None);
+    }
+
+    let id = slot_id_word.as_elements();
+    let slot = storage
+        .slots()
+        .iter()
+        .find(|slot| {
+            let candidate = slot.name().id();
+            candidate.suffix() == id[0] && candidate.prefix() == id[1]
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "pool cell index for asset {} and user {} references an unknown slot",
+                asset_id.to_hex(),
+                user_id.to_hex()
+            )
+        })?;
+
+    let cell = PoolCell::from_word(slot.content().value());
+    Ok(Some(PoolCellAllocation {
+        slot_id: slot.name().id().to_string(),
+        bought: cell.bought,
+        sold: cell.sold,
+    }))
+}
+
+/// Reads one `(asset, user)` cell, treating an unallocated key as an empty cell.
+pub fn pool_cell_from_storage(
+    storage: &AccountStorage,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<PoolCell> {
+    Ok(
+        match pool_cell_allocation_from_storage(storage, asset_id, user_id)? {
+            Some(allocation) => PoolCell {
+                bought: allocation.bought,
+                sold: allocation.sold,
+            },
+            None => PoolCell::default(),
+        },
+    )
 }
 
 /// Fetches a user's derived pool balance for one asset over RPC: reads the vault totals and
@@ -397,40 +469,27 @@ pub async fn get_user_balance_from_pool(
     pool_id: AccountId,
     vault_id: AccountId,
     asset_id: AccountId,
-    asset_index: u8,
     user_id: AccountId,
 ) -> Result<u64> {
-    if asset_index > 1 {
-        return Err(anyhow!("asset_index must be 0 or 1, got {asset_index}"));
-    }
-
     let vault_storage = fetch_account_storage_from_rpc(vault_id).await?;
     let vault_info = vault_user_asset_info_from_storage(&vault_storage, asset_id, user_id)?;
-    let (user_index, _) = vault_user_registration(&vault_storage, user_id)?
-        .ok_or_else(|| anyhow!("user {} is not registered on the vault", user_id.to_hex()))?;
 
     let pool_storage = fetch_account_storage_from_rpc(pool_id).await?;
-    let trades = user_trades_from_storage(&pool_storage, user_index as u16)?;
+    let cell = pool_cell_from_storage(&pool_storage, asset_id, user_id)?;
 
-    let (balance, _) = derive_balance_details(
-        &vault_info,
-        trades.bought[asset_index as usize],
-        trades.sold[asset_index as usize],
-    );
+    let (balance, _) = derive_balance_details(&vault_info, cell.bought, cell.sold);
     Ok(balance)
 }
 
 pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
     vault_id: AccountId,
-    asset0: AccountId,
-    asset1: AccountId,
 ) -> Result<Account> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
     let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
-    let pool_component = build_pool_component(client.code_builder(), vault_id, asset0, asset1)?;
+    let pool_component = build_pool_component(client.code_builder(), vault_id)?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
@@ -467,30 +526,25 @@ pub async fn deploy_pool(
     Ok(pool_contract)
 }
 
-pub fn build_pool_component(
-    cb: CodeBuilder,
-    vault_id: AccountId,
-    asset0: AccountId,
-    asset1: AccountId,
-) -> Result<AccountComponent> {
+pub fn build_pool_component(cb: CodeBuilder, vault_id: AccountId) -> Result<AccountComponent> {
     let vault_proc_root = vault_trading_details_proc_root(cb.clone())?;
     let lib = compile_pool_code(cb)?;
 
     let zero_word = Word::new([Felt::ZERO; 4]);
 
-    let mut slots: Vec<StorageSlot> = Vec::with_capacity(MAX_POOL_USERS + 4);
+    let mut slots: Vec<StorageSlot> = Vec::with_capacity(MAX_POOL_CELLS + 5);
 
-    // one trades slot per user: [bought0, sold0, bought1, sold1]
-    for i in 0..MAX_POOL_USERS {
+    // Generic cells are assigned lazily to full (asset, user) keys.
+    for i in 0..MAX_POOL_CELLS {
         slots.push(StorageSlot::with_value(
-            get_user_trades_slot_name(i as u16),
+            get_pool_cell_slot_name(i as u16),
             zero_word,
         ));
     }
 
-    // index -> hashed trades-slot id lookup (slot ids are hashed names, underivable in MASM)
-    let slot_ids_map = StorageMap::with_entries((0..MAX_POOL_USERS).map(|i| {
-        let slot_id = get_user_trades_slot_name(i as u16).id();
+    // Dense index -> hashed cell-slot id (slot ids are underivable in MASM).
+    let slot_ids_map = StorageMap::with_entries((0..MAX_POOL_CELLS).map(|i| {
+        let slot_id = get_pool_cell_slot_name(i as u16).id();
         (
             StorageMapKey::new(Word::new([
                 Felt::new(i as u64).unwrap(),
@@ -501,21 +555,20 @@ pub fn build_pool_component(
             Word::new([slot_id.suffix(), slot_id.prefix(), Felt::ZERO, Felt::ZERO]),
         )
     }))
-    .map_err(|e| anyhow!("failed to build user slot ids map: {e:?}"))?;
+    .map_err(|e| anyhow!("failed to build pool cell slot ids map: {e:?}"))?;
     slots.push(StorageSlot::with_map(
-        storage_slot_name(USER_SLOT_IDS_SLOT),
+        storage_slot_name(CELL_SLOT_IDS_SLOT),
         slot_ids_map,
     ));
 
-    // pool assets: [asset0_suffix, asset0_prefix, asset1_suffix, asset1_prefix]
+    slots.push(StorageSlot::with_map(
+        storage_slot_name(CELL_INDEX_SLOT),
+        StorageMap::new(),
+    ));
+
     slots.push(StorageSlot::with_value(
-        storage_slot_name(ASSETS_SLOT),
-        Word::new([
-            asset0.suffix(),
-            asset0.prefix().as_felt(),
-            asset1.suffix(),
-            asset1.prefix().as_felt(),
-        ]),
+        storage_slot_name(NEXT_CELL_SLOT),
+        zero_word,
     ));
 
     slots.push(StorageSlot::with_value(
@@ -544,10 +597,7 @@ pub fn build_pool_component(
 
 #[cfg(test)]
 mod tests {
-    use miden_client::testing::account_id::{
-        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
-        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-    };
+    use miden_client::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
 
     use super::*;
     use crate::assembly_utils::pool_balance_details_proc_root;
@@ -557,12 +607,9 @@ mod tests {
     #[test]
     fn test_build_components_and_roots() -> Result<()> {
         let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
-        let asset0 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1)?;
-        let asset1 = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2)?;
-
         let cb = CodeBuilder::new();
-        build_pool_component(cb.clone(), vault_id, asset0, asset1)?;
-        crate::vault::build_vault_component(cb.clone())?;
+        build_pool_component(cb.clone(), vault_id)?;
+        crate::vault::build_vault_component(cb.clone(), vault_id)?;
 
         let vault_root = vault_trading_details_proc_root(cb.clone())?;
         let pool_root = pool_balance_details_proc_root(cb)?;

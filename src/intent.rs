@@ -10,11 +10,11 @@ use miden_protocol::crypto::hash::poseidon2::Poseidon2;
 pub struct Intent {
     pub user_suffix: u64,
     pub user_prefix: u64,
-    pub user_key_suffix: u64,
-    pub user_key_prefix: u64,
-    pub sell_idx: u64,
+    pub sell_asset_suffix: u64,
+    pub sell_asset_prefix: u64,
     pub sell_amount: u64,
-    pub buy_idx: u64,
+    pub buy_asset_suffix: u64,
+    pub buy_asset_prefix: u64,
     pub buy_amount: u64,
 }
 
@@ -25,11 +25,11 @@ impl Intent {
         vec![
             self.user_suffix,
             self.user_prefix,
-            self.sell_idx,
+            self.sell_asset_suffix,
+            self.sell_asset_prefix,
             self.sell_amount,
-            self.user_key_suffix,
-            self.user_key_prefix,
-            self.buy_idx,
+            self.buy_asset_suffix,
+            self.buy_asset_prefix,
             self.buy_amount,
         ]
     }

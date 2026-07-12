@@ -1,4 +1,9 @@
-use std::{cell::OnceCell, env, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    env,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, anyhow};
 use dotenv::dotenv;
@@ -17,14 +22,11 @@ use miden_client::{
     keystore::{FilesystemKeyStore, Keystore},
     note::NoteType,
     rpc::domain::account::AccountStorageRequirements,
-    testing::{
-        account_id::{ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2},
-        common::wait_for_blocks,
-    },
+    testing::common::wait_for_blocks,
     transaction::{ForeignAccount, TransactionId, TransactionRequest, TransactionRequestBuilder},
 };
 use miden_client_sqlite_store::SqliteStore;
-use miden_core::{Felt, Word};
+use miden_core::Word;
 use rand::RngCore;
 use tracing::info;
 
@@ -37,26 +39,12 @@ use crate::{
         DepositInstructions, FundInstructions, RegisterInstructions, WithdrawInstructions,
         ZekeNote, ZekeNoteInstructions,
     },
-    pool::USER_SLOT_IDS_SLOT,
     vault::{
         USER_ASSET_TOTAL_FUNDING_SLOT, USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT,
-        USER_ASSET_TOTAL_REDEEMS_SLOT, USER_INDICES_SLOT, USER_PUBKEYS_SLOT, deploy_vault,
-        vault_user_asset_key, vault_user_key,
+        USER_ASSET_TOTAL_REDEEMS_SLOT, USER_PUBKEYS_SLOT, deploy_vault, vault_user_asset_key,
+        vault_user_key,
     },
 };
-
-const ASSET_0: OnceCell<AccountId> = OnceCell::new();
-const ASSET_1: OnceCell<AccountId> = OnceCell::new();
-
-const USERS: OnceCell<AccountId> = OnceCell::new();
-
-pub fn get_asset0() -> AccountId {
-    *ASSET_0.get_or_init(|| AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap())
-}
-
-pub fn get_asset1() -> AccountId {
-    *ASSET_1.get_or_init(|| AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2).unwrap())
-}
 
 pub async fn get_client() -> Result<Client<FilesystemKeyStore>> {
     let network = MidenNetwork::from_env();
@@ -175,10 +163,11 @@ pub async fn get_miden_execution() -> Result<MidenExecution> {
     Ok(miden_execution)
 }
 
-pub async fn get_vault(client: &mut Client<FilesystemKeyStore>) -> Result<AccountId> {
+pub async fn get_vault(client: &mut Client<FilesystemKeyStore>) -> Result<(AccountId, AccountId)> {
     dotenv().ok();
-    let vault = deploy_vault(client).await?;
-    Ok(vault.id())
+    let operator_id = get_operator(client).await?;
+    let vault = deploy_vault(client, operator_id).await?;
+    Ok((vault.id(), operator_id))
 }
 
 pub async fn get_user(client: &mut Client<FilesystemKeyStore>) -> Result<AccountId> {
@@ -214,19 +203,46 @@ pub async fn get_user(client: &mut Client<FilesystemKeyStore>) -> Result<Account
     Ok(acc.id())
 }
 
+/// Creates the server-controlled account that authors operator-only notes for the network vault.
+pub async fn get_operator(client: &mut Client<FilesystemKeyStore>) -> Result<AccountId> {
+    let keystore = Arc::new(FilesystemKeyStore::new("./keystore".into())?);
+    let mut init_seed = [0_u8; 32];
+    client.rng().fill_bytes(&mut init_seed);
+    let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
+
+    let account = AccountBuilder::new(init_seed)
+        .account_type(AccountType::Public)
+        .with_auth_component(AuthSingleSig::new(
+            key_pair.public_key().to_commitment(),
+            AuthScheme::EcdsaK256Keccak,
+        ))
+        .with_component(BasicWallet)
+        .build()?;
+
+    client.add_account(&account, false).await?;
+    keystore.add_key(&key_pair, account.id()).await?;
+    client.sync_state().await?;
+    touch_account(client, &account.id()).await?;
+    Ok(account.id())
+}
+
 pub async fn get_faucet(
     client: &mut Client<FilesystemKeyStore>,
     symbol: &str,
+    decimals: u8,
+    max_supply: u64,
 ) -> Result<AccountId> {
     let mut init_seed = [0u8; 32];
     client.rng().fill_bytes(&mut init_seed);
     let keystore_path = PathBuf::from("./keystore");
     let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).unwrap());
     // Faucet parameters
-    let name = TokenName::new(symbol).unwrap();
-    let symbol = TokenSymbol::new(symbol).unwrap();
-    let decimals = 8;
-    let max_supply = AssetAmount::new(10_000_000_000).unwrap();
+    let name = TokenName::new(symbol)
+        .map_err(|error| anyhow!("invalid faucet token name {symbol:?}: {error}"))?;
+    let symbol = TokenSymbol::new(symbol)
+        .map_err(|error| anyhow!("invalid faucet token symbol {symbol:?}: {error}"))?;
+    let max_supply =
+        AssetAmount::new(max_supply).map_err(|error| anyhow!("invalid max supply: {error}"))?;
 
     // Generate key pair
     let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
@@ -243,7 +259,7 @@ pub async fn get_faucet(
                 .decimals(decimals)
                 .max_supply(max_supply)
                 .build()
-                .unwrap(),
+                .map_err(|error| anyhow!("invalid fungible faucet configuration: {error}"))?,
         )
         .with_components(
             TokenPolicyManager::new()
@@ -252,8 +268,7 @@ pub async fn get_faucet(
                 .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
                 .unwrap(),
         )
-        .build()
-        .unwrap();
+        .build()?;
 
     // Add the faucet to the client
     client.add_account(&faucet_account, false).await?;
@@ -277,7 +292,7 @@ pub async fn get_faucet(
 pub async fn get_funded_user(
     client: &mut Client<FilesystemKeyStore>,
 ) -> Result<(AccountId, AccountId)> {
-    let faucet_id = get_faucet(client, "TEST").await?;
+    let faucet_id = get_faucet(client, "TEST", 8, 10_000_000_000).await?;
     let user_id = get_user(client).await?;
     let fungible_asset = FungibleAsset::new(faucet_id, 10_000).unwrap();
     let transaction_request = TransactionRequestBuilder::new()
@@ -334,14 +349,30 @@ pub async fn mint_asset_to_user(
     user_id: AccountId,
     amount: u64,
 ) -> Result<()> {
+    let initial_balance = client
+        .account_reader(user_id)
+        .get_balance(faucet_id)
+        .await?;
+    let expected_balance = initial_balance
+        .checked_add(amount)
+        .ok_or_else(|| anyhow!("mint would overflow the user's asset balance"))?;
     let fungible_asset =
         FungibleAsset::new(faucet_id, amount).map_err(|e| anyhow!("invalid asset: {e:?}"))?;
     let transaction_request = TransactionRequestBuilder::new()
         .build_mint_fungible_asset(fungible_asset, user_id, NoteType::Public, client.rng())
         .map_err(|e| anyhow!("failed to build mint tx: {e:?}"))?;
     submit_tx_resilient(client, faucet_id, transaction_request).await?;
-    consume_all_notes_for(client, user_id).await?;
-    Ok(())
+    loop {
+        consume_all_notes_for(client, user_id).await?;
+        client.sync_state().await?;
+        let balance = client
+            .account_reader(user_id)
+            .get_balance(faucet_id)
+            .await?;
+        if balance >= expected_balance {
+            return Ok(());
+        }
+    }
 }
 
 /// Consumes every currently-consumable note addressed to `account_id`, waiting for at least
@@ -370,30 +401,41 @@ pub async fn consume_all_notes_for(
     }
 }
 
-/// Sends a note from `sender_id` and consumes it on `consumer_id`, optionally declaring
-/// foreign accounts on the consuming transaction (needed when the note's script FPIs).
-pub async fn send_and_consume_note(
+/// Sends a public note to a network account and waits for the node's network transaction builder
+/// to consume it.
+pub async fn send_note_to_network(
     client: &mut Client<FilesystemKeyStore>,
     note: &ZekeNote,
     sender_id: AccountId,
-    consumer_id: AccountId,
-    foreign_accounts: Vec<ForeignAccount>,
 ) -> Result<()> {
     let tx_req = TransactionRequestBuilder::new()
         .own_output_notes(vec![note.note().clone()])
         .build()?;
     submit_tx_resilient(client, sender_id, tx_req).await?;
-    client.sync_state().await?;
-    wait_for_blocks(client, 1).await;
 
-    let tx_req = TransactionRequestBuilder::new()
-        .input_notes(vec![(note.note().clone(), None)])
-        .foreign_accounts(foreign_accounts)
-        .build()?;
-    submit_tx_resilient(client, consumer_id, tx_req).await?;
-    client.sync_state().await?;
-    wait_for_blocks(client, 1).await;
-    Ok(())
+    let timeout_secs = env::var("NETWORK_NOTE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(180);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        client.sync_state().await?;
+        if client
+            .get_output_note(note.note().id())
+            .await?
+            .is_some_and(|record| record.is_consumed())
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "network note {} was not consumed within {timeout_secs}s; verify that the node's \
+                 network transaction builder is running",
+                note.note().id().to_hex()
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Registers `user_id`'s trading pubkey commitment on the vault via a REGISTER note.
@@ -411,7 +453,7 @@ pub async fn register_user_on_vault(
         }),
         client.code_builder(),
     )?;
-    send_and_consume_note(client, &note, user_id, vault_id, vec![]).await
+    send_note_to_network(client, &note, user_id).await
 }
 
 /// Funds the user's trading balance on the vault via a FUND note carrying `asset`.
@@ -429,7 +471,7 @@ pub async fn fund_user_on_vault(
         }),
         client.code_builder(),
     )?;
-    send_and_consume_note(client, &note, user_id, vault_id, vec![]).await
+    send_note_to_network(client, &note, user_id).await
 }
 
 /// Deposits liquidity into the vault via a DEPOSIT note carrying `asset`; the vault
@@ -448,7 +490,7 @@ pub async fn deposit_liquidity_on_vault(
         }),
         client.code_builder(),
     )?;
-    send_and_consume_note(client, &note, lp_id, vault_id, vec![]).await
+    send_note_to_network(client, &note, lp_id).await
 }
 
 /// Self-custodial LP withdrawal: sends a WITHDRAW note from `lp_id`, the vault checks the
@@ -468,39 +510,35 @@ pub async fn withdraw_liquidity_from_vault(
         }),
         client.code_builder(),
     )?;
-    send_and_consume_note(client, &note, lp_id, vault_id, vec![]).await
-}
-
-/// Foreign-account declaration for vault-native transactions that FPI into the pool
-/// (INIT_REDEEM / REDEEM consumption): requests the user's entry of the pool's
-/// index -> trades-slot-id map.
-pub fn pool_foreign_account(pool_id: AccountId, user_index: u64) -> Result<ForeignAccount> {
-    let index_key = StorageMapKey::new(Word::new([
-        Felt::new(user_index).map_err(|e| anyhow!("invalid user index: {e:?}"))?,
-        Felt::ZERO,
-        Felt::ZERO,
-        Felt::ZERO,
-    ]));
-    let requirements =
-        AccountStorageRequirements::new([(storage_slot_name(USER_SLOT_IDS_SLOT), [&index_key])]);
-    ForeignAccount::public(pool_id, requirements)
-        .map_err(|e| anyhow!("failed to build pool foreign account: {e:?}"))
+    send_note_to_network(client, &note, lp_id).await
 }
 
 /// Foreign-account declaration for pool-native swap transactions that FPI into the vault:
 /// requests the funding/initiated/redeems entries for every (asset, user) pair plus the
-/// registration entries (pubkey + index) for every user.
+/// pubkey registration entry for every user.
 pub fn vault_foreign_account(
     vault_id: AccountId,
     asset_user_pairs: &[(AccountId, AccountId)],
 ) -> Result<ForeignAccount> {
-    let asset_user_keys: Vec<StorageMapKey> = asset_user_pairs
+    let mut unique_pairs = Vec::with_capacity(asset_user_pairs.len());
+    for pair in asset_user_pairs {
+        if !unique_pairs.contains(pair) {
+            unique_pairs.push(*pair);
+        }
+    }
+    let asset_user_keys: Vec<StorageMapKey> = unique_pairs
         .iter()
         .map(|(asset_id, user_id)| StorageMapKey::new(vault_user_asset_key(*asset_id, *user_id)))
         .collect();
-    let user_keys: Vec<StorageMapKey> = asset_user_pairs
-        .iter()
-        .map(|(_, user_id)| StorageMapKey::new(vault_user_key(*user_id)))
+    let mut unique_users = Vec::with_capacity(unique_pairs.len());
+    for (_, user_id) in &unique_pairs {
+        if !unique_users.contains(user_id) {
+            unique_users.push(*user_id);
+        }
+    }
+    let user_keys: Vec<StorageMapKey> = unique_users
+        .into_iter()
+        .map(|user_id| StorageMapKey::new(vault_user_key(user_id)))
         .collect();
 
     let requirements = AccountStorageRequirements::new([
@@ -518,10 +556,6 @@ pub fn vault_foreign_account(
         ),
         (
             storage_slot_name(USER_PUBKEYS_SLOT),
-            user_keys.iter().collect::<Vec<_>>(),
-        ),
-        (
-            storage_slot_name(USER_INDICES_SLOT),
             user_keys.iter().collect::<Vec<_>>(),
         ),
     ]);

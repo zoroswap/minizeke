@@ -17,15 +17,11 @@ use rand::RngCore;
 pub struct User {
     id: AccountId,
     key_pair: AuthSecretKey,
-    index: u16,
 }
 
 impl User {
     pub fn id(&self) -> AccountId {
         self.id
-    }
-    pub fn index(&self) -> u16 {
-        self.index
     }
     pub fn pubkey(&self) -> PublicKey {
         self.key_pair.public_key()
@@ -39,7 +35,7 @@ pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Resul
     let keystore = FilesystemKeyStore::new("keystore".into())?;
     let mut users = Vec::with_capacity(n as usize);
     println!("Creating {n} user accounts");
-    for i in 0..n {
+    for _ in 0..n {
         // Draw a fresh seed per account, otherwise every account is built from the
         // same seed and ends up with an identical AccountId.
         let mut init_seed = [0_u8; 32];
@@ -65,7 +61,6 @@ pub async fn get_users(n: u32, client: &mut Client<FilesystemKeyStore>) -> Resul
         users.push(User {
             id: account.id(),
             key_pair,
-            index: i as u16,
         });
     }
     client.sync_state().await?;

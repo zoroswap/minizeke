@@ -1,18 +1,44 @@
 {
+  "schema_version": 2,
   "network": "testnet",
-  "vault_id": "0x04ef9e0a7e773271733e3eab435b7e",
-  "pool_id": "0xaa827e6f3544a331085cede73ddeaf",
-  "asset0": "0x0cd9017f7c0eadb134ed51fbe6524a",
-  "asset1": "0x325fb0e7e2dd001101083299e7db15",
-  "lp_account_id": "0x83e4e377973b6a915b7cd123220b20",
-  "deposits": [
+  "operator_account_id": "0x651e7f65ba6cd2111040b677ccea71",
+  "vault_id": "0xc5945c1a087b86f14e8440c5aada55",
+  "assets": [
     {
-      "faucet_id": "0x0cd9017f7c0eadb134ed51fbe6524a",
-      "amount": 100000000
+      "faucet_id": "0x0d429b5f2613df311e027c4201e9e1",
+      "symbol": "BTC",
+      "decimals": 8,
+      "oracle_feed_id": "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
     },
     {
-      "faucet_id": "0x325fb0e7e2dd001101083299e7db15",
-      "amount": 100000000
+      "faucet_id": "0x6331c12c54e966915023c652780494",
+      "symbol": "ETH",
+      "decimals": 8,
+      "oracle_feed_id": "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+    },
+    {
+      "faucet_id": "0x4712c8f28c3a7ed155449660e430a5",
+      "symbol": "USDC",
+      "decimals": 8,
+      "oracle_feed_id": "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"
+    }
+  ],
+  "pools": [
+    "0x252dd0520db7a391055d852ed10e58"
+  ],
+  "lp_account_id": "0xf985eb9721e255d16a6ef3b12aea54",
+  "deposits": [
+    {
+      "faucet_id": "0x0d429b5f2613df311e027c4201e9e1",
+      "amount": 1000000000
+    },
+    {
+      "faucet_id": "0x6331c12c54e966915023c652780494",
+      "amount": 35000000000
+    },
+    {
+      "faucet_id": "0x4712c8f28c3a7ed155449660e430a5",
+      "amount": 120000000000000
     }
   ]
 }
