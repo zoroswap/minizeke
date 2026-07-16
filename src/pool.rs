@@ -471,14 +471,40 @@ pub async fn get_user_balance_from_pool(
     asset_id: AccountId,
     user_id: AccountId,
 ) -> Result<u64> {
+    Ok(
+        get_user_balance_details_from_pool(pool_id, vault_id, asset_id, user_id)
+            .await?
+            .0,
+    )
+}
+
+/// Fetches the amount the user can spend after pending redeems are reserved.
+pub async fn get_user_available_balance_from_pool(
+    pool_id: AccountId,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<u64> {
+    Ok(
+        get_user_balance_details_from_pool(pool_id, vault_id, asset_id, user_id)
+            .await?
+            .1,
+    )
+}
+
+async fn get_user_balance_details_from_pool(
+    pool_id: AccountId,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<(u64, u64)> {
     let vault_storage = fetch_account_storage_from_rpc(vault_id).await?;
     let vault_info = vault_user_asset_info_from_storage(&vault_storage, asset_id, user_id)?;
 
     let pool_storage = fetch_account_storage_from_rpc(pool_id).await?;
     let cell = pool_cell_from_storage(&pool_storage, asset_id, user_id)?;
 
-    let (balance, _) = derive_balance_details(&vault_info, cell.bought, cell.sold);
-    Ok(balance)
+    Ok(derive_balance_details(&vault_info, cell.bought, cell.sold))
 }
 
 pub async fn deploy_pool(
@@ -616,5 +642,18 @@ mod tests {
         assert_ne!(vault_root, Word::new([Felt::ZERO; 4]));
         assert_ne!(pool_root, Word::new([Felt::ZERO; 4]));
         Ok(())
+    }
+
+    #[test]
+    fn pending_redeems_reduce_available_but_not_gross_balance() {
+        let vault_info = VaultUserAssetInfo {
+            total_funding: 1_000,
+            total_initiated_redeems: 400,
+            total_redeems: 100,
+        };
+
+        let (balance, available) = derive_balance_details(&vault_info, 200, 50);
+        assert_eq!(balance, 1_050);
+        assert_eq!(available, 750);
     }
 }

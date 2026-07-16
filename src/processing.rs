@@ -6,7 +6,7 @@ use crate::{
     },
     oracle_sse::OraclePricing,
     order::{Created, Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders},
-    pool::{PoolState, fetch_account_storage_from_rpc, get_user_balance_from_pool},
+    pool::{PoolState, fetch_account_storage_from_rpc, get_user_available_balance_from_pool},
     vault::user_pool_from_storage,
 };
 
@@ -81,7 +81,7 @@ impl Processing {
             return Err(anyhow!("unknown pool asset {}", faucet_id.to_hex()));
         }
         let pool_id = self.resolve_user_pool(user_id).await?;
-        get_user_balance_from_pool(pool_id, self.vault_id, faucet_id, user_id).await
+        get_user_available_balance_from_pool(pool_id, self.vault_id, faucet_id, user_id).await
     }
 
     async fn resolve_user_pool(&mut self, user_id: AccountId) -> Result<AccountId> {
@@ -318,10 +318,13 @@ impl Processing {
                 continue;
             }
 
-            // If a cached balance would reject the order, refresh it once. FUND and REDEEM
-            // notes change vault state without notifying this process.
-            let mut sell_balance = match self.balance_of(user_id, sell_faucet).await {
-                Ok(sell) => sell,
+            // Always refresh the spendable sell balance. INIT_REDEEM can reduce available
+            // funds without notifying this process, so a cached value is not authoritative.
+            let sell_balance = match self.fetch_balance_from_chain(user_id, sell_faucet).await {
+                Ok(balance) => {
+                    self.balances.insert((user_id, sell_faucet), balance);
+                    balance
+                }
                 Err(e) => {
                     warn!(order_id = %order.id, "Sell balance fetch failed: {e:?}");
                     let failed = order.failed(OrderFailureReason::ExecutionError);
@@ -329,20 +332,6 @@ impl Processing {
                     continue;
                 }
             };
-            if sell_balance < details.amount_in {
-                sell_balance = match self.fetch_balance_from_chain(user_id, sell_faucet).await {
-                    Ok(balance) => {
-                        self.balances.insert((user_id, sell_faucet), balance);
-                        balance
-                    }
-                    Err(e) => {
-                        warn!(order_id = %order.id, "Sell balance refresh failed: {e:?}");
-                        let failed = order.failed(OrderFailureReason::ExecutionError);
-                        self.publish_order_update(OrderUpdate::Failed(failed))?;
-                        continue;
-                    }
-                };
-            }
             if sell_balance < details.amount_in {
                 warn!(
                     order_id = %order.id,

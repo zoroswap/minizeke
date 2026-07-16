@@ -482,22 +482,30 @@ impl HistoryStore {
             .map_err(Into::into)
     }
 
-    pub fn trades(&self, pair: &str, before: Option<u64>, limit: u64) -> Result<Vec<TradeRecord>> {
+    pub fn trades(
+        &self,
+        pair: Option<&str>,
+        user_id: Option<&str>,
+        before: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<TradeRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             r#"
             SELECT order_id, user_id, pair, asset_in, asset_out, amount_in,
                    amount_out, price, oracle_price, tx_hash, timestamp
             FROM trades
-            WHERE pair = ?1
-              AND (?2 IS NULL OR timestamp < ?2)
+            WHERE (?1 IS NULL OR pair = ?1)
+              AND (?2 IS NULL OR user_id = ?2)
+              AND (?3 IS NULL OR timestamp < ?3)
             ORDER BY timestamp DESC
-            LIMIT ?3
+            LIMIT ?4
             "#,
         )?;
         let rows = statement.query_map(
             params![
                 pair,
+                user_id,
                 before.map(timestamp_millis).map(to_i64).transpose()?,
                 to_i64(limit)?
             ],
@@ -845,5 +853,43 @@ mod tests {
         assert_eq!(candles[0].low, 90);
         assert_eq!(candles[0].close, 90);
         assert_eq!(candles[0].trade_count, 0);
+    }
+
+    #[test]
+    fn trades_filter_by_pair_and_user() {
+        let store = HistoryStore::open(":memory:").unwrap();
+        let connection = store.connection().unwrap();
+        for (order_id, user_id, pair, timestamp) in [
+            ("order-1", "user-a", "BTC/USDC", 100_i64),
+            ("order-2", "user-b", "BTC/USDC", 200_i64),
+            ("order-3", "user-a", "ETH/USDC", 300_i64),
+        ] {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO trades (
+                        order_id, user_id, pair, asset_in, asset_out, amount_in,
+                        amount_out, price, oracle_price, tx_hash, timestamp
+                    ) VALUES (?1, ?2, ?3, 'in', 'out', 10, 20, 2, NULL, NULL, ?4)
+                    "#,
+                    rusqlite::params![order_id, user_id, pair, timestamp],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let user_trades = store.trades(None, Some("user-a"), None, 10).unwrap();
+        assert_eq!(user_trades.len(), 2);
+        assert!(user_trades.iter().all(|trade| trade.user_id == "user-a"));
+
+        let pair_trades = store.trades(Some("BTC/USDC"), None, None, 10).unwrap();
+        assert_eq!(pair_trades.len(), 2);
+        assert!(pair_trades.iter().all(|trade| trade.pair == "BTC/USDC"));
+
+        let filtered = store
+            .trades(Some("BTC/USDC"), Some("user-a"), None, 10)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].order_id, "order-1");
     }
 }

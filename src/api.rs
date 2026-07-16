@@ -272,17 +272,29 @@ async fn candles(
 
 #[derive(Debug, Deserialize)]
 struct TradesQuery {
-    pair: String,
+    pair: Option<String>,
+    user_id: Option<String>,
     before: Option<u64>,
     limit: Option<u64>,
 }
 
 async fn trades(State(state): State<AppState>, Query(query): Query<TradesQuery>) -> Response<Body> {
-    if query.pair.trim().is_empty() {
-        return bad_request("pair must not be empty");
+    let pair = query
+        .pair
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let user_id = query
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if pair.is_none() && user_id.is_none() {
+        return bad_request("pair or user_id must be provided");
     }
     match state.history.trades(
-        &query.pair,
+        pair,
+        user_id,
         query.before,
         query.limit.unwrap_or(100).clamp(1, 1_000),
     ) {
