@@ -307,8 +307,18 @@ impl Order<Created> {
         details: OrderDetails,
         pubkey: PublicKey,
     ) -> Self {
+        Self::new_with_id(Uuid::new_v4(), signed_order, user_id, details, pubkey)
+    }
+
+    pub fn new_with_id(
+        id: Uuid,
+        signed_order: Signature,
+        user_id: AccountId,
+        details: OrderDetails,
+        pubkey: PublicKey,
+    ) -> Self {
         Order {
-            id: Uuid::new_v4(),
+            id,
             timing: OrderTiming::new(),
             signed_order,
             user_id,

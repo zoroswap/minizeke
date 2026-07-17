@@ -88,6 +88,14 @@ pub struct PoolBalances {
     pub total_liabilities: U256,
 }
 
+#[derive(Clone, Debug, Copy, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeSource {
+    None,
+    Automatic,
+    Manual,
+}
+
 #[derive(Clone, Debug, Copy, Serialize)]
 pub struct PoolSettings {
     #[serde(serialize_with = "serialize_i256")]
@@ -100,6 +108,15 @@ pub struct PoolSettings {
     pub backstop_fee: U256,
     #[serde(serialize_with = "serialize_u256")]
     pub protocol_fee: U256,
+    /// Dynamic volatility surcharge when this asset is the swap input/sold asset.
+    #[serde(serialize_with = "serialize_u256")]
+    pub volatility_fee_in: U256,
+    /// Dynamic volatility surcharge when this asset is the swap output/bought asset.
+    #[serde(serialize_with = "serialize_u256")]
+    pub volatility_fee_out: U256,
+    pub volatility_fee_valid_until: u64,
+    pub volatility_fee_version: u64,
+    pub volatility_fee_source: FeeSource,
 }
 
 impl Default for PoolSettings {
@@ -110,6 +127,11 @@ impl Default for PoolSettings {
             swap_fee: U256::from(200),
             backstop_fee: U256::from(300),
             protocol_fee: U256::from(0),
+            volatility_fee_in: U256::ZERO,
+            volatility_fee_out: U256::ZERO,
+            volatility_fee_valid_until: 0,
+            volatility_fee_version: 0,
+            volatility_fee_source: FeeSource::None,
         }
     }
 }
@@ -185,6 +207,10 @@ impl PoolState {
 
     pub fn metadata(&self) -> &PoolMetadata {
         &self.metadata
+    }
+
+    pub fn update_settings(&mut self, settings: PoolSettings) {
+        self.settings = settings;
     }
 
     pub fn lp_total_supply(&self) -> u64 {

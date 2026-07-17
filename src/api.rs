@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Response, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -16,24 +16,29 @@ use miden_client::{
     asset::FungibleAsset,
     auth::{PublicKey, Signature},
 };
+use miden_core::Word;
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    analytics_store::{AnalyticsStore, Pagination},
+    auth::AuthStore,
     faucet::{DEFAULT_FAUCET_SERVER_URL, MintRequest},
+    fee_store::{FeeBatchRequest, FeeStore, FeeUpdateSource},
     history::HistoryStore,
+    intent::Intent,
     lp::LpService,
     market::derive_depth,
-    message_broker::message_broker::MessageBroker,
+    message_broker::message_broker::{FeeStateEvent, MessageBroker},
     order::{Order, OrderDetails, OrderType, SerializableOrder},
     pool::{fetch_account_storage_from_rpc, pool_cell_allocation_from_storage},
     serde::{deserialize_account_id, serialize_account_id},
     store::Store,
-    vault::user_placement_from_storage,
+    vault::{user_placement_from_storage, vault_user_registration},
     websocket::{connection_manager::ConnectionManager, handlers::websocket_handler},
 };
 
@@ -48,6 +53,9 @@ pub struct AppState {
     pub faucet_server_url: String,
     pub faucet_http: reqwest::Client,
     pub lp_service: LpService,
+    pub fee_store: Arc<FeeStore>,
+    pub auth_store: Arc<AuthStore>,
+    pub analytics_store: Arc<AnalyticsStore>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +95,9 @@ pub async fn start(
     store: Arc<Store>,
     history: Arc<HistoryStore>,
     lp_service: LpService,
+    fee_store: Arc<FeeStore>,
+    auth_store: Arc<AuthStore>,
+    analytics_store: Arc<AnalyticsStore>,
 ) -> Result<()> {
     let server_url: &'static str = env::var("SERVER_URL").unwrap().leak();
     let faucet_server_url = normalize_http_url(
@@ -100,16 +111,19 @@ pub async fn start(
         faucet_server_url,
         faucet_http: reqwest::Client::new(),
         lp_service,
+        fee_store,
+        auth_store,
+        analytics_store,
     });
     let listener = tokio::net::TcpListener::bind(server_url)
         .await
         .unwrap_or_else(|err| panic!("Failed to bind TCP listener to {}: {err:?}", server_url));
     info!("Server listening on {}", server_url);
     println!("Server: {server_url}");
-    println!("GET  /health /pools/info /stats /candles /trades /depth");
-    println!("GET  /orders /orders/{{id}} /users/{{id}}/placement /ws");
+    println!("GET  /health /pools/info /pools/analytics /stats /candles /trades /depth");
+    println!("GET  /orders /orders/{{id}} /users/{{id}}/placement /users/me/analytics /ws");
     println!("GET  /lp/operations/{{note_id}} /lp/positions/{{lp_id}}/{{faucet_id}}");
-    println!("POST /orders/new /mint /lp/deposits/note");
+    println!("POST /auth/challenge /auth/login /orders/new /mint /lp/deposits/note");
 
     if let Err(e) = axum::serve(listener, app).await {
         error!("Critical error on server: {e}. Exiting with status 1.");
@@ -130,6 +144,14 @@ fn normalize_http_url(value: &str) -> String {
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
+        .route("/auth/challenge", post(auth_challenge))
+        .route("/auth/login", post(auth_login))
+        .route("/users/me/analytics", get(user_analytics))
+        .route("/users/me/pnl", get(user_analytics))
+        .route("/users/me/positions", get(user_positions))
+        .route("/users/me/events", get(user_analytics_events))
+        .route("/pools/analytics", get(pool_analytics_all))
+        .route("/pools/{faucet_id}/analytics", get(pool_analytics))
         .route("/pools/info", get(pool_info))
         .route("/stats", get(stats))
         .route("/candles", get(candles))
@@ -145,8 +167,268 @@ pub fn create_router(state: AppState) -> Router {
         .route("/lp/positions/{lp_id}/{faucet_id}", get(lp_position))
         .route("/ws", get(websocket_handler))
         .route("/orders/new", post(order_new))
-        .layer(CorsLayer::permissive())
+        .route("/internal/fees/batch", post(apply_automatic_fee_batch))
+        .route("/admin/fees/override", post(apply_manual_fee_batch))
+        .route("/admin/fees/clear", post(clear_manual_fee_batch))
+        .layer(cors_layer())
         .with_state(state)
+}
+
+fn cors_layer() -> CorsLayer {
+    let origins: Vec<HeaderValue> = env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://localhost:5173".to_owned())
+        .split(',')
+        .filter_map(|origin| origin.trim().parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthChallengeRequest {
+    user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthChallengeResponse {
+    challenge_id: String,
+    user_id: String,
+    nonce: String,
+    message: [u64; 4],
+    domain: String,
+    network: String,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthLoginRequest {
+    challenge_id: String,
+    user_id: String,
+    pubkey: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthLoginResponse {
+    access_token: String,
+    token_type: &'static str,
+    expires_at: u64,
+    user_id: String,
+}
+
+async fn auth_challenge(
+    State(state): State<AppState>,
+    Json(request): Json<AuthChallengeRequest>,
+) -> Response<Body> {
+    let user_id = match AccountId::from_hex(&request.user_id) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("invalid user_id: {error}")),
+    };
+    let storage = match fetch_account_storage_from_rpc(state.store.vault_id()).await {
+        Ok(storage) => storage,
+        Err(error) => return service_unavailable(format!("vault unavailable: {error}")),
+    };
+    let commitment = match vault_user_registration(&storage, user_id) {
+        Ok(Some(commitment)) => commitment,
+        Ok(None) => return not_found("user has no registered trading key"),
+        Err(error) => return service_unavailable(error.to_string()),
+    };
+    let now = Utc::now().timestamp() as u64;
+    let challenge = match state.auth_store.issue_challenge(user_id, commitment, now) {
+        Ok(challenge) => challenge,
+        Err(error) => return service_unavailable(error.to_string()),
+    };
+    let mut message = [0_u64; 4];
+    for (index, felt) in challenge.message.into_iter().enumerate() {
+        message[index] = felt.as_canonical_u64();
+    }
+    Json(ApiResponse {
+        data: AuthChallengeResponse {
+            challenge_id: challenge.id,
+            user_id: user_id.to_hex(),
+            nonce: general_purpose::URL_SAFE_NO_PAD.encode(challenge.nonce),
+            message,
+            domain: env::var("AUTH_DOMAIN").unwrap_or_else(|_| "minizeke".to_owned()),
+            network: env::var("MIDEN_NETWORK").unwrap_or_else(|_| "testnet".to_owned()),
+            issued_at: challenge.issued_at,
+            expires_at: challenge.expires_at,
+        },
+    })
+    .into_response()
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(request): Json<AuthLoginRequest>,
+) -> Response<Body> {
+    let user_id = match AccountId::from_hex(&request.user_id) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("invalid user_id: {error}")),
+    };
+    let pubkey = match general_purpose::STANDARD
+        .decode(request.pubkey)
+        .ok()
+        .and_then(|bytes| PublicKey::read_from_bytes(&bytes).ok())
+    {
+        Some(value) => value,
+        None => return bad_request("invalid public key"),
+    };
+    let signature = match general_purpose::STANDARD
+        .decode(request.signature)
+        .ok()
+        .and_then(|bytes| Signature::read_from_bytes(&bytes).ok())
+    {
+        Some(value) => value,
+        None => return bad_request("invalid signature"),
+    };
+    let storage = match fetch_account_storage_from_rpc(state.store.vault_id()).await {
+        Ok(storage) => storage,
+        Err(error) => return service_unavailable(format!("vault unavailable: {error}")),
+    };
+    let commitment = match vault_user_registration(&storage, user_id) {
+        Ok(Some(commitment)) => commitment,
+        Ok(None) => return not_found("user has no registered trading key"),
+        Err(error) => return service_unavailable(error.to_string()),
+    };
+    let now = Utc::now().timestamp() as u64;
+    match state.auth_store.authenticate(
+        &request.challenge_id,
+        user_id,
+        commitment,
+        pubkey,
+        signature,
+        now,
+    ) {
+        Ok(session) => Json(ApiResponse {
+            data: AuthLoginResponse {
+                access_token: session.bearer_token,
+                token_type: "Bearer",
+                expires_at: session.session.expires_at,
+                user_id: session.session.user_id.to_hex(),
+            },
+        })
+        .into_response(),
+        Err(error) => error_response(StatusCode::UNAUTHORIZED, error.to_string()),
+    }
+}
+
+fn authenticated_user(state: &AppState, headers: &HeaderMap) -> Result<AccountId, Response<Body>> {
+    let token = crate::auth::parse_bearer(headers)
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "missing or invalid bearer token"))?;
+    let now = Utc::now().timestamp() as u64;
+    state
+        .auth_store
+        .lookup_session(token.as_str(), now)
+        .map_err(|error| service_unavailable(error.to_string()))?
+        .map(|session| session.user_id)
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "expired or revoked session"))
+}
+
+#[derive(Debug, Deserialize)]
+struct AnalyticsQuery {
+    offset: Option<u64>,
+    limit: Option<u32>,
+}
+
+async fn user_analytics(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    let user = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let now = Utc::now().timestamp_millis() as u64;
+    match state
+        .analytics_store
+        .user_summary(&user.to_hex(), "oracle_usd", now)
+    {
+        Ok(summary) => match state.history.user_order_stats(&user.to_hex()) {
+            Ok(order_stats) => Json(ApiResponse {
+                data: serde_json::json!({
+                    "pnl": summary,
+                    "orders": order_stats,
+                }),
+            })
+            .into_response(),
+            Err(error) => ApiError(error).into_response(),
+        },
+        Err(error) => ApiError(error).into_response(),
+    }
+}
+
+async fn user_positions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AnalyticsQuery>,
+) -> Response<Body> {
+    let user = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match state.analytics_store.positions(
+        &user.to_hex(),
+        "oracle_usd",
+        Utc::now().timestamp_millis() as u64,
+        Pagination {
+            offset: query.offset.unwrap_or(0),
+            limit: query.limit.unwrap_or(50).clamp(1, 500),
+        },
+    ) {
+        Ok(positions) => Json(ApiResponse { data: positions }).into_response(),
+        Err(error) => ApiError(error).into_response(),
+    }
+}
+
+async fn user_analytics_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AnalyticsQuery>,
+) -> Response<Body> {
+    let user = match authenticated_user(&state, &headers) {
+        Ok(user) => user.to_hex(),
+        Err(response) => return response,
+    };
+    match state.analytics_store.events_for_subject(
+        &user,
+        Pagination {
+            offset: query.offset.unwrap_or(0),
+            limit: query.limit.unwrap_or(50).clamp(1, 500),
+        },
+    ) {
+        Ok(events) => Json(ApiResponse { data: events }).into_response(),
+        Err(error) => ApiError(error).into_response(),
+    }
+}
+
+async fn pool_analytics_all(State(state): State<AppState>) -> Response<Body> {
+    let now = Utc::now().timestamp_millis() as u64;
+    let mut analytics = Vec::new();
+    for asset in state.store.assets() {
+        match state
+            .analytics_store
+            .pool_summary(&asset.faucet_id.to_hex(), now)
+        {
+            Ok(Some(summary)) => analytics.push(summary),
+            Ok(None) => {}
+            Err(error) => return ApiError(error).into_response(),
+        }
+    }
+    Json(ApiResponse { data: analytics }).into_response()
+}
+
+async fn pool_analytics(
+    State(state): State<AppState>,
+    Path(faucet_id): Path<String>,
+) -> Response<Body> {
+    match state
+        .analytics_store
+        .pool_summary(&faucet_id, Utc::now().timestamp_millis() as u64)
+    {
+        Ok(Some(summary)) => Json(ApiResponse { data: summary }).into_response(),
+        Ok(None) => not_found("pool analytics unavailable"),
+        Err(error) => ApiError(error).into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,12 +449,20 @@ struct LpDepositNoteResponse {
 
 async fn build_lp_deposit_note(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<LpDepositNoteRequest>,
 ) -> Response<Body> {
     let lp_id = match AccountId::from_hex(&request.lp_id) {
         Ok(value) => value,
         Err(error) => return bad_request(format!("invalid lp_id: {error}")),
     };
+    let authenticated = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if authenticated != lp_id {
+        return error_response(StatusCode::FORBIDDEN, "cannot create another LP's deposit");
+    }
     let faucet_id = match AccountId::from_hex(&request.faucet_id) {
         Ok(value) => value,
         Err(error) => return bad_request(format!("invalid faucet_id: {error}")),
@@ -207,10 +497,21 @@ async fn build_lp_deposit_note(
 
 async fn lp_operation(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(note_id): Path<String>,
 ) -> Response<Body> {
+    let authenticated = match authenticated_user(&state, &headers) {
+        Ok(user) => user.to_hex(),
+        Err(response) => return response,
+    };
     match state.lp_service.store().operation(&note_id) {
-        Ok(Some(operation)) => Json(ApiResponse { data: operation }).into_response(),
+        Ok(Some(operation)) if operation.lp_id == authenticated => {
+            Json(ApiResponse { data: operation }).into_response()
+        }
+        Ok(Some(_)) => error_response(
+            StatusCode::FORBIDDEN,
+            "LP operation belongs to another user",
+        ),
         Ok(None) => not_found("LP operation not found"),
         Err(error) => service_unavailable(format!("LP journal unavailable: {error}")),
     }
@@ -218,12 +519,20 @@ async fn lp_operation(
 
 async fn lp_position(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((lp_id, faucet_id)): Path<(String, String)>,
 ) -> Response<Body> {
     let lp_id = match AccountId::from_hex(&lp_id) {
         Ok(value) => value,
         Err(error) => return bad_request(format!("invalid lp_id: {error}")),
     };
+    let authenticated = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if authenticated != lp_id {
+        return error_response(StatusCode::FORBIDDEN, "cannot access another LP's position");
+    }
     let faucet_id = match AccountId::from_hex(&faucet_id) {
         Ok(value) => value,
         Err(error) => return bad_request(format!("invalid faucet_id: {error}")),
@@ -374,27 +683,62 @@ struct TradesQuery {
     limit: Option<u64>,
 }
 
-async fn trades(State(state): State<AppState>, Query(query): Query<TradesQuery>) -> Response<Body> {
+async fn trades(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<TradesQuery>,
+) -> Response<Body> {
     let pair = query
         .pair
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let user_id = query
+    let requested_user_id = query
         .user_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if pair.is_none() && user_id.is_none() {
+    if pair.is_none() && requested_user_id.is_none() {
         return bad_request("pair or user_id must be provided");
     }
+    let user_id = if let Some(requested) = requested_user_id {
+        let authenticated = match authenticated_user(&state, &headers) {
+            Ok(user) => user,
+            Err(response) => return response,
+        };
+        if requested != authenticated.to_hex() {
+            return error_response(StatusCode::FORBIDDEN, "cannot access another user's trades");
+        }
+        Some(requested)
+    } else {
+        None
+    };
     match state.history.trades(
         pair,
         user_id,
         query.before,
         query.limit.unwrap_or(100).clamp(1, 1_000),
     ) {
-        Ok(trades) => Json(ApiResponse { data: trades }).into_response(),
+        Ok(trades) if user_id.is_some() => Json(ApiResponse { data: trades }).into_response(),
+        Ok(trades) => {
+            let redacted: Vec<_> = trades
+                .into_iter()
+                .map(|trade| {
+                    serde_json::json!({
+                        "order_id": trade.order_id,
+                        "pair": trade.pair,
+                        "asset_in": trade.asset_in,
+                        "asset_out": trade.asset_out,
+                        "amount_in": trade.amount_in,
+                        "amount_out": trade.amount_out,
+                        "price": trade.price,
+                        "oracle_price": trade.oracle_price,
+                        "timestamp": trade.timestamp,
+                    })
+                })
+                .collect();
+            Json(ApiResponse { data: redacted }).into_response()
+        }
         Err(error) => ApiError(error).into_response(),
     }
 }
@@ -407,9 +751,24 @@ struct OrdersQuery {
     limit: Option<u64>,
 }
 
-async fn orders(State(state): State<AppState>, Query(query): Query<OrdersQuery>) -> Response<Body> {
+async fn orders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrdersQuery>,
+) -> Response<Body> {
+    let user_id = match authenticated_user(&state, &headers) {
+        Ok(user) => user.to_hex(),
+        Err(response) => return response,
+    };
+    if query
+        .user_id
+        .as_deref()
+        .is_some_and(|value| value != user_id)
+    {
+        return error_response(StatusCode::FORBIDDEN, "cannot access another user's orders");
+    }
     match state.history.orders(
-        query.user_id.as_deref(),
+        Some(&user_id),
         query.status.as_deref(),
         query.before,
         query.limit.unwrap_or(100).clamp(1, 1_000),
@@ -419,15 +778,42 @@ async fn orders(State(state): State<AppState>, Query(query): Query<OrdersQuery>)
     }
 }
 
-async fn order_by_id(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response<Body> {
+async fn order_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response<Body> {
+    let user_id = match authenticated_user(&state, &headers) {
+        Ok(user) => user.to_hex(),
+        Err(response) => return response,
+    };
     match state.history.order(id) {
-        Ok(Some(order)) => Json(ApiResponse { data: order }).into_response(),
+        Ok(Some(order)) if order.user_id == user_id => {
+            Json(ApiResponse { data: order }).into_response()
+        }
+        Ok(Some(_)) => error_response(StatusCode::FORBIDDEN, "order belongs to another user"),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => ApiError(error).into_response(),
     }
 }
 
-async fn order_events(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response<Body> {
+async fn order_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response<Body> {
+    let user_id = match authenticated_user(&state, &headers) {
+        Ok(user) => user.to_hex(),
+        Err(response) => return response,
+    };
+    match state.history.order(id) {
+        Ok(Some(order)) if order.user_id == user_id => {}
+        Ok(Some(_)) => {
+            return error_response(StatusCode::FORBIDDEN, "order belongs to another user");
+        }
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return ApiError(error).into_response(),
+    }
     match state.history.order_events(id) {
         Ok(events) => Json(ApiResponse { data: events }).into_response(),
         Err(error) => ApiError(error).into_response(),
@@ -525,6 +911,23 @@ async fn pool_info(State(state): State<AppState>) -> Response<Body> {
         assets.push(serde_json::json!({
             "asset": asset,
             "pool_state": pool_state,
+            "fees": {
+                "base_swap": pool_state.settings().swap_fee.to_string(),
+                "base_backstop": pool_state.settings().backstop_fee.to_string(),
+                "base_protocol": pool_state.settings().protocol_fee.to_string(),
+                "volatility_fee_in": pool_state.settings().volatility_fee_in.to_string(),
+                "volatility_fee_out": pool_state.settings().volatility_fee_out.to_string(),
+                "maximum_effective_fee_out": (
+                    pool_state.settings().swap_fee
+                        + pool_state.settings().backstop_fee
+                        + pool_state.settings().protocol_fee
+                        + pool_state.settings().volatility_fee_out
+                ).to_string(),
+                "valid_until": pool_state.settings().volatility_fee_valid_until,
+                "version": pool_state.settings().volatility_fee_version,
+                "source": pool_state.settings().volatility_fee_source,
+                "precision": 1_000_000u64,
+            },
         }));
     }
     let response = serde_json::json!({
@@ -532,11 +935,91 @@ async fn pool_info(State(state): State<AppState>) -> Response<Body> {
         "pool_shard_ids": state.store.pools().iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
     });
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("max-age=120, must-revalidate"),
-    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (headers, Json(response)).into_response()
+}
+
+async fn apply_automatic_fee_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut request): Json<FeeBatchRequest>,
+) -> Response<Body> {
+    request.source = FeeUpdateSource::Automatic;
+    apply_fee_batch(state, headers, request).await
+}
+
+async fn apply_manual_fee_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut request): Json<FeeBatchRequest>,
+) -> Response<Body> {
+    request.source = FeeUpdateSource::Manual;
+    apply_fee_batch(state, headers, request).await
+}
+
+async fn clear_manual_fee_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !valid_fee_admin_token(&headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid fee updater token").into_response();
+    }
+    let now = Utc::now().timestamp() as u64;
+    match state.fee_store.clear_manual(now) {
+        Ok(cleared) => {
+            let _ = state.message_broker.broadcast_fee_state(FeeStateEvent {
+                fee_states: state.fee_store.active_states(now).unwrap_or_default(),
+                timestamp: Utc::now().timestamp_millis() as u64,
+            });
+            Json(ApiResponse {
+                data: serde_json::json!({"cleared": cleared}),
+            })
+            .into_response()
+        }
+        Err(error) => service_unavailable(error.to_string()),
+    }
+}
+
+async fn apply_fee_batch(
+    state: AppState,
+    headers: HeaderMap,
+    request: FeeBatchRequest,
+) -> Response<Body> {
+    if !valid_fee_admin_token(&headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid fee updater token").into_response();
+    }
+    let now = Utc::now().timestamp() as u64;
+    let assets: Vec<_> = state
+        .store
+        .assets()
+        .iter()
+        .map(|asset| asset.faucet_id)
+        .collect();
+    let applied = match state.fee_store.apply_batch(&request, &assets, now) {
+        Ok(applied) => applied,
+        Err(error) => return bad_request(error.to_string()),
+    };
+    let fee_states = match state.fee_store.active_states(now) {
+        Ok(states) => states,
+        Err(error) => return service_unavailable(error.to_string()),
+    };
+    let _ = state.message_broker.broadcast_fee_state(FeeStateEvent {
+        fee_states,
+        timestamp: Utc::now().timestamp_millis() as u64,
+    });
+    Json(ApiResponse { data: applied }).into_response()
+}
+
+fn valid_fee_admin_token(headers: &HeaderMap) -> bool {
+    let Ok(expected) = env::var("FEE_UPDATER_TOKEN") else {
+        return false;
+    };
+    !expected.is_empty()
+        && headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            == Some(expected.as_str())
 }
 
 async fn user_placement(State(state): State<AppState>, Path(id): Path<String>) -> Response<Body> {
@@ -614,22 +1097,11 @@ fn service_unavailable(message: impl Into<String>) -> Response<Body> {
     error_response(StatusCode::SERVICE_UNAVAILABLE, message)
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct PoolBalancesResponse {
-    faucet_id: String,
-    reserve: String,
-    reserve_with_slippage: String,
-    total_liabilities: String,
-}
-#[derive(Clone, Debug, Serialize)]
-struct PoolSettingsResponse {
-    faucet_id: String,
-    swap_fee: String,
-    backstop_fee: String,
-    protocol_fee: String,
-}
-
-async fn order_new(State(state): State<AppState>, body: Bytes) -> Result<Response<Body>, ApiError> {
+async fn order_new(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
     let raw = String::from_utf8_lossy(&body);
     // info!(body = %raw, "POST /orders/new received");
 
@@ -644,6 +1116,16 @@ async fn order_new(State(state): State<AppState>, body: Bytes) -> Result<Respons
                 .into_response());
         }
     };
+    let authenticated = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return Ok(response),
+    };
+    if authenticated != payload.user_id {
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "order user_id does not match bearer session",
+        ));
+    }
 
     // info!(
     //     order_id = %payload.id,
@@ -670,7 +1152,42 @@ async fn order_new(State(state): State<AppState>, body: Bytes) -> Result<Respons
     let pubkey = PublicKey::read_from_bytes(&pubkey_bytes)
         .map_err(|e| ApiError(anyhow!("Failed to read signature from bytes: {}", e)))?;
 
-    let order = Order::new(signature, payload.user_id, payload.details, pubkey);
+    let vault_storage = fetch_account_storage_from_rpc(state.store.vault_id())
+        .await
+        .map_err(ApiError)?;
+    let registered = vault_user_registration(&vault_storage, payload.user_id)
+        .map_err(ApiError)?
+        .ok_or_else(|| ApiError(anyhow!("user has no registered trading key")))?;
+    if Word::from(pubkey.to_commitment()) != registered {
+        return Ok(error_response(
+            StatusCode::UNAUTHORIZED,
+            "public key is not registered for this user",
+        ));
+    }
+    let intent = Intent {
+        user_suffix: payload.user_id.suffix().as_canonical_u64(),
+        user_prefix: payload.user_id.prefix().as_u64(),
+        sell_asset_suffix: payload.details.asset_in.suffix().as_canonical_u64(),
+        sell_asset_prefix: payload.details.asset_in.prefix().as_u64(),
+        sell_amount: payload.details.amount_in,
+        buy_asset_suffix: payload.details.asset_out.suffix().as_canonical_u64(),
+        buy_asset_prefix: payload.details.asset_out.prefix().as_u64(),
+        buy_amount: payload.details.min_amount_out,
+    };
+    if !pubkey.verify(intent.message_word(), signature.clone()) {
+        return Ok(error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid signed intent",
+        ));
+    }
+
+    let order = Order::new_with_id(
+        payload.id,
+        signature,
+        payload.user_id,
+        payload.details,
+        pubkey,
+    );
     state
         .message_broker
         .broadcast_order_update(order.clone().into())

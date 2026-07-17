@@ -1,11 +1,17 @@
+pub mod analytics;
+pub mod analytics_store;
 pub mod api;
 pub mod assembly_utils;
 pub mod asset_config;
 pub mod asset_utils;
+pub mod auth;
 pub mod curve;
 pub mod deployment;
 pub mod execution_script;
+pub mod execution_store;
 pub mod faucet;
+pub mod fee;
+pub mod fee_store;
 pub mod history;
 pub mod intent;
 pub mod lp;

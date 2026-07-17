@@ -10,6 +10,7 @@ use crate::{
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    Authenticate { token: String },
     Subscribe { channels: Vec<SubscriptionChannel> },
     Unsubscribe { channels: Vec<SubscriptionChannel> },
     Ping,
@@ -25,6 +26,10 @@ pub enum ServerMessage {
     },
     Unsubscribed {
         channel: SubscriptionChannel,
+    },
+    Authenticated {
+        user_id: String,
+        expires_at: u64,
     },
 
     // Data updates
@@ -55,6 +60,10 @@ pub enum ServerMessage {
         user_id: String,
         faucet_id: String,
         amount: u64,
+    },
+    AnalyticsUpdate {
+        user_id: String,
+        timestamp: u64,
     },
     Trade {
         order_id: String,
@@ -98,6 +107,11 @@ pub enum SubscriptionChannel {
     },
     #[serde(rename = "user")]
     UserEvent {
+        #[serde(default)]
+        user_id: Option<String>,
+    },
+    #[serde(rename = "analytics")]
+    Analytics {
         #[serde(default)]
         user_id: Option<String>,
     },
@@ -159,6 +173,14 @@ impl SubscriptionChannel {
             (
                 SubscriptionChannel::UserEvent { user_id: None },
                 SubscriptionChannel::UserEvent { .. },
+            ) => true,
+            (
+                SubscriptionChannel::Analytics { user_id: Some(id1) },
+                SubscriptionChannel::Analytics { user_id: Some(id2) },
+            ) => id1 == id2,
+            (
+                SubscriptionChannel::Analytics { user_id: None },
+                SubscriptionChannel::Analytics { .. },
             ) => true,
             _ => false,
         }

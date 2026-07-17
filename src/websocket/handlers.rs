@@ -91,9 +91,70 @@ async fn handle_text_message(text: &str, conn_id: Uuid, state: &AppState) -> any
 /// Handle a parsed client message
 async fn handle_client_message(msg: ClientMessage, conn_id: Uuid, state: &AppState) {
     match msg {
+        ClientMessage::Authenticate { token } => {
+            let now = chrono::Utc::now().timestamp() as u64;
+            match state.auth_store.lookup_session(&token, now) {
+                Ok(Some(session)) => {
+                    let user_id = session.user_id.to_hex();
+                    state
+                        .connection_manager
+                        .set_authenticated_user(conn_id, user_id.clone());
+                    state.connection_manager.send_to_connection(
+                        conn_id,
+                        ServerMessage::Authenticated {
+                            user_id,
+                            expires_at: session.expires_at,
+                        },
+                    );
+                }
+                Ok(None) => state.connection_manager.send_to_connection(
+                    conn_id,
+                    ServerMessage::Error {
+                        message: "expired or invalid session".to_owned(),
+                    },
+                ),
+                Err(error) => state.connection_manager.send_to_connection(
+                    conn_id,
+                    ServerMessage::Error {
+                        message: format!("authentication unavailable: {error}"),
+                    },
+                ),
+            }
+        }
         ClientMessage::Subscribe { channels } => {
             debug!(conn_id = %conn_id, "Client subscribing to {} channels", channels.len());
             for channel in channels {
+                let authenticated = state.connection_manager.authenticated_user(conn_id);
+                let private_allowed = match &channel {
+                    SubscriptionChannel::UserEvent {
+                        user_id: Some(user_id),
+                    } => authenticated.as_deref() == Some(user_id.as_str()),
+                    SubscriptionChannel::UserEvent { user_id: None } => false,
+                    SubscriptionChannel::Analytics {
+                        user_id: Some(user_id),
+                    } => authenticated.as_deref() == Some(user_id.as_str()),
+                    SubscriptionChannel::Analytics { user_id: None } => false,
+                    SubscriptionChannel::OrderUpdates {
+                        order_id: Some(order_id),
+                    } => uuid::Uuid::parse_str(order_id)
+                        .ok()
+                        .and_then(|id| state.history.order(id).ok().flatten())
+                        .is_some_and(|order| {
+                            authenticated.as_deref() == Some(order.user_id.as_str())
+                        }),
+                    SubscriptionChannel::OrderUpdates { order_id: None } => false,
+                    _ => true,
+                };
+                if !private_allowed {
+                    state.connection_manager.send_to_connection(
+                        conn_id,
+                        ServerMessage::Error {
+                            message: "authentication does not authorize this subscription"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
                 debug!(conn_id = %conn_id, channel = ?channel, "Subscribing to channel");
                 state.connection_manager.subscribe(conn_id, channel.clone());
                 state.connection_manager.send_to_connection(

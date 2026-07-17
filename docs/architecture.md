@@ -144,7 +144,35 @@ The execution worker groups accepted orders by assigned shard. It submits shard 
 
 A failed placement lookup fails only that order. A failed shard transaction marks every order in that shard failed. Earlier shard transactions stay submitted, and later shard groups are still attempted. There is no cross-shard atomic transaction.
 
-The current processor does not roll back its precomputed in-memory balance or curve changes when a later shard submission fails. Pool curve state also is not persisted after swaps. Restart reconstructs it from deployment deposit records, not past swaps.
+Accepted swaps are journaled as proposed. `Executed` finalizes their accounting, while a failed
+shard reverses the recorded balance and curve deltas. Once the logical batch resolves, finalized
+pool snapshots are committed to `execution.<network>.sqlite3`; restart overlays these snapshots
+on the liquidity-derived baseline.
+
+## Oracle delivery and volatility fees
+
+The oracle broker remains full-rate for quoting, history, depth, and volatility estimation.
+Only WebSocket forwarding is coalesced per asset: one update per second by default, with an
+immediate bypass at a 20-basis-point movement and a trailing flush of the newest pending tick.
+
+Dynamic risk pricing runs in the standalone `fee_updater` binary. It ports the reference
+EWMA/log-fee policy and sends authenticated, idempotent fee batches to the server. Fee state is
+durable, versioned, applied between logical batches, and always has an expiry (600 seconds by
+default). Expiry removes volatility fee in/out but never removes static swap, backstop, or
+protocol fees. `/pools/info` and `pool_state` WebSockets publish the full fee state.
+
+## Authentication and analytics
+
+The vault-registered ECDSA trading key is also the HTTP identity root. A one-time
+domain/network/user-bound Poseidon2 challenge creates a short-lived opaque session. The server
+stores only token commitments and enforces ownership on private order, trade, LP, and analytics
+routes. Order intents are verified off-chain before queue admission and again on-chain.
+
+The analytics worker uses its own Miden client/store and scans consumed `FUND`,
+`INIT_REDEEM`, and `REDEEM` notes idempotently. Finalized swaps, event-time oracle marks, LP cash
+flows, pool snapshots, and exact fee components feed a SQLite WAC ledger. Responses include
+coverage metadata so opening snapshots or missing historical marks are visible rather than
+reported as exact history.
 
 ## Trust and verification
 

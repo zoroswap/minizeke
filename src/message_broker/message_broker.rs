@@ -8,9 +8,16 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::{
+    fee_store::AssetFeeState,
     order::{Order, OrderStats, OrderUpdate, Processed},
     pool::PoolState,
 };
+
+#[derive(Debug, Clone)]
+pub struct FeeStateEvent {
+    pub fee_states: HashMap<AccountId, AssetFeeState>,
+    pub timestamp: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LpOperationKind {
@@ -81,6 +88,12 @@ pub struct UserEvent {
     pub amount: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AnalyticsEvent {
+    pub user_id: AccountId,
+    pub timestamp: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TradeEvent {
     pub order_id: String,
@@ -102,6 +115,8 @@ pub enum MessageBrokerEvent {
     User(UserEvent),
     Trade(TradeEvent),
     LpChain(LpChainEvent),
+    FeeState(FeeStateEvent),
+    Analytics(AnalyticsEvent),
 }
 
 #[derive(Clone)]
@@ -116,6 +131,8 @@ pub struct MessageBroker {
     pub trades_tx: broadcast::Sender<TradeEvent>,
     pub lp_chain_tx: broadcast::Sender<LpChainEvent>,
     pub lp_applied_tx: broadcast::Sender<LpAppliedEvent>,
+    pub fee_state_tx: broadcast::Sender<FeeStateEvent>,
+    pub analytics_tx: broadcast::Sender<AnalyticsEvent>,
 }
 
 impl MessageBroker {
@@ -132,6 +149,8 @@ impl MessageBroker {
         let (trades_tx, _) = broadcast::channel(1000);
         let (lp_chain_tx, _) = broadcast::channel(100);
         let (lp_applied_tx, _) = broadcast::channel(100);
+        let (fee_state_tx, _) = broadcast::channel(20);
+        let (analytics_tx, _) = broadcast::channel(100);
 
         Self {
             order_updates_tx,
@@ -144,6 +163,8 @@ impl MessageBroker {
             trades_tx,
             lp_chain_tx,
             lp_applied_tx,
+            fee_state_tx,
+            analytics_tx,
         }
     }
 
@@ -239,6 +260,13 @@ impl MessageBroker {
         Ok(())
     }
 
+    pub fn broadcast_fee_state(&self, event: FeeStateEvent) -> Result<()> {
+        if let Err(error) = self.fee_state_tx.send(event) {
+            warn!("Failed to broadcast fee state event: {error}");
+        }
+        Ok(())
+    }
+
     /// Broadcast a batch of processed orders to the execution engine
     pub fn broadcast_processed_batch(&self, batch: Vec<Order<Processed>>) -> Result<()> {
         match self.processed_batch_tx.send(batch) {
@@ -295,6 +323,21 @@ impl MessageBroker {
 
     pub fn subscribe_lp_applied(&self) -> broadcast::Receiver<LpAppliedEvent> {
         self.lp_applied_tx.subscribe()
+    }
+
+    pub fn subscribe_fee_state(&self) -> broadcast::Receiver<FeeStateEvent> {
+        self.fee_state_tx.subscribe()
+    }
+
+    pub fn broadcast_analytics(&self, event: AnalyticsEvent) -> Result<()> {
+        if let Err(error) = self.analytics_tx.send(event) {
+            warn!("Failed to broadcast analytics event: {error}");
+        }
+        Ok(())
+    }
+
+    pub fn subscribe_analytics(&self) -> broadcast::Receiver<AnalyticsEvent> {
+        self.analytics_tx.subscribe()
     }
 }
 

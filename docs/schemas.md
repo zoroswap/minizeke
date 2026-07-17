@@ -201,6 +201,38 @@ Runtime LP accounting is stored in `lp.<network>.sqlite3` by default:
 The note is the chain commit point. Replaying a confirmed note is safe because both the
 journal and Processing deduplicate it before changing shares or curve state.
 
+## Finalized execution, fees, and analytics
+
+`execution.<network>.sqlite3` contains:
+
+- `swap_accounting`: proposed/executed/failed swaps, oracle marks, quoted and credited output,
+  retained surplus, fee version, and exact LP/backstop/protocol/volatility components.
+- `pool_snapshots`: the latest finalized curve state per faucet, restored after restart.
+
+`fees.<network>.sqlite3` contains versioned fee batches and their per-asset expansion. An
+automatic or manual batch is atomic and idempotent by `batch_id`. The public fee precision is
+`1_000_000`; one basis point is 100 units. Every volatility fee has `valid_until`. Expired state
+is represented as zero volatility fee while static base fields remain unchanged.
+
+`analytics.<network>.sqlite3` is an append-only idempotent event journal with projections for:
+
+- weighted-average-cost user positions and realized/unrealized marked PnL;
+- completed funding/redeem cash flows (`INIT_REDEEM` affects pending totals only);
+- finalized swap volume, fills, and fees;
+- LP deposits/withdrawals, pool NAV/TVL, inventory PnL, and fee totals;
+- event-time oracle marks and explicit history coverage.
+
+## Wallet session schema
+
+`auth.<network>.sqlite3` stores one-time challenges and opaque sessions. The challenge message is
+Poseidon2 over a domain-separation tag, length-prefixed domain and network, user suffix/prefix,
+the vault pubkey commitment, a random 32-byte nonce, issue time, and expiry. Login accepts only
+ECDSA k256-keccak keys whose commitment equals the user's current vault registration.
+
+Bearer tokens are random 32-byte values returned once. Only a domain-separated Poseidon2 token
+commitment is persisted. Private WebSocket subscriptions use an `Authenticate` client frame and
+are bound to the session user.
+
 `POST /lp/deposits/note` accepts:
 
 ```json

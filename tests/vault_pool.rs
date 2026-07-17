@@ -786,7 +786,7 @@ async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
     let swap_amount_in: u64 = 100;
     // pair price 1.0, scaled by 1e12 like PriceData::quote_with
     let price = U256::from(10).pow(U256::from(12));
-    let (amount_out, new_balances0, new_balances1) = get_curve_amount_out(
+    let quote = get_curve_amount_out(
         &pool_state0,
         &pool_state1,
         U256::from(pool_state0.metadata().asset_decimals),
@@ -794,15 +794,15 @@ async fn test_lp_deposit_withdraw_e2e() -> Result<()> {
         U256::from(swap_amount_in),
         price,
     )?;
-    let amount_out_u64 = amount_out.saturating_to::<u64>();
+    let amount_out_u64 = quote.amount_out.saturating_to::<u64>();
     info!("[TEST] curve quote: {swap_amount_in} asset0 -> {amount_out_u64} asset1");
     assert!(amount_out_u64 > 0, "curve quote should be non-zero");
     assert!(
         amount_out_u64 <= swap_amount_in,
         "balanced pools at price 1.0 cannot pay out more than put in"
     );
-    pool_state0.update_balances(new_balances0);
-    pool_state1.update_balances(new_balances1);
+    pool_state0.update_balances(quote.new_base_pool_balances);
+    pool_state1.update_balances(quote.new_quote_pool_balances);
 
     info!("[TEST] executing curve-quoted swap");
     let (intent, advice) = signed_intent(

@@ -80,6 +80,12 @@ pub async fn get_lp_client() -> Result<Client<FilesystemKeyStore>> {
     build_client(format!("lp.{}", network.store_path())).await
 }
 
+/// Independent read client for durable user cash-flow analytics.
+pub async fn get_analytics_client() -> Result<Client<FilesystemKeyStore>> {
+    let network = MidenNetwork::from_env();
+    build_client(format!("analytics.{}", network.store_path())).await
+}
+
 async fn build_client(store_path: String) -> Result<Client<FilesystemKeyStore>> {
     dotenv().ok();
 

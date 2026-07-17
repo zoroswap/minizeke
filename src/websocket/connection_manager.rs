@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{broadcast::error::RecvError, mpsc};
 use tracing::{debug, error, trace, warn};
@@ -12,10 +12,11 @@ use uuid::Uuid;
 
 use crate::{
     message_broker::{
-        message_broker::MessageBroker,
+        message_broker::{MessageBroker, OraclePriceEvent},
         messages::{ServerMessage, SubscriptionChannel},
     },
     order::{OrderStatus, OrderUpdate},
+    websocket::oracle_throttle::OracleWsThrottle,
 };
 
 /// Metadata about a WebSocket connection
@@ -23,6 +24,7 @@ pub struct ConnectionMetadata {
     pub connected_at: DateTime<Utc>,
     pub last_pong: Arc<Mutex<DateTime<Utc>>>,
     pub ip_address: Option<String>,
+    pub authenticated_user: Arc<Mutex<Option<String>>>,
 }
 
 impl ConnectionMetadata {
@@ -32,6 +34,7 @@ impl ConnectionMetadata {
             connected_at: now,
             last_pong: Arc::new(Mutex::new(now)),
             ip_address,
+            authenticated_user: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -116,6 +119,20 @@ impl ConnectionManager {
             total_subscribers = self.subscriptions.get(&channel).map(|s| s.len()).unwrap_or(0),
             "Subscription added"
         );
+    }
+
+    pub fn set_authenticated_user(&self, conn_id: Uuid, user_id: String) {
+        if let Some(connection) = self.connections.get(&conn_id)
+            && let Ok(mut authenticated) = connection.metadata.authenticated_user.lock()
+        {
+            *authenticated = Some(user_id);
+        }
+    }
+
+    pub fn authenticated_user(&self, conn_id: Uuid) -> Option<String> {
+        let connection = self.connections.get(&conn_id)?;
+        let authenticated = connection.metadata.authenticated_user.lock().ok()?;
+        authenticated.clone()
     }
 
     /// Unsubscribe a connection from a channel
@@ -288,25 +305,30 @@ impl ConnectionManager {
             let conn_mgr = self.clone();
             tokio::spawn(async move {
                 let mut rx = message_broker.subscribe_oracle_prices();
+                let mut throttle = OracleWsThrottle::from_env();
                 loop {
-                    match rx.recv().await {
+                    let received = if let Some(deadline) = throttle.next_deadline() {
+                        tokio::select! {
+                            result = rx.recv() => Some(result),
+                            _ = tokio::time::sleep_until(deadline.into()) => {
+                                for event in throttle.flush_due(Instant::now()) {
+                                    conn_mgr.broadcast_oracle_price_event(event);
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        Some(rx.recv().await)
+                    };
+
+                    let Some(received) = received else {
+                        continue;
+                    };
+                    match received {
                         Ok(event) => {
-                            let message = ServerMessage::OraclePriceUpdate {
-                                oracle_id: event.oracle_id.clone(),
-                                faucet_id: event.faucet_id,
-                                price: event.price,
-                                timestamp: event.timestamp,
-                            };
-                            conn_mgr.broadcast_to_channel(
-                                &SubscriptionChannel::OraclePrices { oracle_id: None },
-                                message.clone(),
-                            );
-                            conn_mgr.broadcast_to_channel(
-                                &SubscriptionChannel::OraclePrices {
-                                    oracle_id: Some(event.oracle_id),
-                                },
-                                message,
-                            );
+                            if let Some(event) = throttle.push(event, Instant::now()) {
+                                conn_mgr.broadcast_oracle_price_event(event);
+                            }
                         }
                         Err(RecvError::Lagged(n)) => warn!("Oracle prices lagged, skipped {n}"),
                         Err(RecvError::Closed) => {
@@ -437,6 +459,35 @@ impl ConnectionManager {
             });
         }
 
+        // User analytics invalidation notifications
+        {
+            let message_broker = message_broker.clone();
+            let conn_mgr = self.clone();
+            tokio::spawn(async move {
+                let mut rx = message_broker.subscribe_analytics();
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let user_id = event.user_id.to_hex();
+                            conn_mgr.broadcast_to_channel(
+                                &SubscriptionChannel::Analytics {
+                                    user_id: Some(user_id.clone()),
+                                },
+                                ServerMessage::AnalyticsUpdate {
+                                    user_id,
+                                    timestamp: event.timestamp,
+                                },
+                            );
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            warn!("Analytics updates lagged, skipped {n}")
+                        }
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         // Executed curve fills
         {
             let message_broker = message_broker.clone();
@@ -469,6 +520,25 @@ impl ConnectionManager {
         }
 
         debug!("Event forwarding tasks started");
+    }
+
+    fn broadcast_oracle_price_event(&self, event: OraclePriceEvent) {
+        let message = ServerMessage::OraclePriceUpdate {
+            oracle_id: event.oracle_id.clone(),
+            faucet_id: event.faucet_id,
+            price: event.price,
+            timestamp: event.timestamp,
+        };
+        self.broadcast_to_channel(
+            &SubscriptionChannel::OraclePrices { oracle_id: None },
+            message.clone(),
+        );
+        self.broadcast_to_channel(
+            &SubscriptionChannel::OraclePrices {
+                oracle_id: Some(event.oracle_id),
+            },
+            message,
+        );
     }
 
     /// Check for and remove stale connections

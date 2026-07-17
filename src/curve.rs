@@ -264,16 +264,54 @@ impl ZoroCurve {
 }
 
 /// Constants for fee calculations
-const FEE_PRECISION: U256 = U256::from_limbs([1_000_000, 0, 0, 0]); // 10^6
+pub const FEE_PRECISION: U256 = U256::from_limbs([1_000_000, 0, 0, 0]); // 10^6
 pub const PRICE_SCALING_FACTOR: i128 = 1e12 as i128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapFeeBreakdown {
+    pub raw_amount_out: U256,
+    pub backstop_fee: U256,
+    pub protocol_fee: U256,
+    pub volatility_fee: U256,
+    pub lp_fee: U256,
+    pub max_lp_fee: U256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapQuote {
+    /// Maximum output produced by the curve before the user's signed minimum is applied.
+    pub amount_out: U256,
+    /// Output actually credited to the signed intent. Equal to `amount_out` until execution
+    /// applies the signed minimum.
+    pub credited_amount_out: U256,
+    /// Quote improvement retained by the output pool.
+    pub retained_surplus: U256,
+    pub new_base_pool_balances: PoolBalances,
+    pub new_quote_pool_balances: PoolBalances,
+    pub fees: SwapFeeBreakdown,
+}
+
+impl SwapQuote {
+    pub fn credit_to(mut self, credited_amount_out: U256) -> Self {
+        let credited_amount_out = credited_amount_out.min(self.amount_out);
+        self.retained_surplus = self.amount_out - credited_amount_out;
+        self.credited_amount_out = credited_amount_out;
+        self.new_quote_pool_balances.reserve = self
+            .new_quote_pool_balances
+            .reserve
+            .saturating_add(self.retained_surplus);
+        self.new_quote_pool_balances.reserve_with_slippage = self
+            .new_quote_pool_balances
+            .reserve_with_slippage
+            .saturating_add(self.retained_surplus);
+        self
+    }
+}
 
 /// Calculates the amount out for a swap.
 ///
 /// Implements the protocol's swap calculation logic, taking into account pool
 /// imbalances, fees, and slippage.
-///
-/// # Returns
-/// `(amount_out, new_base_pool_balances, new_quote_pool_balances)`
 ///
 /// # Errors
 /// Returns an error if the amount out exceeds the reserve.
@@ -284,9 +322,28 @@ pub fn get_curve_amount_out(
     asset_decimals_out: U256,
     amount_in: U256,
     price: U256,
-) -> Result<(U256, PoolBalances, PoolBalances)> {
+) -> Result<SwapQuote> {
+    get_curve_amount_out_with_volatility_fee(
+        base_pool,
+        quote_pool,
+        asset_decimals_in,
+        asset_decimals_out,
+        amount_in,
+        price,
+        U256::ZERO,
+    )
+}
+
+pub fn get_curve_amount_out_with_volatility_fee(
+    base_pool: &PoolState,
+    quote_pool: &PoolState,
+    asset_decimals_in: U256,
+    asset_decimals_out: U256,
+    amount_in: U256,
+    price: U256,
+    volatility_fee: U256,
+) -> Result<SwapQuote> {
     let price_scaling_factor = U256::from(PRICE_SCALING_FACTOR);
-    let fee = quote_pool.settings().backstop_fee + quote_pool.settings().protocol_fee;
     let lp_fee = quote_pool.settings().swap_fee;
     // Initialize curves by direction
     let curve_in = ZoroCurve::new(
@@ -329,7 +386,21 @@ pub fn get_curve_amount_out(
     if (base_pool.balances().reserve + effective_amount_in)
         > (U256::from(2) * base_pool.balances().total_liabilities)
     {
-        return Ok((U256::ZERO, *base_pool.balances(), *quote_pool.balances()));
+        return Ok(SwapQuote {
+            amount_out: U256::ZERO,
+            credited_amount_out: U256::ZERO,
+            retained_surplus: U256::ZERO,
+            new_base_pool_balances: *base_pool.balances(),
+            new_quote_pool_balances: *quote_pool.balances(),
+            fees: SwapFeeBreakdown {
+                raw_amount_out: U256::ZERO,
+                backstop_fee: U256::ZERO,
+                protocol_fee: U256::ZERO,
+                volatility_fee: U256::ZERO,
+                lp_fee: U256::ZERO,
+                max_lp_fee: U256::ZERO,
+            },
+        });
     }
 
     // AMOUNT OUT BEFORE FEES AND OUT TOKEN POOL IMBALANCE
@@ -348,7 +419,10 @@ pub fn get_curve_amount_out(
     let raw_amount_out = effective_amount_in * price / scaling_factor;
 
     // COMPUTE FEES
-    let fee_amount = raw_amount_out * fee / FEE_PRECISION;
+    let backstop_fee_amount = raw_amount_out * quote_pool.settings().backstop_fee / FEE_PRECISION;
+    let protocol_fee_amount = raw_amount_out * quote_pool.settings().protocol_fee / FEE_PRECISION;
+    let volatility_fee_amount = raw_amount_out * volatility_fee / FEE_PRECISION;
+    let fee_amount = backstop_fee_amount + protocol_fee_amount + volatility_fee_amount;
     let max_lp_fee = raw_amount_out * lp_fee / FEE_PRECISION;
 
     // ADJUST FOR OUT TOKEN POOL IMBALANCE
@@ -416,7 +490,21 @@ pub fn get_curve_amount_out(
         total_liabilities: actual_total_liabilities_out,
     };
 
-    Ok((amount_out, new_pool_balances_base, new_pool_balances_quote))
+    Ok(SwapQuote {
+        amount_out,
+        credited_amount_out: amount_out,
+        retained_surplus: U256::ZERO,
+        new_base_pool_balances: new_pool_balances_base,
+        new_quote_pool_balances: new_pool_balances_quote,
+        fees: SwapFeeBreakdown {
+            raw_amount_out,
+            backstop_fee: backstop_fee_amount,
+            protocol_fee: protocol_fee_amount,
+            volatility_fee: volatility_fee_amount,
+            lp_fee: actual_lp_fee_amount,
+            max_lp_fee,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -500,6 +588,7 @@ mod tests {
                 swap_fee: U256::from(200),
                 backstop_fee: U256::from(300),
                 protocol_fee: U256::from(300),
+                ..PoolSettings::default()
             },
             PoolBalances {
                 reserve: parse_ether("1000"),
@@ -523,7 +612,7 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let amount_out = result.unwrap().0;
+        let amount_out = result.unwrap().amount_out;
         // Reference value produced by the proprietary zoro-curve crate with these
         // exact pool settings (verified against ../zoro-curve directly).
         let expected_amount_out = U256::from(9993944727768167277u64);
@@ -539,6 +628,7 @@ mod tests {
                 swap_fee: U256::from(200),
                 backstop_fee: U256::from(300),
                 protocol_fee: U256::from(300),
+                ..PoolSettings::default()
             },
             PoolBalances {
                 reserve: U256::from(5_000_000_000_000_000_000u64),
@@ -562,7 +652,38 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let amount_out = result.unwrap().0;
+        let amount_out = result.unwrap().amount_out;
         assert_eq!(amount_out, U256::ZERO);
+    }
+
+    #[test]
+    fn credited_output_retains_quote_improvement_in_pool() {
+        let quote = SwapQuote {
+            amount_out: U256::from(100),
+            credited_amount_out: U256::from(100),
+            retained_surplus: U256::ZERO,
+            new_base_pool_balances: PoolBalances::default(),
+            new_quote_pool_balances: PoolBalances {
+                reserve: U256::from(900),
+                reserve_with_slippage: U256::from(850),
+                total_liabilities: U256::from(1_000),
+            },
+            fees: SwapFeeBreakdown {
+                raw_amount_out: U256::from(100),
+                backstop_fee: U256::ZERO,
+                protocol_fee: U256::ZERO,
+                volatility_fee: U256::ZERO,
+                lp_fee: U256::ZERO,
+                max_lp_fee: U256::ZERO,
+            },
+        }
+        .credit_to(U256::from(90));
+        assert_eq!(quote.credited_amount_out, U256::from(90));
+        assert_eq!(quote.retained_surplus, U256::from(10));
+        assert_eq!(quote.new_quote_pool_balances.reserve, U256::from(910));
+        assert_eq!(
+            quote.new_quote_pool_balances.reserve_with_slippage,
+            U256::from(860)
+        );
     }
 }

@@ -20,6 +20,7 @@ use crate::{
     assembly_utils::{link_math, link_operator, link_pool},
     deployment::{AssetInfo, Deployment},
     execution_script::make_exec_script,
+    execution_store::ExecutionStore,
     intent::Intent,
     lp_store::LpStore,
     message_broker::message_broker::{AmmEvent, MessageBroker},
@@ -113,10 +114,8 @@ impl MidenExecution {
             pools.len()
         );
 
-        // Rebuild server-side pool state deterministically by replaying the recorded
-        // liquidity deposits through the curve's deposit math.
-        // Known limitation: pool state mutated by past swaps is not recovered on restart —
-        // pool-state persistence is a follow-up.
+        // Rebuild the baseline from liquidity operations, then replace assets for which a
+        // finalized execution snapshot exists.
         let mut pool_states = HashMap::with_capacity(assets.len());
         for asset in &assets {
             pool_states.insert(
@@ -162,9 +161,18 @@ impl MidenExecution {
                 pool.update_state(balances, supply);
             }
         }
+        let execution_store = ExecutionStore::open_from_env()?;
+        let restored_states = execution_store.latest_pool_states()?;
+        let restored_count = restored_states.len();
+        for (faucet_id, state) in restored_states {
+            if pool_states.contains_key(&faucet_id) {
+                pool_states.insert(faucet_id, state);
+            }
+        }
         info!(
             deposits = deployment.deposits.len(),
-            "Rebuilt pool states from recorded deposits"
+            restored_snapshots = restored_count,
+            "Rebuilt pool states from liquidity and finalized swap snapshots"
         );
 
         Ok(Self {

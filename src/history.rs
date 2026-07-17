@@ -98,6 +98,14 @@ pub struct TradingStats {
     pub failures_by_reason: HashMap<String, u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UserOrderStats {
+    pub total_orders: u64,
+    pub executed_orders: u64,
+    pub failed_orders: u64,
+    pub fill_rate: f64,
+}
+
 pub struct HistoryStore {
     connection: Mutex<Connection>,
 }
@@ -283,6 +291,31 @@ impl HistoryStore {
         self.connection
             .lock()
             .map_err(|_| anyhow!("history database lock poisoned"))
+    }
+
+    pub fn user_order_stats(&self, user_id: &str) -> Result<UserOrderStats> {
+        let connection = self.connection()?;
+        let (total, executed, failed): (i64, i64, i64) = connection.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status IN ('executed','settled') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+             FROM orders WHERE user_id = ?1",
+            [user_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let total_orders = u64::try_from(total)?;
+        let executed_orders = u64::try_from(executed)?;
+        let failed_orders = u64::try_from(failed)?;
+        Ok(UserOrderStats {
+            total_orders,
+            executed_orders,
+            failed_orders,
+            fill_rate: if executed_orders + failed_orders == 0 {
+                0.0
+            } else {
+                executed_orders as f64 / (executed_orders + failed_orders) as f64
+            },
+        })
     }
 
     pub fn persist_order_update(&self, update: &OrderUpdate) -> Result<()> {

@@ -11,10 +11,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use minizeke::*;
 
 use crate::{
+    analytics_store::AnalyticsStore,
+    auth::{AuthConfig, AuthStore},
     deployment::AssetInfo,
+    fee_store::{FeeStore, apply_fee_states},
     history::{HistoryStore, start_history_service},
     lp::LpService,
-    message_broker::message_broker::{MessageBroker, StatsEvent},
+    message_broker::message_broker::{FeeStateEvent, MessageBroker, StatsEvent},
     miden_execution::MidenExecution,
     oracle_sse::OracleSSEClient,
     pool::PoolState,
@@ -109,7 +112,33 @@ fn main() {
 }
 
 #[tokio::main]
-async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> Result<()> {
+async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>) -> Result<()> {
+    println!("[INIT] Initializing authentication database");
+    let auth_config = AuthConfig::new(
+        env::var("AUTH_DOMAIN").unwrap_or_else(|_| "minizeke".to_owned()),
+        env::var("MIDEN_NETWORK").unwrap_or_else(|_| "testnet".to_owned()),
+        env::var("AUTH_CHALLENGE_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60),
+        env::var("AUTH_SESSION_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_800),
+    )?;
+    let auth_path = env::var("AUTH_DB_PATH").unwrap_or_else(|_| {
+        let network = env::var("MIDEN_NETWORK").unwrap_or_else(|_| "testnet".to_owned());
+        format!("auth.{}.sqlite3", network.to_ascii_lowercase())
+    });
+    let auth_store = Arc::new(AuthStore::open(auth_path, auth_config)?);
+    println!("[INIT] Initializing analytics database");
+    let analytics_store = Arc::new(AnalyticsStore::open_from_env()?);
+    analytics::initialize(analytics_store.clone()).await?;
+    println!("[INIT] Initializing dynamic fee database");
+    let fee_store = Arc::new(FeeStore::open_from_env()?);
+    let now = chrono::Utc::now().timestamp() as u64;
+    let active_fee_states = fee_store.active_states(now)?;
+    apply_fee_states(&mut init_data.pool_states, &active_fee_states);
     println!("[INIT] Connection manager");
     let connection_manager = Arc::new(ConnectionManager::with_message_broker(
         message_broker.clone(),
@@ -174,6 +203,33 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
         processing.start().await;
     });
 
+    println!("[RUN] Starting volatility-fee expiry task");
+    {
+        let fee_store = fee_store.clone();
+        let message_broker = message_broker.clone();
+        tokio::spawn(async move {
+            let interval_secs = env::var("FEE_EXPIRY_CHECK_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                interval.tick().await;
+                let now = chrono::Utc::now().timestamp() as u64;
+                match fee_store.expire(now) {
+                    Ok(true) => {
+                        let _ = message_broker.broadcast_fee_state(FeeStateEvent {
+                            fee_states: HashMap::new(),
+                            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(error) => warn!(%error, "failed to expire volatility fee"),
+                }
+            }
+        });
+    }
+
     println!("[RUN] Starting oracle listener");
     tokio::spawn(async move {
         if let Err(e) = oracle_client.start().await {
@@ -236,6 +292,9 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
         store,
         history,
         lp_service,
+        fee_store,
+        auth_store,
+        analytics_store,
     )
     .await?;
 

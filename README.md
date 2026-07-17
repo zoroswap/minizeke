@@ -7,7 +7,7 @@ minizeke is a Miden spot-swap prototype. A public network vault holds assets and
 1. Deploy faucets, the vault, and the first pool shard.
 2. Seed each asset through the vault.
 3. Register a user and fund the vault with public network notes.
-4. Submit an order with the user's public key and signature.
+4. Authenticate with the vault-registered trading key, then submit a signed order with its Bearer session.
 5. The server quotes the order and assigns it to the user's shard.
 6. The pool verifies the eight-felt intent, reads fresh vault totals by FPI, and updates both swap legs in one transaction.
 7. Redeem in two notes: initiate the redeem, then consume the redeem note to receive a P2ID payout.
@@ -47,6 +47,14 @@ Optional values:
 - `LP_CHECKPOINT_INTERVAL_SECS`: LP entitlement checkpoint interval. Default: `600`.
 - `LP_SYNC_INTERVAL_SECS`: interval for discovering consumed LP notes. Default: `2`.
 - `LP_MIN_DEPOSIT_AMOUNT`: minimum permissionless deposit in base units. Default: `1`.
+- `EXECUTION_DB_PATH`: finalized swap and pool-state journal. Default: `execution.<network>.sqlite3`.
+- `ANALYTICS_DB_PATH`: WAC user and pool analytics journal. Default: `analytics.<network>.sqlite3`.
+- `AUTH_DB_PATH`: wallet challenges and hashed opaque sessions. Default: `auth.<network>.sqlite3`.
+- `FEE_DB_PATH`: volatility-fee batches and validity state. Default: `fees.<network>.sqlite3`.
+- `ORACLE_WS_MIN_INTERVAL_MS` / `ORACLE_WS_BPS_THRESHOLD`: frontend oracle coalescing. Defaults: `1000` / `20`.
+- `AUTH_DOMAIN`, `AUTH_CHALLENGE_TTL_SECS`, `AUTH_SESSION_TTL_SECS`: signed login domain and TTLs.
+- `CORS_ALLOWED_ORIGINS`: comma-separated frontend origins.
+- `FEE_UPDATER_TOKEN`: service credential shared with the isolated fee updater.
 - `FAUCET_MINT_AMOUNT`: amount minted per request. Default: `10000000`.
 - `FAUCET_MINT_COOLDOWN_SECS`: cooldown per recipient and faucet. Default: `240`.
 - `ASSETS_FILE`: deploy-time asset config. Default: `assets.toml`.
@@ -103,6 +111,37 @@ cargo run
 ```
 
 The main process requires a valid schema-v2 deployment file and does not deploy accounts.
+
+Run the isolated volatility-fee updater separately:
+
+```sh
+cargo run --bin fee_updater
+```
+
+It uses the same EWMA, logarithmic fee curve, deadband, spike, and refresh policy as
+`../fee_updater`, samples `FEE_ORACLE_FEED_ID`, and pushes one surge value to all configured
+assets and both directions. Every update expires; `VALIDITY_PERIOD_SECS` defaults to `600`,
+with refresh at `REFRESH_FRACTION=0.8`. If the updater stops, the server retains static base
+fees and automatically clears expired surge fees.
+
+## Authentication and private APIs
+
+`POST /auth/challenge` accepts `{\"user_id\":\"0x...\"}`. The wallet signs the returned
+Poseidon2 message with the trading key registered in the vault, then sends the base64 public
+key and signature to `POST /auth/login`. Login returns a short-lived opaque Bearer token; only
+its Poseidon2 commitment is stored.
+
+Bearer authentication is required for order submission, private order/trade history, LP-owned
+records, and `/users/me/*` analytics. Public market trades are redacted. WebSocket clients send
+`{\"type\":\"Authenticate\",\"token\":\"...\"}` before subscribing to private `user`,
+`order_updates`, or `analytics` channels.
+
+Frontend analytics routes:
+
+- `GET /users/me/analytics`, `/users/me/pnl`, `/users/me/positions`, `/users/me/events`
+- `GET /pools/analytics`, `/pools/{faucet_id}/analytics`
+- `GET /pools/info` and WebSocket `pool_state` include base fees, volatility fee in/out,
+  source, version, precision, and `valid_until`.
 
 ## Extend a deployment
 

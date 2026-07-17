@@ -98,7 +98,7 @@ fn derive_side(
         let cumulative_input = input_step
             .checked_mul(index as u64)
             .ok_or_else(|| anyhow!("depth input overflow"))?;
-        let (output, _, _) = get_curve_amount_out(
+        let quote = get_curve_amount_out(
             input_pool,
             output_pool,
             U256::from(input_pool.metadata().asset_decimals),
@@ -106,7 +106,7 @@ fn derive_side(
             U256::from(cumulative_input),
             U256::from(curve_price),
         )?;
-        let cumulative_output = output.saturating_to::<u64>();
+        let cumulative_output = quote.amount_out.saturating_to::<u64>();
         if cumulative_output == 0 || cumulative_output <= previous_output {
             break;
         }
@@ -154,6 +154,7 @@ mod tests {
                 swap_fee: U256::from(200),
                 backstop_fee: U256::from(300),
                 protocol_fee: U256::ZERO,
+                ..PoolSettings::default()
             },
             PoolBalances {
                 reserve: U256::from(100_000_000_000u64),
