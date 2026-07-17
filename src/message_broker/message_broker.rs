@@ -1,4 +1,11 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    env,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -133,24 +140,47 @@ pub struct MessageBroker {
     pub lp_applied_tx: broadcast::Sender<LpAppliedEvent>,
     pub fee_state_tx: broadcast::Sender<FeeStateEvent>,
     pub analytics_tx: broadcast::Sender<AnalyticsEvent>,
+    metrics: Arc<BrokerMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelClass {
+    /// Notification only; consumers recover authoritative payloads from durable stores.
+    DurableWakeup,
+    /// Latest state supersedes older values and lag may be coalesced.
+    BestEffortCoalesced,
+    /// Ephemeral lifecycle signal with bounded loss tolerance.
+    BestEffort,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BrokerMetricSnapshot {
+    pub lagged_messages: u64,
+    pub dropped_without_receivers: u64,
+}
+
+#[derive(Default)]
+struct BrokerMetrics {
+    lagged_messages: AtomicU64,
+    dropped_without_receivers: AtomicU64,
 }
 
 impl MessageBroker {
     /// Create a new MessageBroker with specified channel capacities
     pub fn new() -> Self {
-        // Buffer sizes based on expected message frequency
-        let (order_updates_tx, _) = broadcast::channel(1000); // High volume
-        let (pool_state_tx, _) = broadcast::channel(100);
-        let (oracle_prices_tx, _) = broadcast::channel(100);
-        let (stats_tx, _) = broadcast::channel(10);
-        let (amm_tx, _) = broadcast::channel(100);
-        let (user_tx, _) = broadcast::channel(100);
-        let (processed_batch_tx, _) = broadcast::channel(100);
-        let (trades_tx, _) = broadcast::channel(1000);
-        let (lp_chain_tx, _) = broadcast::channel(100);
-        let (lp_applied_tx, _) = broadcast::channel(100);
-        let (fee_state_tx, _) = broadcast::channel(20);
-        let (analytics_tx, _) = broadcast::channel(100);
+        let (order_updates_tx, _) = broadcast::channel(capacity("BROKER_ORDER_CAPACITY", 1000));
+        let (pool_state_tx, _) = broadcast::channel(capacity("BROKER_POOL_STATE_CAPACITY", 100));
+        let (oracle_prices_tx, _) = broadcast::channel(capacity("BROKER_ORACLE_CAPACITY", 100));
+        let (stats_tx, _) = broadcast::channel(capacity("BROKER_STATS_CAPACITY", 10));
+        let (amm_tx, _) = broadcast::channel(capacity("BROKER_AMM_CAPACITY", 100));
+        let (user_tx, _) = broadcast::channel(capacity("BROKER_USER_CAPACITY", 100));
+        let (processed_batch_tx, _) =
+            broadcast::channel(capacity("BROKER_PROCESSED_BATCH_CAPACITY", 100));
+        let (trades_tx, _) = broadcast::channel(capacity("BROKER_TRADE_CAPACITY", 1000));
+        let (lp_chain_tx, _) = broadcast::channel(capacity("BROKER_LP_CAPACITY", 100));
+        let (lp_applied_tx, _) = broadcast::channel(capacity("BROKER_LP_APPLIED_CAPACITY", 100));
+        let (fee_state_tx, _) = broadcast::channel(capacity("BROKER_FEE_STATE_CAPACITY", 20));
+        let (analytics_tx, _) = broadcast::channel(capacity("BROKER_ANALYTICS_CAPACITY", 100));
 
         Self {
             order_updates_tx,
@@ -165,7 +195,42 @@ impl MessageBroker {
             lp_applied_tx,
             fee_state_tx,
             analytics_tx,
+            metrics: Arc::new(BrokerMetrics::default()),
         }
+    }
+
+    pub fn channel_class(channel: &str) -> Option<ChannelClass> {
+        match channel {
+            "order" | "processed_batch" | "lp" | "lp_applied" | "fee_state" => {
+                Some(ChannelClass::DurableWakeup)
+            }
+            "oracle" | "stats" | "pool_state" => Some(ChannelClass::BestEffortCoalesced),
+            "amm" | "user" | "trade" | "analytics" => Some(ChannelClass::BestEffort),
+            _ => None,
+        }
+    }
+
+    pub fn record_lag(&self, channel: &'static str, skipped: u64) {
+        self.metrics
+            .lagged_messages
+            .fetch_add(skipped, Ordering::Relaxed);
+        warn!(channel, skipped, "broker subscriber lagged");
+    }
+
+    pub fn metrics(&self) -> BrokerMetricSnapshot {
+        BrokerMetricSnapshot {
+            lagged_messages: self.metrics.lagged_messages.load(Ordering::Relaxed),
+            dropped_without_receivers: self
+                .metrics
+                .dropped_without_receivers
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_unobserved(&self) {
+        self.metrics
+            .dropped_without_receivers
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Broadcast an order update event
@@ -178,6 +243,7 @@ impl MessageBroker {
                 Ok(())
             }
             Err(e) => {
+                self.record_unobserved();
                 warn!("Failed to broadcast order update: {}", e);
                 Ok(()) // Don't fail the operation if broadcast fails
             }
@@ -189,6 +255,7 @@ impl MessageBroker {
         match self.pool_state_tx.send(event) {
             Ok(_) => Ok(()),
             Err(e) => {
+                self.record_unobserved();
                 warn!("Failed to broadcast pool state: {}", e);
                 Ok(())
             }
@@ -200,6 +267,7 @@ impl MessageBroker {
         match self.oracle_prices_tx.send(event) {
             Ok(_) => Ok(()),
             Err(e) => {
+                self.record_unobserved();
                 warn!("Failed to broadcast oracle price: {}", e);
                 Ok(())
             }
@@ -211,6 +279,7 @@ impl MessageBroker {
         match self.stats_tx.send(event) {
             Ok(_) => Ok(()),
             Err(e) => {
+                self.record_unobserved();
                 warn!("Failed to broadcast stats: {}", e);
                 Ok(())
             }
@@ -222,6 +291,7 @@ impl MessageBroker {
         match self.amm_tx.send(event) {
             Ok(_) => Ok(()),
             Err(e) => {
+                self.record_unobserved();
                 warn!("Failed to broadcast amm event: {}", e);
                 Ok(())
             }
@@ -233,6 +303,7 @@ impl MessageBroker {
         match self.user_tx.send(event) {
             Ok(_) => Ok(()),
             Err(e) => {
+                self.record_unobserved();
                 warn!("Failed to broadcast amm event: {}", e);
                 Ok(())
             }
@@ -241,6 +312,7 @@ impl MessageBroker {
 
     pub fn broadcast_trade(&self, event: TradeEvent) -> Result<()> {
         if let Err(error) = self.trades_tx.send(event) {
+            self.record_unobserved();
             warn!("Failed to broadcast trade event: {error}");
         }
         Ok(())
@@ -248,6 +320,7 @@ impl MessageBroker {
 
     pub fn broadcast_lp_chain(&self, event: LpChainEvent) -> Result<()> {
         if let Err(error) = self.lp_chain_tx.send(event) {
+            self.record_unobserved();
             warn!("Failed to broadcast LP chain event: {error}");
         }
         Ok(())
@@ -255,6 +328,7 @@ impl MessageBroker {
 
     pub fn broadcast_lp_applied(&self, event: LpAppliedEvent) -> Result<()> {
         if let Err(error) = self.lp_applied_tx.send(event) {
+            self.record_unobserved();
             warn!("Failed to broadcast LP applied event: {error}");
         }
         Ok(())
@@ -262,6 +336,7 @@ impl MessageBroker {
 
     pub fn broadcast_fee_state(&self, event: FeeStateEvent) -> Result<()> {
         if let Err(error) = self.fee_state_tx.send(event) {
+            self.record_unobserved();
             warn!("Failed to broadcast fee state event: {error}");
         }
         Ok(())
@@ -272,6 +347,7 @@ impl MessageBroker {
         match self.processed_batch_tx.send(batch) {
             Ok(_) => Ok(()),
             Err(e) => {
+                self.record_unobserved();
                 warn!("Failed to broadcast processed batch: {}", e);
                 Ok(())
             }
@@ -331,6 +407,7 @@ impl MessageBroker {
 
     pub fn broadcast_analytics(&self, event: AnalyticsEvent) -> Result<()> {
         if let Err(error) = self.analytics_tx.send(event) {
+            self.record_unobserved();
             warn!("Failed to broadcast analytics event: {error}");
         }
         Ok(())
@@ -344,5 +421,52 @@ impl MessageBroker {
 impl Default for MessageBroker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn capacity(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_classes_separate_recoverable_and_coalesced_payloads() {
+        assert_eq!(
+            MessageBroker::channel_class("lp"),
+            Some(ChannelClass::DurableWakeup)
+        );
+        assert_eq!(
+            MessageBroker::channel_class("oracle"),
+            Some(ChannelClass::BestEffortCoalesced)
+        );
+        assert_eq!(
+            MessageBroker::channel_class("stats"),
+            Some(ChannelClass::BestEffortCoalesced)
+        );
+    }
+
+    #[test]
+    fn unobserved_sends_are_counted() {
+        let broker = MessageBroker::new();
+        broker
+            .broadcast_oracle_price(OraclePriceEvent {
+                oracle_id: "oracle".into(),
+                faucet_id: "asset".into(),
+                price: 1,
+                timestamp: 1,
+            })
+            .unwrap();
+        assert_eq!(broker.metrics().dropped_without_receivers, 1);
+
+        broker.record_lag("oracle", 3);
+        broker.record_lag("order", 2);
+        assert_eq!(broker.metrics().lagged_messages, 5);
     }
 }

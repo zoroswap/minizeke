@@ -248,6 +248,12 @@ pub struct JournalEvent {
     pub payload: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NoteCursor {
+    pub block_num: u32,
+    pub note_id: String,
+}
+
 /// SQLite-backed event journal. Every event insert and projection update commits atomically.
 pub struct AnalyticsStore {
     connection: Mutex<Connection>,
@@ -505,6 +511,41 @@ impl AnalyticsStore {
             )
             .optional()?
             .is_some())
+    }
+
+    pub fn note_cursor(&self, source: &str) -> Result<NoteCursor> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT block_num, note_id FROM analytics_note_cursors WHERE source = ?1",
+                [source],
+                |row| {
+                    Ok(NoteCursor {
+                        block_num: u32::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                        note_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map(|value| value.unwrap_or_default())
+            .map_err(Into::into)
+    }
+
+    pub fn set_note_cursor(&self, source: &str, cursor: &NoteCursor) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO analytics_note_cursors(source, block_num, note_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(source) DO UPDATE SET
+               block_num=excluded.block_num, note_id=excluded.note_id",
+            params![source, cursor.block_num, cursor.note_id],
+        )?;
+        Ok(())
     }
 
     /// Seeds pre-journal holdings. It does not manufacture historical volume or cash flows.
@@ -849,6 +890,12 @@ CREATE TABLE IF NOT EXISTS analytics_events (
 );
 CREATE INDEX IF NOT EXISTS idx_analytics_events_subject_time
     ON analytics_events(subject_id, event_time, sequence);
+
+CREATE TABLE IF NOT EXISTS analytics_note_cursors (
+    source TEXT PRIMARY KEY,
+    block_num INTEGER NOT NULL,
+    note_id TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS analytics_positions (
     user_id TEXT NOT NULL,
@@ -1713,5 +1760,22 @@ mod tests {
         assert!(summary.coverage.opening_snapshot);
         assert_eq!(summary.coverage.coverage_start, Some(1));
         assert!(!summary.coverage.marks_covered);
+    }
+
+    #[test]
+    fn note_cursor_is_stable_within_a_block() {
+        let store = AnalyticsStore::open(":memory:").unwrap();
+        let cursor = NoteCursor {
+            block_num: 9,
+            note_id: "note-02".into(),
+        };
+        store.set_note_cursor("vault", &cursor).unwrap();
+        assert_eq!(store.note_cursor("vault").unwrap(), cursor);
+        assert!(
+            NoteCursor {
+                block_num: 9,
+                note_id: "note-03".into()
+            } > cursor
+        );
     }
 }

@@ -32,6 +32,7 @@ use minizeke::{
     },
 };
 use tracing::info;
+use uuid::Uuid;
 
 const FUND_AMOUNT: u64 = 1_000;
 
@@ -80,16 +81,15 @@ fn signed_intent(
     buy_asset: AccountId,
     buy_amount: u64,
 ) -> (Intent, Vec<Felt>) {
-    let intent = Intent {
-        user_suffix: user_id.suffix().as_canonical_u64(),
-        user_prefix: user_id.prefix().as_u64(),
-        sell_asset_suffix: sell_asset.suffix().as_canonical_u64(),
-        sell_asset_prefix: sell_asset.prefix().as_u64(),
+    let intent = Intent::new_swap(
+        user_id,
+        sell_asset,
         sell_amount,
-        buy_asset_suffix: buy_asset.suffix().as_canonical_u64(),
-        buy_asset_prefix: buy_asset.prefix().as_u64(),
+        buy_asset,
         buy_amount,
-    };
+        Uuid::new_v4(),
+        chrono::Utc::now().timestamp() as u64 + 3_600,
+    );
     let msg = intent.message_word();
     let signature = trading_key.sign(msg);
     let prepared = signature.to_prepared_signature(msg); // [PK[9], SIG[17]]
@@ -200,10 +200,23 @@ async fn test_swap_minimal() -> Result<()> {
         pool_id,
         vault_id,
         vec![intent],
-        advice,
+        advice.clone(),
         &[(asset0, user_id)],
     )
     .await?;
+    let replay = submit_swap(
+        &mut pool_client,
+        pool_id,
+        vault_id,
+        vec![intent],
+        advice,
+        &[(asset0, user_id)],
+    )
+    .await;
+    assert!(
+        replay.is_err(),
+        "the pool must reject a replayed signed client UUID"
+    );
 
     let pool_account = pool_client.try_get_account(pool_id).await?;
     let asset0_cell = pool_cell_from_storage(pool_account.storage(), asset0, user_id)?;
@@ -443,10 +456,23 @@ async fn test_vault_pool_e2e() -> Result<()> {
         pool_id,
         vault_id,
         vec![intent],
-        advice,
+        advice.clone(),
         &[(asset0, user_id)],
     )
     .await?;
+    let replay = submit_swap(
+        &mut pool_client,
+        pool_id,
+        vault_id,
+        vec![intent],
+        advice,
+        &[(asset0, user_id)],
+    )
+    .await;
+    assert!(
+        replay.is_err(),
+        "the pool must reject a replayed signed client UUID"
+    );
 
     let pool_account = pool_client.try_get_account(pool_id).await?;
     let asset0_cell = pool_cell_from_storage(pool_account.storage(), asset0, user_id)?;

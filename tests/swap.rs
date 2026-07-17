@@ -106,17 +106,11 @@ async fn test_swap() -> Result<()> {
     let mut orders = Vec::with_capacity(users.len());
     for user in &users {
         let user_id = user.id();
+        // Miden block headers and the production API both use Unix seconds. Keep this as a
+        // wall-clock deadline: deriving expiry from block height would test a different contract.
+        let expires_at = u64::try_from(chrono::Utc::now().timestamp())? + 3_600;
 
-        let intent = Intent {
-            user_suffix: user_id.suffix().as_canonical_u64(),
-            user_prefix: user_id.prefix().as_u64(),
-            sell_asset_suffix: asset0.suffix().as_canonical_u64(),
-            sell_asset_prefix: asset0.prefix().as_u64(),
-            sell_amount: 10,
-            buy_asset_suffix: asset1.suffix().as_canonical_u64(),
-            buy_asset_prefix: asset1.prefix().as_u64(),
-            buy_amount: 20,
-        };
+        let intent = Intent::new_swap(user_id, asset0, 10, asset1, 20, Uuid::new_v4(), expires_at);
 
         let msg_word = intent.message_word();
         let signature = user.sign(msg_word);
@@ -131,6 +125,7 @@ async fn test_swap() -> Result<()> {
                 min_amount_out: 20,
             },
             user.pubkey(),
+            intent,
         );
 
         let order = order.start_processing();

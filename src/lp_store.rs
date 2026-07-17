@@ -15,6 +15,12 @@ pub enum LpOperationKind {
     Withdraw,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NoteCursor {
+    pub block_num: u32,
+    pub note_id: String,
+}
+
 impl LpOperationKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -352,29 +358,47 @@ impl LpStore {
         Ok(())
     }
 
-    pub fn sync_cursor(&self) -> Result<u32> {
-        let value = self
-            .connection()?
+    pub fn sync_cursor(&self) -> Result<NoteCursor> {
+        let connection = self.connection()?;
+        let block_num = connection
             .query_row(
-                "SELECT value FROM lp_meta WHERE key = 'sync_cursor'",
+                "SELECT value FROM lp_meta WHERE key = 'sync_cursor_block'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?;
-        value
-            .map(|value| value.parse().context("parse LP sync cursor"))
-            .transpose()
-            .map(|value| value.unwrap_or(0))
+            .optional()?
+            .map(|value| value.parse().context("parse LP sync cursor block"))
+            .transpose()?
+            .unwrap_or(0);
+        let note_id = connection
+            .query_row(
+                "SELECT value FROM lp_meta WHERE key = 'sync_cursor_note'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(NoteCursor { block_num, note_id })
     }
 
-    pub fn set_sync_cursor(&self, block_num: u32) -> Result<()> {
-        self.connection()?.execute(
+    pub fn set_sync_cursor(&self, cursor: &NoteCursor) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             r#"
-            INSERT INTO lp_meta(key, value) VALUES ('sync_cursor', ?1)
+            INSERT INTO lp_meta(key, value) VALUES ('sync_cursor_block', ?1)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             "#,
-            [block_num.to_string()],
+            [cursor.block_num.to_string()],
         )?;
+        transaction.execute(
+            r#"
+            INSERT INTO lp_meta(key, value) VALUES ('sync_cursor_note', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            [&cursor.note_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -425,11 +449,18 @@ fn from_sql_u64(value: i64) -> rusqlite::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use alloy_primitives::U256;
     use miden_client::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
     };
 
     use super::*;
+    use crate::{
+        execution_store::ExecutionStore,
+        pool::{PoolBalances, PoolMetadata, PoolSettings, PoolState},
+    };
 
     fn ids() -> (AccountId, AccountId) {
         (
@@ -479,6 +510,70 @@ mod tests {
     }
 
     #[test]
+    fn marker_recovery_acknowledges_journal_without_reapplying_curve() {
+        let lp_store = LpStore::open(":memory:").unwrap();
+        let execution_store = ExecutionStore::open(":memory:").unwrap();
+        let (lp_id, faucet_id) = ids();
+        lp_store
+            .record_confirmed(
+                "note-restart",
+                None,
+                LpOperationKind::Deposit,
+                lp_id,
+                faucet_id,
+                100,
+                7,
+                10,
+            )
+            .unwrap();
+        let state = PoolState::new(
+            PoolSettings::default(),
+            PoolBalances {
+                reserve: U256::from(100),
+                reserve_with_slippage: U256::from(100),
+                total_liabilities: U256::from(100),
+            },
+            100,
+            PoolMetadata {
+                name: "test",
+                asset_decimals: 8,
+            },
+        );
+        execution_store
+            .save_lp_application(
+                "note-restart",
+                faucet_id,
+                100,
+                &HashMap::from([(faucet_id, state)]),
+                11,
+            )
+            .unwrap();
+
+        let recovered_shares = execution_store
+            .applied_lp_shares("note-restart")
+            .unwrap()
+            .unwrap();
+        assert!(
+            lp_store
+                .apply_operation("note-restart", recovered_shares, 12)
+                .unwrap()
+        );
+        assert!(
+            !lp_store
+                .apply_operation("note-restart", recovered_shares, 13)
+                .unwrap()
+        );
+        assert_eq!(
+            lp_store.position(lp_id, faucet_id).unwrap().unwrap().shares,
+            100
+        );
+        assert_eq!(
+            execution_store.latest_pool_states().unwrap()[&faucet_id].lp_total_supply(),
+            100
+        );
+    }
+
+    #[test]
     fn checkpoint_snapshot_is_persisted() {
         let store = LpStore::open(":memory:").unwrap();
         let (lp_id, faucet_id) = ids();
@@ -490,5 +585,22 @@ mod tests {
         assert_eq!(position.checkpoint_shares, 100);
         assert_eq!(position.checkpoint_value, 125);
         assert_eq!(position.checkpoint_withdrawn, 20);
+    }
+
+    #[test]
+    fn sync_cursor_orders_notes_within_a_block() {
+        let store = LpStore::open(":memory:").unwrap();
+        let cursor = NoteCursor {
+            block_num: 42,
+            note_id: "note-b".into(),
+        };
+        store.set_sync_cursor(&cursor).unwrap();
+        assert_eq!(store.sync_cursor().unwrap(), cursor);
+        assert!(
+            NoteCursor {
+                block_num: 42,
+                note_id: "note-c".into()
+            } > cursor
+        );
     }
 }

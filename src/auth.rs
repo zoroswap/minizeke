@@ -750,6 +750,34 @@ mod tests {
     }
 
     #[test]
+    fn revoked_session_is_immediately_unusable() {
+        let store = store(30, 60);
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let public_key = key.public_key();
+        let commitment = Word::from(public_key.to_commitment());
+        let challenge = store.issue_challenge(user_id(), commitment, 100).unwrap();
+        let session = store
+            .authenticate(
+                &challenge.id,
+                user_id(),
+                commitment,
+                public_key,
+                key.sign(challenge.message),
+                100,
+            )
+            .unwrap();
+
+        assert!(store.revoke_session(&session.bearer_token, 101).unwrap());
+        assert!(!store.revoke_session(&session.bearer_token, 102).unwrap());
+        assert!(
+            store
+                .lookup_session(&session.bearer_token, 101)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn bearer_parsing_is_strict_and_case_insensitive() {
         let mut headers = HeaderMap::new();
         assert_eq!(parse_bearer(&headers), Err(BearerParseError::Missing));

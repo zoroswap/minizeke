@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::miden_env::MidenNetwork;
 
-pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 2;
+/// Schema 3 requires freshly deployed pools with v2 intent replay protection.
+pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 3;
 
 /// One fungible asset supported by this deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]

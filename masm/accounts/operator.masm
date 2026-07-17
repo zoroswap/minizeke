@@ -5,6 +5,7 @@
 # the balance totals). This component is therefore stateless.
 
 use miden::core::crypto::dsa::ecdsa_k256_keccak
+use miden::core::crypto::hashes::poseidon2
 
 const ADV_MAP_KEY = [0, 0, 0, 1]
 
@@ -12,50 +13,32 @@ pub proc populate_adv_stack
     push.ADV_MAP_KEY adv.push_mapval dropw
 end
 
-# Number of intent felts the sponge absorbs, and the capacity element that initializes the
-# permutation. The canonical signed intent is exactly 8 felts = one full sponge rate
-# (RATE_WIDTH = 8), so the capacity initializer is `len % RATE_WIDTH = 8 % 8 = 0`.
-const NUMBER_OF_HASHED_ELEMENTS_CAP = 0
-
 #! Verifies a signed trade intent against the supplied pubkey commitment.
 #!
-#! Rebuilds MSG = Poseidon2::hash_elements(intent_felts[0..8]) with a single permutation
-#! (the 8 intent felts exactly fill the sponge rate) and verifies the ECDSA signature
-#! provided on the advice stack. Aborts the transaction on an invalid signature or a
-#! public key that does not hash to PK_COMM.
+#! Rebuilds MSG = Poseidon2::hash_elements(intent_felts[0..16]) and verifies the ECDSA
+#! signature provided on the advice stack.
 #!
-#! Inputs:  [m0..m7, PK_COMM]   (m0 = first canonical intent felt, on top)
-#! Intent:  [user_suffix, user_prefix, sell_asset_suffix, sell_asset_prefix,
-#!           sell_amount, buy_asset_suffix, buy_asset_prefix, buy_amount]
+#! Inputs:  [m0..m15, PK_COMM]   (m0 = first canonical intent felt, on top)
 #! Outputs: []
 #! Advice:  [PK[9], SIG[17], ...]
 #!
 #! Invocation: exec
+@locals(16)
 pub proc verify_intent_signature
-    # build the 12-element sponge state: [m0..m7, cap, 0, 0, 0]
-    push.0 push.0 push.0 push.NUMBER_OF_HASHED_ELEMENTS_CAP
-    # => [cap, 0, 0, 0, m0..m7, PK_COMM]
-    movdnw.2
-    # => [m0..m7, cap, 0, 0, 0, PK_COMM]
-    hperm
-    # => [R0, R1, C, PK_COMM]   digest = R0
-    exec.extract_digest_from_hashing_output
+    # `poseidon2::hash_elements` streams locals in increasing address order. The operand-stack
+    # word `[m0, m1, m2, m3]` must therefore use the LE word store; `loc_storew_be` reverses each
+    # four-felt chunk in memory and produces a different digest than Rust's `hash_elements`.
+    loc_storew_le.0 dropw
+    loc_storew_le.4 dropw
+    loc_storew_le.8 dropw
+    loc_storew_le.12 dropw
+    # => [PK_COMM]
+
+    push.16 locaddr.0
+    exec.poseidon2::hash_elements
     # => [MSG, PK_COMM]
     swapw
     # => [PK_COMM, MSG]
     exec.ecdsa_k256_keccak::verify
     # => []   (aborts the tx if commitment or signature is invalid)
-end
-
-#! Extracts the 4-element digest (the rate-0 word) from a Poseidon2 sponge state and drops the
-#! two remaining state words. After a single `hperm` over a fully-absorbed input, this rate-0
-#! word IS the hash digest.
-#!
-#! Inputs:  [R0, R1, C, ...]   (R0 = rate[0..4] on top, R1 = rate[4..8], C = capacity)
-#! Outputs: [R0, ...]
-#!
-#! Invocation: exec
-proc extract_digest_from_hashing_output
-    swapw.2 dropw dropw
-    # => [R0, ...]
 end

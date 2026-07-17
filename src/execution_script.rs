@@ -35,6 +35,9 @@ pub fn make_exec_script(intents: Vec<Intent>) -> String {
 
     for intent in intents {
         let Intent {
+            purpose,
+            domain,
+            network,
             user_suffix,
             user_prefix,
             sell_asset_suffix,
@@ -43,11 +46,14 @@ pub fn make_exec_script(intents: Vec<Intent>) -> String {
             buy_asset_suffix,
             buy_asset_prefix,
             buy_amount,
+            client_order_id,
+            expires_at,
         } = intent;
+        let [uuid0, uuid1, uuid2, uuid3] = client_order_id;
 
         let trade_string = format!(
             r#"
-       push.{buy_amount}.{buy_asset_prefix}.{buy_asset_suffix}.{sell_amount}.{sell_asset_prefix}.{sell_asset_suffix}.{user_prefix}.{user_suffix}
+       push.{expires_at}.{uuid3}.{uuid2}.{uuid1}.{uuid0}.{buy_amount}.{buy_asset_prefix}.{buy_asset_suffix}.{sell_amount}.{sell_asset_prefix}.{sell_asset_suffix}.{user_prefix}.{user_suffix}.{network}.{domain}.{purpose}
        call.execute_swap"#,
         );
 

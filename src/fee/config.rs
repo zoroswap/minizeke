@@ -114,7 +114,7 @@ impl Config {
                 server_url: value(
                     &mut lookup,
                     "FEE_SERVER_URL",
-                    "http://127.0.0.1:3000".to_owned(),
+                    "http://127.0.0.1:7801".to_owned(),
                 )?
                 .parse()
                 .context("invalid FEE_SERVER_URL")?,

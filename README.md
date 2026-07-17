@@ -1,3 +1,31 @@
+# Bounded ingress and proxy policy
+
+The server applies the same exact-match origin allowlist to HTTP and WebSocket
+requests. Configure it with `CORS_ALLOWED_ORIGINS` (default:
+`http://localhost:3000,http://localhost:5173`). Requests without an `Origin`
+header remain valid for non-browser clients.
+
+Client IPs come from the TCP peer by default. `X-Forwarded-For` is accepted only
+when both `TRUST_PROXY_HEADERS=true` and
+`TRUST_PROXY_TLS_TERMINATED=true`. Enable both only when the server is reachable
+exclusively through a trusted TLS-terminating reverse proxy that overwrites
+forwarded headers; never enable them on a directly reachable listener.
+
+Ingress defaults are:
+
+- `HTTP_MAX_BODY_BYTES=1048576`, `HTTP_REQUEST_TIMEOUT_SECS=15`
+- `RATE_LIMIT_PUBLIC_PER_MINUTE=240`, `RATE_LIMIT_AUTH_PER_MINUTE=20`,
+  `RATE_LIMIT_MUTATION_PER_MINUTE=60`, `RATE_LIMIT_MAX_KEYS=100000`
+- `DB_MAX_CONCURRENCY=8`, `MIDEN_RPC_MAX_CONCURRENCY=8`
+- `WS_QUEUE_CAPACITY=128`, `WS_GLOBAL_CONNECTION_CAP=2000`,
+  `WS_PER_IP_CONNECTION_CAP=20`, `WS_MAX_MESSAGE_BYTES=65536`,
+  `WS_MAX_SUBSCRIPTIONS=64`
+- `WS_SESSION_RECHECK_SECS=30`, `WS_PING_INTERVAL_SECS=20`,
+  `WS_PONG_TIMEOUT_SECS=60`, `WS_WRITE_TIMEOUT_SECS=10`,
+  `AUTH_PURGE_INTERVAL_SECS=300`
+
+Saturated rate limits return `429`; saturated bounded workers and WebSocket
+capacity return `503`. Both include `Retry-After`.
 # minizeke
 
 minizeke is a Miden spot-swap prototype. A public network vault holds assets and user registrations. Public pool accounts hold per-user trade counters. The server quotes orders from oracle prices and an off-chain curve, then submits signed swaps to each user's assigned pool account.
@@ -9,7 +37,7 @@ minizeke is a Miden spot-swap prototype. A public network vault holds assets and
 3. Register a user and fund the vault with public network notes.
 4. Authenticate with the vault-registered trading key, then submit a signed order with its Bearer session.
 5. The server quotes the order and assigns it to the user's shard.
-6. The pool verifies the eight-felt intent, reads fresh vault totals by FPI, and updates both swap legs in one transaction.
+6. The pool verifies the sixteen-felt v2 intent, expiry, and unused client UUID, reads fresh vault totals by FPI, and updates both swap legs in one transaction.
 7. Redeem in two notes: initiate the redeem, then consume the redeem note to receive a P2ID payout.
 
 ## Prerequisites
@@ -29,6 +57,7 @@ Required server values:
 
 ```dotenv
 SERVER_URL=127.0.0.1:7799
+ADMIN_SERVER_URL=127.0.0.1:7801
 FAUCET_SERVER_URL=127.0.0.1:7800
 ORACLE_URL=https://oracle.zoroswap.com
 MIDEN_NETWORK=testnet
@@ -48,20 +77,29 @@ Optional values:
 - `LP_SYNC_INTERVAL_SECS`: interval for discovering consumed LP notes. Default: `2`.
 - `LP_MIN_DEPOSIT_AMOUNT`: minimum permissionless deposit in base units. Default: `1`.
 - `EXECUTION_DB_PATH`: finalized swap and pool-state journal. Default: `execution.<network>.sqlite3`.
+- `FINALITY_TIMEOUT_SECS`: terminal timeout for a submitted transaction that remains unconfirmed. Default: `1800`.
+- `FINALITY_RETRY_SECS`: minimum interval between reconciliation attempts. Default: `2`.
+- `FINALITY_MAX_ATTEMPTS`: terminal reconciliation-attempt limit. Default: `900`.
 - `ANALYTICS_DB_PATH`: WAC user and pool analytics journal. Default: `analytics.<network>.sqlite3`.
 - `AUTH_DB_PATH`: wallet challenges and hashed opaque sessions. Default: `auth.<network>.sqlite3`.
 - `FEE_DB_PATH`: volatility-fee batches and validity state. Default: `fees.<network>.sqlite3`.
 - `ORACLE_WS_MIN_INTERVAL_MS` / `ORACLE_WS_BPS_THRESHOLD`: frontend oracle coalescing. Defaults: `1000` / `20`.
 - `AUTH_DOMAIN`, `AUTH_CHALLENGE_TTL_SECS`, `AUTH_SESSION_TTL_SECS`: signed login domain and TTLs.
 - `CORS_ALLOWED_ORIGINS`: comma-separated frontend origins.
-- `FEE_UPDATER_TOKEN`: service credential shared with the isolated fee updater.
+- `PUBLIC_MINT_ENABLED`: public `/mint` proxy switch. Default: `false`.
+- `FAUCET_SERVICE_TOKEN` / `FAUCET_SERVICE_TOKEN_NEXT`: scoped, rotatable credential
+  used only from the main server to the loopback faucet.
+- `FEE_UPDATER_TOKEN` / `FEE_UPDATER_TOKEN_NEXT`: automatic fee-updater credential.
+- `FEE_ADMIN_TOKEN` / `FEE_ADMIN_TOKEN_NEXT`: separate manual override credential.
+- `ADMIN_SERVER_URL`: private fee/admin listener. Default: `127.0.0.1:7801`; do not
+  expose it through the public reverse proxy.
 - `FAUCET_MINT_AMOUNT`: amount minted per request. Default: `10000000`.
 - `FAUCET_MINT_COOLDOWN_SECS`: cooldown per recipient and faucet. Default: `240`.
 - `ASSETS_FILE`: deploy-time asset config. Default: `assets.toml`.
 
 ## Deploy
 
-`spawn` creates the operator, configured faucets, vault, first pool shard, authorization note, and schema-v2 deployment file:
+`spawn` creates the operator, configured faucets, vault, first pool shard, authorization note, and schema-v3 deployment file:
 
 ```sh
 cargo run --bin spawn
@@ -110,7 +148,7 @@ Run the API, order processor, oracle client, and Miden execution worker:
 cargo run
 ```
 
-The main process requires a valid schema-v2 deployment file and does not deploy accounts.
+The main process requires a valid schema-v3 deployment file and does not deploy accounts.
 
 Run the isolated volatility-fee updater separately:
 
@@ -118,7 +156,7 @@ Run the isolated volatility-fee updater separately:
 cargo run --bin fee_updater
 ```
 
-It uses the same EWMA, logarithmic fee curve, deadband, spike, and refresh policy as
+Set `FEE_SERVER_URL=http://127.0.0.1:7801`. It uses the same EWMA, logarithmic fee curve, deadband, spike, and refresh policy as
 `../fee_updater`, samples `FEE_ORACLE_FEED_ID`, and pushes one surge value to all configured
 assets and both directions. Every update expires; `VALIDITY_PERIOD_SECS` defaults to `600`,
 with refresh at `REFRESH_FRACTION=0.8`. If the updater stops, the server retains static base
@@ -171,7 +209,7 @@ Schema version 2 has this shape:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "network": "testnet",
   "operator_account_id": "0x...",
   "vault_id": "0x...",
@@ -195,7 +233,7 @@ Schema version 2 has this shape:
 }
 ```
 
-- `schema_version`: must be `2`.
+- `schema_version`: must be `3`.
 - `network`: must equal the active `MIDEN_NETWORK`.
 - `operator_account_id`: account allowed to authorize pools and checkpoint LP entitlements.
 - `vault_id`: public network account holding assets and custody counters.
@@ -226,7 +264,7 @@ The main server exposes:
 - `GET /users/{id}/placement`: the user's vault-assigned shard and allocated asset cells.
 - `GET /depth`: derived depth for hex `base` and `quote` faucet IDs.
 - `GET /ws`: order, pool, oracle, user, and stats events.
-- `POST /orders/new`: submit an order, base64 signature, and base64 public key.
+- `POST /orders/new`: submit a v2 signed intent, base64 signature, and base64 public key.
 - `POST /mint`: proxy a mint request to the faucet process.
 - `POST /lp/deposits/note`: quote and build a self-custodial DEPOSIT note. The response
   contains a base64-encoded public note for the LP to submit from its own account.
@@ -236,19 +274,47 @@ The main server exposes:
 LP shares use execution-time pricing. The quote returned while building a note is
 informational; the confirmed note's chain order determines the minted shares.
 
+Order intent v1 is rejected. A v2 request uses a client-signed UUID and a separate server
+lifecycle ID:
+
+```json
+{"version":2,"client_order_id":"00112233-4455-6677-8899-aabbccddeeff","expires_at":1784304000,"details":{"asset_in":"0x...","amount_in":10,"asset_out":"0x...","min_amount_out":9},"order_type":"Spot","user_id":"0x...","signed_intent":"...","pubkey":"..."}
+```
+
+The signed Poseidon2 message binds the swap purpose, `minizeke` domain, `testnet` network,
+user, both asset IDs, both amounts, client UUID, and expiry. An identical UUID retry returns
+the original lifecycle ID; using that UUID for different signed fields returns HTTP 409.
+
 The faucet process also exposes `GET /health` and `POST /mint`. A mint body is:
 
 ```json
 {"address":"mtst1...","faucet_id":"0x..."}
 ```
 
+`POST /mint` is disabled by default on the public API. When explicitly enabled, the
+main server authenticates to the loopback faucet with `FAUCET_SERVICE_TOKEN`; direct
+faucet mint calls require that same scoped Bearer credential. Primary and `_NEXT`
+values are accepted during rotation. Fee updater and manual admin routes use different
+credentials and are hosted only on `ADMIN_SERVER_URL`.
+
+Consumed analytics and LP notes use durable `(block, note_id)` cursors and exact event
+IDs, so each sync processes only the new ordered suffix while inserts remain idempotent.
+Broker capacities are configurable with `BROKER_*_CAPACITY`. Order, LP, fee, and
+execution notifications are durable-store wakeups; oracle, stats, and pool-state feeds
+are best-effort latest-state updates. `/health` reports aggregate broker lag and
+unobserved-send counters.
+
 ## Checks
 
 ```sh
 cargo fmt --check
+cargo check --all-targets
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+See [`docs/remediation-runbook.md`](docs/remediation-runbook.md) for the exact remediation
+verification sequence, ignored load/remote-testnet harnesses, and orders/sec/socket metrics.
 
 ```sh
 curl http://127.0.0.1:7799/health

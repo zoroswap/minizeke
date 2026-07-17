@@ -7,7 +7,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -26,6 +26,7 @@ use tracing::info;
 
 use crate::{
     deployment::Deployment,
+    service_auth::ServiceCredentials,
     test_utils::{get_faucet_client, submit_tx_resilient},
 };
 
@@ -69,12 +70,15 @@ struct FaucetCommand {
 #[derive(Clone)]
 pub struct FaucetService {
     commands: mpsc::Sender<FaucetCommand>,
+    credentials: ServiceCredentials,
 }
 
 /// Creates the independent faucet service state and imports all faucet accounts
 /// in the active deployment. The `spawn` deployment must have written their keys into
 /// `./keystore`.
 pub async fn initialize() -> Result<FaucetService> {
+    let credentials =
+        ServiceCredentials::from_env("FAUCET_SERVICE_TOKEN", "FAUCET_SERVICE_TOKEN_NEXT")?;
     let deployment = Deployment::load()?;
     let mint_amount = env::var("FAUCET_MINT_AMOUNT")
         .ok()
@@ -115,7 +119,10 @@ pub async fn initialize() -> Result<FaucetService> {
         .map_err(|error| anyhow::anyhow!("faucet worker exited during startup: {error}"))?
         .map_err(anyhow::Error::msg)?;
 
-    Ok(FaucetService { commands })
+    Ok(FaucetService {
+        commands,
+        credentials,
+    })
 }
 
 impl FaucetWorker {
@@ -202,8 +209,15 @@ async fn health() -> impl IntoResponse {
 
 async fn mint(
     State(state): State<FaucetService>,
+    headers: HeaderMap,
     Json(request): Json<MintRequest>,
 ) -> impl IntoResponse {
+    if !state.credentials.authorizes(&headers) {
+        return mint_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid faucet service token".into(),
+        );
+    }
     let recipient = match parse_account_id(&request.address) {
         Ok(account_id) => account_id,
         Err(error) => {

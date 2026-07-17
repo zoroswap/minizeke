@@ -2,14 +2,17 @@ use base64::{Engine, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use miden_client::{
-    Serializable,
+    Deserializable, Serializable,
     account::AccountId,
     auth::{PublicKey, Signature},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::serde::{deserialize_account_id, serialize_account_id};
+use crate::{
+    intent::Intent,
+    serde::{deserialize_account_id, serialize_account_id},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderType {
@@ -52,6 +55,8 @@ pub struct OrderTiming {
     pub last_updated_at: DateTime<Utc>,
     pub started_processing: Option<DateTime<Utc>>,
     pub processed: Option<DateTime<Utc>>,
+    pub submitted: Option<DateTime<Utc>>,
+    pub confirmed: Option<DateTime<Utc>>,
     pub failed: Option<DateTime<Utc>>,
     pub executed: Option<DateTime<Utc>>,
     pub settled: Option<DateTime<Utc>>,
@@ -65,6 +70,8 @@ impl OrderTiming {
             last_updated_at: now,
             started_processing: None,
             processed: None,
+            submitted: None,
+            confirmed: None,
             failed: None,
             executed: None,
             settled: None,
@@ -83,6 +90,22 @@ impl OrderTiming {
         Self {
             last_updated_at: now,
             processed: Some(now),
+            ..self
+        }
+    }
+    pub fn submitted(self) -> Self {
+        let now = Utc::now();
+        Self {
+            last_updated_at: now,
+            submitted: Some(now),
+            ..self
+        }
+    }
+    pub fn confirmed(self) -> Self {
+        let now = Utc::now();
+        Self {
+            last_updated_at: now,
+            confirmed: Some(now),
             ..self
         }
     }
@@ -117,6 +140,8 @@ pub enum OrderUpdate {
     New(Order<Created>),
     StartedProcessing(Order<Processing>),
     Processed(Order<Processed>),
+    Submitted(Order<Submitted>),
+    Confirmed(Order<Confirmed>),
     Executed(Order<Executed>),
     Settled(Order<Settled>),
     Failed(Order<Failed>),
@@ -127,6 +152,8 @@ pub enum OrderStatus {
     Created,
     Processing,
     Processed,
+    Submitted,
+    Confirmed,
     Executed,
     Settled,
     Failed,
@@ -138,6 +165,8 @@ impl OrderStatus {
             Self::Created => "created",
             Self::Processing => "processing",
             Self::Processed => "processed",
+            Self::Submitted => "submitted",
+            Self::Confirmed => "confirmed",
             Self::Executed => "executed",
             Self::Settled => "settled",
             Self::Failed => "failed",
@@ -148,6 +177,8 @@ impl OrderStatus {
 #[derive(Debug, Clone)]
 pub struct OrderSnapshot {
     pub id: Uuid,
+    pub client_order_id: Uuid,
+    pub expires_at: u64,
     pub details: OrderDetails,
     pub order_type: OrderType,
     pub user_id: AccountId,
@@ -164,6 +195,8 @@ impl OrderUpdate {
             ($order:expr, $status:expr, $failure:expr, $result:expr, $tx_hash:expr) => {
                 OrderSnapshot {
                     id: $order.id,
+                    client_order_id: $order.intent.client_order_uuid(),
+                    expires_at: $order.intent.expires_at,
                     details: $order.details,
                     order_type: $order.order_type,
                     user_id: $order.user_id,
@@ -187,6 +220,20 @@ impl OrderUpdate {
                 None,
                 Some(order.state.execution_result.clone()),
                 None
+            ),
+            Self::Submitted(order) => common!(
+                order,
+                OrderStatus::Submitted,
+                None,
+                Some(order.state.execution_result.clone()),
+                Some(order.state.tx_hash.clone())
+            ),
+            Self::Confirmed(order) => common!(
+                order,
+                OrderStatus::Confirmed,
+                None,
+                Some(order.state.execution_result.clone()),
+                Some(order.state.tx_hash.clone())
             ),
             Self::Executed(order) => common!(
                 order,
@@ -226,6 +273,18 @@ pub struct Processed {
 }
 
 #[derive(Debug, Clone)]
+pub struct Submitted {
+    tx_hash: String,
+    execution_result: OrderExecutionResult,
+}
+
+#[derive(Debug, Clone)]
+pub struct Confirmed {
+    tx_hash: String,
+    execution_result: OrderExecutionResult,
+}
+
+#[derive(Debug, Clone)]
 pub struct Executed {
     tx_hash: String,
     execution_result: OrderExecutionResult,
@@ -244,12 +303,12 @@ pub struct Failed {
     execution_result: Option<OrderExecutionResult>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderExecutionResult {
     pub amount_out: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderFailureReason {
     Expired,
     MinOutNotMet,
@@ -272,6 +331,16 @@ impl From<Order<Processed>> for OrderUpdate {
         OrderUpdate::Processed(value)
     }
 }
+impl From<Order<Submitted>> for OrderUpdate {
+    fn from(value: Order<Submitted>) -> Self {
+        OrderUpdate::Submitted(value)
+    }
+}
+impl From<Order<Confirmed>> for OrderUpdate {
+    fn from(value: Order<Confirmed>) -> Self {
+        OrderUpdate::Confirmed(value)
+    }
+}
 impl From<Order<Executed>> for OrderUpdate {
     fn from(value: Order<Executed>) -> Self {
         OrderUpdate::Executed(value)
@@ -292,6 +361,7 @@ impl From<Order<Failed>> for OrderUpdate {
 pub struct Order<State> {
     state: State,
     pub id: Uuid,
+    intent: Intent,
     details: OrderDetails,
     order_type: OrderType,
     user_id: AccountId,
@@ -300,14 +370,59 @@ pub struct Order<State> {
     timing: OrderTiming,
 }
 
+/// Restart-safe representation of an admitted order. Runtime timing is intentionally
+/// reconstructed when a worker claims the order; signed authorization data is preserved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableOrder {
+    pub id: Uuid,
+    #[serde(serialize_with = "serialize_account_id")]
+    #[serde(deserialize_with = "deserialize_account_id")]
+    pub user_id: AccountId,
+    pub details: OrderDetails,
+    pub signed_order: String,
+    pub pubkey: String,
+    pub intent: Intent,
+}
+
+impl DurableOrder {
+    pub fn into_created(self) -> anyhow::Result<Order<Created>> {
+        let signature =
+            Signature::read_from_bytes(&general_purpose::STANDARD.decode(self.signed_order)?)?;
+        let pubkey = PublicKey::read_from_bytes(&general_purpose::STANDARD.decode(self.pubkey)?)?;
+        Ok(Order::new_with_id(
+            self.id,
+            signature,
+            self.user_id,
+            self.details,
+            pubkey,
+            self.intent,
+        ))
+    }
+
+    pub fn into_processed(self, amount_out: u64) -> anyhow::Result<Order<Processed>> {
+        Ok(self
+            .into_created()?
+            .start_processing()
+            .processed(OrderExecutionResult { amount_out }))
+    }
+}
+
 impl Order<Created> {
     pub fn new(
         signed_order: Signature,
         user_id: AccountId,
         details: OrderDetails,
         pubkey: PublicKey,
+        intent: Intent,
     ) -> Self {
-        Self::new_with_id(Uuid::new_v4(), signed_order, user_id, details, pubkey)
+        Self::new_with_id(
+            Uuid::new_v4(),
+            signed_order,
+            user_id,
+            details,
+            pubkey,
+            intent,
+        )
     }
 
     pub fn new_with_id(
@@ -316,9 +431,11 @@ impl Order<Created> {
         user_id: AccountId,
         details: OrderDetails,
         pubkey: PublicKey,
+        intent: Intent,
     ) -> Self {
         Order {
             id,
+            intent,
             timing: OrderTiming::new(),
             signed_order,
             user_id,
@@ -333,6 +450,7 @@ impl Order<Created> {
         Order {
             state: Processing,
             id: self.id,
+            intent: self.intent,
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
@@ -344,6 +462,21 @@ impl Order<Created> {
     pub fn user_id(&self) -> AccountId {
         self.user_id
     }
+
+    pub fn client_order_id(&self) -> Uuid {
+        self.intent.client_order_uuid()
+    }
+
+    pub fn durable(&self) -> DurableOrder {
+        DurableOrder {
+            id: self.id,
+            user_id: self.user_id,
+            details: self.details,
+            signed_order: general_purpose::STANDARD.encode(self.signed_order.to_bytes()),
+            pubkey: general_purpose::STANDARD.encode(self.pubkey.to_bytes()),
+            intent: self.intent,
+        }
+    }
 }
 
 impl Order<Processing> {
@@ -351,6 +484,7 @@ impl Order<Processing> {
         Order {
             state: Processed { execution_result },
             id: self.id,
+            intent: self.intent,
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
@@ -368,6 +502,7 @@ impl Order<Processing> {
                 tx_hash: None,
             },
             id: self.id,
+            intent: self.intent,
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
@@ -383,9 +518,33 @@ impl Order<Processing> {
     pub fn user_id(&self) -> AccountId {
         self.user_id
     }
+
+    pub fn expires_at(&self) -> u64 {
+        self.intent.expires_at
+    }
 }
 
 impl Order<Processed> {
+    pub fn submitted(self, tx_hash: String) -> Order<Submitted> {
+        let execution_result = self.state.execution_result;
+        Order {
+            state: Submitted {
+                tx_hash,
+                execution_result,
+            },
+            id: self.id,
+            intent: self.intent,
+            order_type: self.order_type,
+            details: self.details,
+            user_id: self.user_id,
+            signed_order: self.signed_order,
+            timing: self.timing.submitted(),
+            pubkey: self.pubkey,
+        }
+    }
+    pub fn confirmed(self, tx_hash: String) -> Order<Confirmed> {
+        self.submitted(tx_hash).confirmed()
+    }
     pub fn executed(
         self,
         tx_hash: String,
@@ -397,6 +556,7 @@ impl Order<Processed> {
                 execution_result,
             },
             id: self.id,
+            intent: self.intent,
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
@@ -417,6 +577,7 @@ impl Order<Processed> {
                 tx_hash: None,
             },
             id: self.id,
+            intent: self.intent,
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
@@ -440,6 +601,40 @@ impl Order<Processed> {
     pub fn pubkey(&self) -> PublicKey {
         self.pubkey.clone()
     }
+
+    pub fn intent(&self) -> Intent {
+        self.intent
+    }
+
+    pub fn durable(&self) -> DurableOrder {
+        DurableOrder {
+            id: self.id,
+            user_id: self.user_id,
+            details: self.details,
+            signed_order: general_purpose::STANDARD.encode(self.signed_order.to_bytes()),
+            pubkey: general_purpose::STANDARD.encode(self.pubkey.to_bytes()),
+            intent: self.intent,
+        }
+    }
+}
+
+impl Order<Submitted> {
+    pub fn confirmed(self) -> Order<Confirmed> {
+        Order {
+            state: Confirmed {
+                tx_hash: self.state.tx_hash,
+                execution_result: self.state.execution_result,
+            },
+            id: self.id,
+            intent: self.intent,
+            order_type: self.order_type,
+            details: self.details,
+            user_id: self.user_id,
+            signed_order: self.signed_order,
+            timing: self.timing.confirmed(),
+            pubkey: self.pubkey,
+        }
+    }
 }
 
 impl Order<Executed> {
@@ -450,6 +645,7 @@ impl Order<Executed> {
                 execution_result: self.state.execution_result,
             },
             id: self.id,
+            intent: self.intent,
             order_type: self.order_type,
             details: self.details,
             user_id: self.user_id,
@@ -474,6 +670,8 @@ pub struct Orders {
     new: DashMap<Uuid, Order<Created>>,
     in_processing: DashMap<Uuid, Order<Processing>>,
     processed: DashMap<Uuid, Order<Processed>>,
+    submitted: DashMap<Uuid, Order<Submitted>>,
+    confirmed: DashMap<Uuid, Order<Confirmed>>,
     executed: DashMap<Uuid, Order<Executed>>,
     settled: DashMap<Uuid, Order<Settled>>,
     failed: DashMap<Uuid, Order<Failed>>,
@@ -493,6 +691,14 @@ impl Orders {
                 self.in_processing.remove(&order.id);
                 self.processed.insert(order.id, order);
             }
+            OrderUpdate::Submitted(order) => {
+                self.processed.remove(&order.id);
+                self.submitted.insert(order.id, order);
+            }
+            OrderUpdate::Confirmed(order) => {
+                self.submitted.remove(&order.id);
+                self.confirmed.insert(order.id, order);
+            }
             OrderUpdate::Executed(order) => {
                 self.processed.remove(&order.id);
                 self.executed.insert(order.id, order);
@@ -505,7 +711,10 @@ impl Orders {
                 self.new.remove(&order.id);
                 self.in_processing.remove(&order.id);
                 self.processed.remove(&order.id);
+                self.submitted.remove(&order.id);
+                self.confirmed.remove(&order.id);
                 self.executed.remove(&order.id);
+                self.settled.remove(&order.id);
                 self.failed.insert(order.id, order);
             }
         }
@@ -517,6 +726,10 @@ impl Orders {
         } else if let Some(order) = self.in_processing.get(id) {
             Some(order.clone().into())
         } else if let Some(order) = self.processed.get(id) {
+            Some(order.clone().into())
+        } else if let Some(order) = self.submitted.get(id) {
+            Some(order.clone().into())
+        } else if let Some(order) = self.confirmed.get(id) {
             Some(order.clone().into())
         } else if let Some(order) = self.executed.get(id) {
             Some(order.clone().into())
@@ -577,12 +790,16 @@ impl Orders {
             created: self.new.len(),
             processing: self.in_processing.len(),
             processed: self.processed.len(),
+            submitted: self.submitted.len(),
+            confirmed: self.confirmed.len(),
             executed: self.executed.len(),
             settled: self.settled.len(),
             failed: self.failed.len(),
         };
-        let open = by_status.created + by_status.processing + by_status.processed;
-        let closed = by_status.executed + by_status.settled + by_status.failed;
+        let open =
+            by_status.created + by_status.processing + by_status.processed + by_status.submitted;
+        let closed =
+            by_status.confirmed + by_status.executed + by_status.settled + by_status.failed;
         OrderStats {
             total: open + closed,
             open,
@@ -597,6 +814,8 @@ pub struct OrderStatusCounts {
     pub created: usize,
     pub processing: usize,
     pub processed: usize,
+    pub submitted: usize,
+    pub confirmed: usize,
     pub executed: usize,
     pub settled: usize,
     pub failed: usize,
@@ -613,6 +832,8 @@ pub struct OrderStats {
 #[derive(Debug, Serialize)]
 pub struct SerializableOrder {
     id: Uuid,
+    client_order_id: Uuid,
+    expires_at: u64,
     details: OrderDetails,
     order_type: OrderType,
     user_id: String,
@@ -629,6 +850,8 @@ impl From<OrderUpdate> for SerializableOrder {
             OrderUpdate::New(o) => o.into(),
             OrderUpdate::StartedProcessing(o) => o.into(),
             OrderUpdate::Processed(o) => o.into(),
+            OrderUpdate::Submitted(o) => o.into(),
+            OrderUpdate::Confirmed(o) => o.into(),
             OrderUpdate::Executed(o) => o.into(),
             OrderUpdate::Failed(o) => o.into(),
             OrderUpdate::Settled(o) => o.into(),
@@ -640,6 +863,8 @@ impl From<Order<Created>> for SerializableOrder {
     fn from(value: Order<Created>) -> Self {
         Self {
             id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
@@ -655,6 +880,8 @@ impl From<Order<Processing>> for SerializableOrder {
     fn from(value: Order<Processing>) -> Self {
         Self {
             id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
@@ -670,6 +897,8 @@ impl From<Order<Processed>> for SerializableOrder {
     fn from(value: Order<Processed>) -> Self {
         Self {
             id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
@@ -681,10 +910,46 @@ impl From<Order<Processed>> for SerializableOrder {
         }
     }
 }
+impl From<Order<Submitted>> for SerializableOrder {
+    fn from(value: Order<Submitted>) -> Self {
+        Self {
+            id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
+            details: value.details,
+            order_type: value.order_type,
+            user_id: value.user_id.to_hex(),
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
+            timing: value.timing,
+            failure_reason: None,
+            execution_result: Some(value.state.execution_result),
+            tx_hash: Some(value.state.tx_hash),
+        }
+    }
+}
+impl From<Order<Confirmed>> for SerializableOrder {
+    fn from(value: Order<Confirmed>) -> Self {
+        Self {
+            id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
+            details: value.details,
+            order_type: value.order_type,
+            user_id: value.user_id.to_hex(),
+            signed_order: general_purpose::STANDARD.encode(value.signed_order.to_bytes()),
+            timing: value.timing,
+            failure_reason: None,
+            execution_result: Some(value.state.execution_result),
+            tx_hash: Some(value.state.tx_hash),
+        }
+    }
+}
 impl From<Order<Executed>> for SerializableOrder {
     fn from(value: Order<Executed>) -> Self {
         Self {
             id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
@@ -700,6 +965,8 @@ impl From<Order<Settled>> for SerializableOrder {
     fn from(value: Order<Settled>) -> Self {
         Self {
             id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
@@ -715,6 +982,8 @@ impl From<Order<Failed>> for SerializableOrder {
     fn from(value: Order<Failed>) -> Self {
         Self {
             id: value.id,
+            client_order_id: value.intent.client_order_uuid(),
+            expires_at: value.intent.expires_at,
             details: value.details,
             order_type: value.order_type,
             user_id: value.user_id.to_hex(),
@@ -740,11 +1009,21 @@ mod tests {
         let user_id = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
         let asset_in = AccountId::from_hex("0x57a179f33b726c315fcfd5e0ff3309").unwrap();
         let asset_out = AccountId::from_hex("0x1e7e8af77fc5f2f1631d5c5ce35471").unwrap();
+        let intent = Intent::new_swap(
+            user_id,
+            asset_in,
+            10,
+            asset_out,
+            u64::MAX,
+            Uuid::nil(),
+            u64::MAX,
+        );
         let created = Order::new(
             key.sign(Word::default()),
             user_id,
             OrderDetails::new(asset_in, 10, asset_out, u64::MAX),
             key.public_key(),
+            intent,
         );
         let failed = created
             .clone()
@@ -757,5 +1036,49 @@ mod tests {
 
         assert!(orders.orders_new().is_empty());
         assert_eq!(orders.orders_failed().len(), 1);
+    }
+
+    #[test]
+    fn submitted_order_becomes_confirmed_only_after_confirmation_update() {
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let user_id = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
+        let asset_in = AccountId::from_hex("0x57a179f33b726c315fcfd5e0ff3309").unwrap();
+        let asset_out = AccountId::from_hex("0x1e7e8af77fc5f2f1631d5c5ce35471").unwrap();
+        let intent = Intent::new_swap(
+            user_id,
+            asset_in,
+            10,
+            asset_out,
+            9,
+            Uuid::new_v4(),
+            u64::MAX,
+        );
+        let processed = Order::new(
+            key.sign(Word::default()),
+            user_id,
+            OrderDetails::new(asset_in, 10, asset_out, 9),
+            key.public_key(),
+            intent,
+        )
+        .start_processing()
+        .processed(OrderExecutionResult { amount_out: 9 });
+        let order_id = processed.id;
+        let submitted = processed.clone().submitted("tx-1".to_owned());
+        let confirmed = submitted.clone().confirmed();
+        let orders = Orders::default();
+
+        orders.apply_order_update(OrderUpdate::Processed(processed));
+        orders.apply_order_update(OrderUpdate::Submitted(submitted));
+        assert_eq!(orders.stats().by_status.submitted, 1);
+        assert_eq!(orders.stats().by_status.confirmed, 0);
+
+        orders.apply_order_update(OrderUpdate::Confirmed(confirmed));
+        assert_eq!(orders.stats().by_status.submitted, 0);
+        assert_eq!(orders.stats().by_status.confirmed, 1);
+        let snapshot = orders.get_order(&order_id).unwrap().snapshot();
+        assert_eq!(snapshot.status, OrderStatus::Confirmed);
+        assert_eq!(snapshot.tx_hash.as_deref(), Some("tx-1"));
+        assert!(snapshot.timing.submitted.is_some());
+        assert!(snapshot.timing.confirmed.is_some());
     }
 }

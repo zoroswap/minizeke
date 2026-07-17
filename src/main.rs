@@ -14,6 +14,7 @@ use crate::{
     analytics_store::AnalyticsStore,
     auth::{AuthConfig, AuthStore},
     deployment::AssetInfo,
+    execution_store::ExecutionStore,
     fee_store::{FeeStore, apply_fee_states},
     history::{HistoryStore, start_history_service},
     lp::LpService,
@@ -70,6 +71,7 @@ fn main() {
 
     let message_broker = Arc::new(MessageBroker::new());
     let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
+    let (miden_start_tx, miden_start_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::scope(|s| {
         let message_broker_for_miden = message_broker.clone();
@@ -95,6 +97,9 @@ fn main() {
                     })
                     .unwrap();
 
+                miden_start_rx
+                    .recv()
+                    .expect("main runtime stopped before workers became ready");
                 println!("[RUN] Starting Miden execution");
                 if let Err(e) = miden_execution.start().await {
                     eprintln!("Critical error on miden_execution: {e}. Exiting with status 1.");
@@ -107,12 +112,16 @@ fn main() {
             .recv()
             .expect("Miden init thread failed before sending init data");
 
-        let _ = main_tokio(init_data, message_broker);
+        let _ = main_tokio(init_data, message_broker, miden_start_tx);
     });
 }
 
 #[tokio::main]
-async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>) -> Result<()> {
+async fn main_tokio(
+    mut init_data: InitData,
+    message_broker: Arc<MessageBroker>,
+    miden_start_tx: std::sync::mpsc::SyncSender<()>,
+) -> Result<()> {
     println!("[INIT] Initializing authentication database");
     let auth_config = AuthConfig::new(
         env::var("AUTH_DOMAIN").unwrap_or_else(|_| "minizeke".to_owned()),
@@ -131,6 +140,27 @@ async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>)
         format!("auth.{}.sqlite3", network.to_ascii_lowercase())
     });
     let auth_store = Arc::new(AuthStore::open(auth_path, auth_config)?);
+    {
+        let auth_store = auth_store.clone();
+        tokio::spawn(async move {
+            let interval_secs = env::var("AUTH_PURGE_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300_u64)
+                .max(1);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                interval.tick().await;
+                let store = auth_store.clone();
+                let now = chrono::Utc::now().timestamp() as u64;
+                match tokio::task::spawn_blocking(move || store.purge(now)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => warn!(%error, "failed to purge auth records"),
+                    Err(error) => warn!(%error, "auth purge worker failed"),
+                }
+            }
+        });
+    }
     println!("[INIT] Initializing analytics database");
     let analytics_store = Arc::new(AnalyticsStore::open_from_env()?);
     analytics::initialize(analytics_store.clone()).await?;
@@ -155,6 +185,8 @@ async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>)
     println!("[INIT] Initializing history database");
     let history = Arc::new(HistoryStore::open_from_env()?);
     start_history_service(history.clone(), message_broker.clone());
+    println!("[INIT] Initializing execution database");
+    let execution_store = Arc::new(ExecutionStore::open_from_env()?);
 
     {
         let store = store.clone();
@@ -195,13 +227,28 @@ async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>)
         init_data.assets,
         init_data.pools,
         lp_service.store(),
+        execution_store.clone(),
+        fee_store.clone(),
     )
     .await?;
+    store.set_pool_states(processing.pool_states());
 
     println!("[RUN] Starting Processing");
-    tokio::spawn(async move {
-        processing.start().await;
-    });
+    std::thread::Builder::new()
+        .name("processing-db-worker".to_owned())
+        .spawn(move || {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("processing runtime");
+            runtime.block_on(async move {
+                processing.start().await;
+            });
+        })
+        .expect("spawn processing worker");
+    miden_start_tx
+        .send(())
+        .expect("Miden execution thread stopped during startup");
 
     println!("[RUN] Starting volatility-fee expiry task");
     {
@@ -216,15 +263,17 @@ async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>)
             loop {
                 interval.tick().await;
                 let now = chrono::Utc::now().timestamp() as u64;
-                match fee_store.expire(now) {
-                    Ok(true) => {
+                let store = fee_store.clone();
+                match tokio::task::spawn_blocking(move || store.expire(now)).await {
+                    Ok(Ok(true)) => {
                         let _ = message_broker.broadcast_fee_state(FeeStateEvent {
                             fee_states: HashMap::new(),
                             timestamp: chrono::Utc::now().timestamp_millis() as u64,
                         });
                     }
-                    Ok(false) => {}
-                    Err(error) => warn!(%error, "failed to expire volatility fee"),
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => warn!(%error, "failed to expire volatility fee"),
+                    Err(error) => warn!(%error, "fee expiry worker failed"),
                 }
             }
         });
@@ -254,9 +303,14 @@ async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>)
             loop {
                 match rx.recv().await {
                     Ok(update) => {
-                        store_for_stats.apply_order_update(update);
-                        let stats = store_for_stats.order_stats();
-                        let _ = message_broker_for_stats.broadcast_stats(StatsEvent::now(stats));
+                        // Public statistics advance only when a chain-observed confirmation is
+                        // published. Earlier lifecycle states are retained in owner-only history.
+                        if matches!(update, order::OrderUpdate::Confirmed(_)) {
+                            store_for_stats.apply_order_update(update);
+                            let stats = store_for_stats.order_stats();
+                            let _ =
+                                message_broker_for_stats.broadcast_stats(StatsEvent::now(stats));
+                        }
                     }
                     Err(RecvError::Lagged(n)) => {
                         warn!("stats updater lagged behind by {n} messages");
@@ -295,6 +349,7 @@ async fn main_tokio(mut init_data: InitData, message_broker: Arc<MessageBroker>)
         fee_store,
         auth_store,
         analytics_store,
+        execution_store,
     )
     .await?;
 

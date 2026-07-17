@@ -122,80 +122,94 @@ pub fn start_history_service(
         let history = history.clone();
         let message_broker = message_broker.clone();
         let prices = prices.clone();
-        tokio::spawn(async move {
-            loop {
-                match order_rx.recv().await {
-                    Ok(update) => {
-                        let snapshot = update.snapshot();
-                        if let Err(error) = history.persist_order_update(&update) {
-                            tracing::error!(%error, order_id = %snapshot.id, "failed to persist order");
-                            continue;
-                        }
-                        if snapshot.status == OrderStatus::Processed {
-                            let asset_in = snapshot.details.asset_in;
-                            let asset_out = snapshot.details.asset_out;
-                            let oracle_price = prices
-                                .get(&asset_in.to_hex())
-                                .zip(prices.get(&asset_out.to_hex()))
-                                .and_then(|(price_in, price_out)| {
-                                    canonical_oracle_price(*price_in, *price_out)
-                                });
-                            match history.record_trade(&snapshot, oracle_price) {
-                                Ok(Some(trade)) => {
-                                    let _ = message_broker.broadcast_trade(TradeEvent {
-                                        order_id: trade.order_id,
-                                        pair: trade.pair,
-                                        asset_in: trade.asset_in,
-                                        asset_out: trade.asset_out,
-                                        amount_in: trade.amount_in,
-                                        amount_out: trade.amount_out,
-                                        price: trade.price,
-                                        timestamp: trade.timestamp,
-                                    });
+        std::thread::Builder::new()
+            .name("history-orders".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("history order runtime");
+                runtime.block_on(async move {
+                    loop {
+                        match order_rx.recv().await {
+                            Ok(update) => {
+                                let snapshot = update.snapshot();
+                                if let Err(error) = history.persist_order_update(&update) {
+                                    tracing::error!(%error, order_id = %snapshot.id, "failed to persist order");
+                                    continue;
                                 }
-                                Ok(None) => {}
-                                Err(error) => tracing::error!(
-                                    %error,
-                                    order_id = %snapshot.id,
-                                    "failed to persist trade"
-                                ),
+                                if is_public_trade_status(snapshot.status) {
+                                    let asset_in = snapshot.details.asset_in;
+                                    let asset_out = snapshot.details.asset_out;
+                                    let oracle_price = prices
+                                        .get(&asset_in.to_hex())
+                                        .zip(prices.get(&asset_out.to_hex()))
+                                        .and_then(|(price_in, price_out)| {
+                                            canonical_oracle_price(*price_in, *price_out)
+                                        });
+                                    match history.record_trade(&snapshot, oracle_price) {
+                                        Ok(Some(trade)) => {
+                                            let _ =
+                                                message_broker.broadcast_trade(TradeEvent {
+                                                    order_id: trade.order_id,
+                                                    pair: trade.pair,
+                                                    asset_in: trade.asset_in,
+                                                    asset_out: trade.asset_out,
+                                                    amount_in: trade.amount_in,
+                                                    amount_out: trade.amount_out,
+                                                    price: trade.price,
+                                                    timestamp: trade.timestamp,
+                                                });
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => tracing::error!(
+                                            %error,
+                                            order_id = %snapshot.id,
+                                            "failed to persist trade"
+                                        ),
+                                    }
+                                }
                             }
-                        } else if snapshot.status == OrderStatus::Executed
-                            && let Some(tx_hash) = &snapshot.tx_hash
-                            && let Err(error) = history.mark_trade_executed(snapshot.id, tx_hash)
-                        {
-                            tracing::error!(
-                                %error,
-                                order_id = %snapshot.id,
-                                "failed to attach transaction hash to trade"
-                            );
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "history order subscriber lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "history order subscriber lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+                });
+            })
+            .expect("spawn history order worker");
     }
 
-    tokio::spawn(async move {
-        loop {
-            match price_rx.recv().await {
-                Ok(event) => {
-                    prices.insert(event.faucet_id.clone(), event.price);
-                    if let Err(error) = history.record_oracle_price(&event) {
-                        tracing::error!(%error, "failed to persist oracle candle");
+    std::thread::Builder::new()
+        .name("history-prices".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("history price runtime");
+            runtime.block_on(async move {
+                loop {
+                    match price_rx.recv().await {
+                        Ok(event) => {
+                            prices.insert(event.faucet_id.clone(), event.price);
+                            if let Err(error) = history.record_oracle_price(&event) {
+                                tracing::error!(%error, "failed to persist oracle candle");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "history oracle subscriber lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "history oracle subscriber lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+            });
+        })
+        .expect("spawn history price worker");
+}
+
+fn is_public_trade_status(status: OrderStatus) -> bool {
+    status == OrderStatus::Confirmed
 }
 
 impl HistoryStore {
@@ -297,7 +311,7 @@ impl HistoryStore {
         let connection = self.connection()?;
         let (total, executed, failed): (i64, i64, i64) = connection.query_row(
             "SELECT COUNT(*),
-                    COALESCE(SUM(CASE WHEN status IN ('executed','settled') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status IN ('confirmed','executed','settled') THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
              FROM orders WHERE user_id = ?1",
             [user_id],
@@ -363,7 +377,10 @@ impl HistoryStore {
                 failure_reason,
                 timing.created_at.timestamp_millis(),
                 timing.processed.map(|value| value.timestamp_millis()),
-                timing.executed.map(|value| value.timestamp_millis()),
+                timing
+                    .confirmed
+                    .or(timing.executed)
+                    .map(|value| value.timestamp_millis()),
                 timing.failed.map(|value| value.timestamp_millis()),
                 timing.last_updated_at.timestamp_millis(),
             ],
@@ -402,7 +419,8 @@ impl HistoryStore {
         let price = directed_trade_price(snapshot.details.amount_in, result.amount_out)?;
         let timestamp = snapshot
             .timing
-            .processed
+            .confirmed
+            .or(snapshot.timing.processed)
             .unwrap_or(snapshot.timing.last_updated_at)
             .timestamp_millis() as u64;
         let pair = format!(
@@ -452,14 +470,6 @@ impl HistoryStore {
         let volume = snapshot.details.amount_in;
         upsert_all_candles(&connection, "trades", &pair, timestamp, price, volume, 1)?;
         Ok(Some(trade))
-    }
-
-    pub fn mark_trade_executed(&self, order_id: Uuid, tx_hash: &str) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE trades SET tx_hash = ?1 WHERE order_id = ?2",
-            params![tx_hash, order_id.to_string()],
-        )?;
-        Ok(())
     }
 
     pub fn record_oracle_price(&self, event: &OraclePriceEvent) -> Result<()> {
@@ -624,7 +634,7 @@ impl HistoryStore {
         let trades_all_time = query_count(&connection, "SELECT COUNT(*) FROM trades", None)?;
         let executed_orders = query_count(
             &connection,
-            "SELECT COUNT(*) FROM orders WHERE status IN ('executed', 'settled')",
+            "SELECT COUNT(*) FROM orders WHERE status IN ('confirmed', 'executed', 'settled')",
             None,
         )?;
         let failed_orders = query_count(
@@ -924,5 +934,59 @@ mod tests {
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].order_id, "order-1");
+    }
+
+    #[test]
+    fn only_confirmed_orders_are_public_trade_history() {
+        assert!(!is_public_trade_status(OrderStatus::Created));
+        assert!(!is_public_trade_status(OrderStatus::Processing));
+        assert!(!is_public_trade_status(OrderStatus::Processed));
+        assert!(!is_public_trade_status(OrderStatus::Submitted));
+        assert!(is_public_trade_status(OrderStatus::Confirmed));
+        assert!(!is_public_trade_status(OrderStatus::Failed));
+    }
+
+    #[test]
+    fn submitted_fill_is_not_published_until_confirmed() {
+        use miden_client::{account::AccountId, auth::AuthSecretKey};
+        use miden_core::Word;
+
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let user = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
+        let asset_in = AccountId::from_hex("0x57a179f33b726c315fcfd5e0ff3309").unwrap();
+        let asset_out = AccountId::from_hex("0x1e7e8af77fc5f2f1631d5c5ce35471").unwrap();
+        let intent = crate::intent::Intent::new_swap(
+            user,
+            asset_in,
+            10,
+            asset_out,
+            9,
+            Uuid::new_v4(),
+            u64::MAX,
+        );
+        let processed = crate::order::Order::new(
+            key.sign(Word::default()),
+            user,
+            crate::order::OrderDetails::new(asset_in, 10, asset_out, 9),
+            key.public_key(),
+            intent,
+        )
+        .start_processing()
+        .processed(crate::order::OrderExecutionResult { amount_out: 9 });
+        let submitted = OrderUpdate::Submitted(processed.clone().submitted("tx".to_owned()));
+        let confirmed = OrderUpdate::Confirmed(processed.confirmed("tx".to_owned()));
+        let store = HistoryStore::open(":memory:").unwrap();
+
+        store.persist_order_update(&submitted).unwrap();
+        if is_public_trade_status(submitted.snapshot().status) {
+            store.record_trade(&submitted.snapshot(), None).unwrap();
+        }
+        assert!(store.trades(None, None, None, 10).unwrap().is_empty());
+
+        store.persist_order_update(&confirmed).unwrap();
+        if is_public_trade_status(confirmed.snapshot().status) {
+            store.record_trade(&confirmed.snapshot(), None).unwrap();
+        }
+        assert_eq!(store.trades(None, None, None, 10).unwrap().len(), 1);
     }
 }

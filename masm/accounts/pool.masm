@@ -17,9 +17,9 @@ use zoro_miden::lib::math
 # CELL_SLOT_IDS maps a dense allocation index to that slot id because hashed slot names cannot
 # be derived in MASM. A missing CELL_INDEX entry is a read-only zero balance.
 
-# The pool component owns 248 cell slots plus these five metadata slots. AuthSingleSig owns two
+# The pool component owns 247 cell slots plus these six metadata slots. AuthSingleSig owns two
 # more and BasicWallet owns none, exactly fitting the account limit of 255 storage slots.
-const MAX_POOL_CELLS = 248
+const MAX_POOL_CELLS = 247
 
 # STORAGE SLOTS
 const CELL_SLOT_IDS_SLOT = word("zoropool::cell_slot_ids")
@@ -27,10 +27,19 @@ const CELL_INDEX_SLOT = word("zoropool::cell_index")
 const NEXT_CELL_SLOT = word("zoropool::next_cell")
 const VAULT_ACCOUNT_ID_SLOT = word("zoropool::vault_account_id")
 const USER_TRADING_DETAILS_PROC_ROOT_SLOT = word("zoropool::user_trading_details_proc_root")
+const CONSUMED_ORDERS_SLOT = word("zoropool::consumed_orders")
+
+# Signed intent v2 constants. These must match src/intent.rs.
+const SWAP_PURPOSE_TAG = 6506385721141899776
+const INTENT_DOMAIN_TAG = 7883954021992852325
+const TESTNET_NETWORK_TAG = 8387236824952960000
 
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "POOL: insufficient available balance for swap"
 const ERR_MAX_POOL_CELLS_REACHED = "POOL: maximum asset-user cells reached"
+const ERR_INVALID_INTENT_DOMAIN = "POOL: invalid v2 intent domain"
+const ERR_INTENT_EXPIRED = "POOL: signed intent expired"
+const ERR_ORDER_ALREADY_CONSUMED = "POOL: signed client order UUID already consumed"
 
 # ----------------------------------------------------------------------------------------------
 # ID HELPERS
@@ -224,50 +233,91 @@ end
 # ----------------------------------------------------------------------------------------------
 
 #! Executes a signed, asset-agnostic swap.
-#! Inputs:  [user_suffix, user_prefix, sell_asset_suffix, sell_asset_prefix,
-#!           sell_amount, buy_asset_suffix, buy_asset_prefix, buy_amount, pad(8)]
+#! Inputs:  [purpose, domain, network, user_suffix, user_prefix, sell_asset_suffix,
+#!           sell_asset_prefix, sell_amount, buy_asset_suffix, buy_asset_prefix,
+#!           buy_amount, uuid0, uuid1, uuid2, uuid3, expires_at]
 #! Advice:  [PK[9], SIG[17], ...]
 #! Outputs: []
 #! Invocation: call
 const SW_INTENT0_LOCAL = 0
 const SW_INTENT1_LOCAL = 4
-const SW_FUNDING_LOCAL = 8
-const SW_REDEEMED_LOCAL = 9
-const SW_PENDING_LOCAL = 10
-const SW_PK_LOCAL = 12
-const SW_SELL_SLOT_LOCAL = 16
-const SW_SELL_SLOT_PREFIX_LOCAL = 17
-const SW_BUY_SLOT_LOCAL = 20
-const SW_BUY_SLOT_PREFIX_LOCAL = 21
-const SW_SELL_AMOUNT_LOCAL = 22
-const SW_BUY_AMOUNT_LOCAL = 23
-const SW_USER_SUFFIX_LOCAL = 24
-const SW_USER_PREFIX_LOCAL = 25
-const SW_BUY_ASSET_SUFFIX_LOCAL = 26
-const SW_BUY_ASSET_PREFIX_LOCAL = 27
-@locals(28)
+const SW_INTENT2_LOCAL = 8
+const SW_INTENT3_LOCAL = 12
+const SW_FUNDING_LOCAL = 16
+const SW_REDEEMED_LOCAL = 17
+const SW_PENDING_LOCAL = 18
+const SW_PK_LOCAL = 20
+const SW_SELL_SLOT_LOCAL = 24
+const SW_SELL_SLOT_PREFIX_LOCAL = 25
+const SW_BUY_SLOT_LOCAL = 28
+const SW_BUY_SLOT_PREFIX_LOCAL = 29
+const SW_SELL_AMOUNT_LOCAL = 30
+const SW_BUY_AMOUNT_LOCAL = 31
+const SW_USER_SUFFIX_LOCAL = 32
+const SW_USER_PREFIX_LOCAL = 33
+const SW_BUY_ASSET_SUFFIX_LOCAL = 34
+const SW_BUY_ASSET_PREFIX_LOCAL = 35
+const SW_UUID0_LOCAL = 36
+const SW_UUID1_LOCAL = 37
+const SW_UUID2_LOCAL = 38
+const SW_UUID3_LOCAL = 39
+const SW_EXPIRES_AT_LOCAL = 40
+const SW_SELL_ASSET_SUFFIX_LOCAL = 41
+const SW_SELL_ASSET_PREFIX_LOCAL = 42
+@locals(43)
 pub proc execute_swap
     loc_storew_be.SW_INTENT0_LOCAL dropw
     loc_storew_be.SW_INTENT1_LOCAL dropw
-    # => [pad(8)]
+    loc_storew_be.SW_INTENT2_LOCAL dropw
+    loc_storew_be.SW_INTENT3_LOCAL dropw
 
-    # Cache scalar amounts explicitly; individual indices of a big-endian word are reversed.
-    loc_loadw_be.SW_INTENT1_LOCAL
-    loc_store.SW_SELL_AMOUNT_LOCAL drop drop drop
-    loc_loadw_be.SW_INTENT1_LOCAL
-    drop drop drop loc_store.SW_BUY_AMOUNT_LOCAL
+    # Assert the purpose/domain/network fixed by this freshly deployed v2 pool.
     loc_loadw_be.SW_INTENT0_LOCAL
+    push.SWAP_PURPOSE_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
+    push.INTENT_DOMAIN_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
+    push.TESTNET_NETWORK_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
     loc_store.SW_USER_SUFFIX_LOCAL
-    loc_store.SW_USER_PREFIX_LOCAL
-    drop drop
+
+    # Cache all business fields and the client UUID.
     loc_loadw_be.SW_INTENT1_LOCAL
-    drop
+    loc_store.SW_USER_PREFIX_LOCAL
+    loc_store.SW_SELL_ASSET_SUFFIX_LOCAL
+    loc_store.SW_SELL_ASSET_PREFIX_LOCAL
+    loc_store.SW_SELL_AMOUNT_LOCAL
+    loc_loadw_be.SW_INTENT2_LOCAL
     loc_store.SW_BUY_ASSET_SUFFIX_LOCAL
     loc_store.SW_BUY_ASSET_PREFIX_LOCAL
-    drop
+    loc_store.SW_BUY_AMOUNT_LOCAL
+    loc_store.SW_UUID0_LOCAL
+    loc_loadw_be.SW_INTENT3_LOCAL
+    loc_store.SW_UUID1_LOCAL
+    loc_store.SW_UUID2_LOCAL
+    loc_store.SW_UUID3_LOCAL
+    loc_store.SW_EXPIRES_AT_LOCAL
+
+    # The chain timestamp independently enforces the signed expiry.
+    loc_load.SW_EXPIRES_AT_LOCAL
+    exec.tx::get_block_timestamp
+    # => [block_timestamp_unix_seconds, expires_at_unix_seconds]
+    # `lt` compares the next stack item with the top item, so swap to assert
+    # block_timestamp < expires_at. Equality is expired, matching API/Processing.
+    swap lt assert.err=ERR_INTENT_EXPIRED
+
+    # The authenticated consumed-orders map makes UUID replay impossible, including
+    # a duplicate later in this same transaction.
+    loc_load.SW_UUID3_LOCAL
+    loc_load.SW_UUID2_LOCAL
+    loc_load.SW_UUID1_LOCAL
+    loc_load.SW_UUID0_LOCAL
+    push.CONSUMED_ORDERS_SLOT[0..2]
+    exec.active_account::get_map_item
+    exec.is_zero_word assert.err=ERR_ORDER_ALREADY_CONSUMED
 
     # Fetch fresh vault values for the full sell asset + user key.
-    loc_loadw_be.SW_INTENT0_LOCAL movup.2 movup.3 swap
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    loc_load.SW_SELL_ASSET_PREFIX_LOCAL
+    loc_load.SW_SELL_ASSET_SUFFIX_LOCAL
     # => [sell_asset_suffix, sell_asset_prefix, user_suffix, user_prefix, pad(8)]
     exec.fetch_user_trading_details
     loc_store.SW_FUNDING_LOCAL
@@ -275,14 +325,19 @@ pub proc execute_swap
     loc_store.SW_PENDING_LOCAL
     loc_storew_be.SW_PK_LOCAL dropw
 
-    # Verify the canonical eight-felt intent.
+    # Verify the canonical sixteen-felt v2 intent against the vault-registered key.
     padw loc_loadw_be.SW_PK_LOCAL
+    padw loc_loadw_be.SW_INTENT3_LOCAL
+    padw loc_loadw_be.SW_INTENT2_LOCAL
     padw loc_loadw_be.SW_INTENT1_LOCAL
     padw loc_loadw_be.SW_INTENT0_LOCAL
     exec.operator::verify_intent_signature
 
     # Lazily allocate both (asset, user) cells.
-    loc_loadw_be.SW_INTENT0_LOCAL movup.2 movup.3 swap
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    loc_load.SW_SELL_ASSET_PREFIX_LOCAL
+    loc_load.SW_SELL_ASSET_SUFFIX_LOCAL
     exec.get_or_create_cell_slot_id
     loc_store.SW_SELL_SLOT_LOCAL
     loc_store.SW_SELL_SLOT_PREFIX_LOCAL
@@ -319,6 +374,16 @@ pub proc execute_swap
     loc_load.SW_BUY_SLOT_PREFIX_LOCAL
     loc_load.SW_BUY_SLOT_LOCAL
     exec.add_to_bought
+
+    # Consume only after every fallible swap check/update; transaction atomicity still
+    # rolls this write back if a later account/kernel assertion fails.
+    push.0.0.0.1
+    loc_load.SW_UUID3_LOCAL
+    loc_load.SW_UUID2_LOCAL
+    loc_load.SW_UUID1_LOCAL
+    loc_load.SW_UUID0_LOCAL
+    push.CONSUMED_ORDERS_SLOT[0..2]
+    exec.native_account::set_map_item dropw
 
     exec.sys::truncate_stack
 end

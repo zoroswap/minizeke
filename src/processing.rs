@@ -4,12 +4,13 @@ use crate::{
     },
     curve::get_curve_amount_out_with_volatility_fee,
     deployment::AssetInfo,
-    execution_store::ExecutionStore,
-    fee_store::apply_fee_states,
+    execution_store::{ExecutionStore, ProposedSwap, SwapFinalization},
+    fee_store::{FeeStore, apply_fee_states},
+    intent::is_expired_at,
     lp_store::LpStore,
     message_broker::message_broker::{
-        AmmEvent, AnalyticsEvent, LpAppliedEvent, LpChainEvent, LpOperationKind, MessageBroker,
-        MessageBrokerEvent, PoolStateEvent, UserEvent,
+        AmmEvent, AnalyticsEvent, LpChainEvent, LpOperationKind, MessageBroker, MessageBrokerEvent,
+        PoolStateEvent, UserEvent,
     },
     oracle_sse::OraclePricing,
     order::{Created, Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders},
@@ -25,9 +26,13 @@ use anyhow::{Result, anyhow};
 use miden_client::account::AccountId;
 use std::{
     collections::{HashMap, HashSet},
+    str::FromStr,
     sync::Arc,
 };
-use tokio::{select, sync::broadcast::error::RecvError};
+use tokio::{
+    select,
+    sync::broadcast::{Receiver, error::RecvError},
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -60,11 +65,15 @@ pub struct Processing {
     /// the on-chain FPI assert in the swap tx remains the real enforcement.
     balances: HashMap<(AccountId, AccountId), u64>,
     lp_ledger: LpLedger,
-    processed_lp_notes: HashMap<String, u64>,
+    lp_store: Arc<LpStore>,
+    lp_chain_rx: Receiver<LpChainEvent>,
+    lp_recovery_pending: bool,
     execution_store: Arc<ExecutionStore>,
+    fee_store: Arc<FeeStore>,
     pending_swaps: HashMap<Uuid, PendingSwap>,
     execution_finished: bool,
     analytics_store: Arc<AnalyticsStore>,
+    worker_id: String,
 }
 
 impl Processing {
@@ -75,11 +84,25 @@ impl Processing {
         assets: Vec<AssetInfo>,
         pools: Vec<AccountId>,
         lp_store: Arc<LpStore>,
+        execution_store: Arc<ExecutionStore>,
+        fee_store: Arc<FeeStore>,
     ) -> Result<Self> {
         let oracle_pricing = OraclePricing::new(&assets);
         let orders = Orders::default();
-        let execution_store = Arc::new(ExecutionStore::open_from_env()?);
         let analytics_store = Arc::new(AnalyticsStore::open_from_env()?);
+
+        // A pool snapshot may have committed immediately before a crash while the
+        // separate LP journal acknowledgement did not. Reconcile those markers first
+        // so the in-memory ledger is rebuilt from authoritative positions.
+        for operation in lp_store.confirmed_operations()? {
+            if let Some(lp_shares) = execution_store.applied_lp_shares(&operation.note_id)? {
+                lp_store.apply_operation(
+                    &operation.note_id,
+                    lp_shares,
+                    chrono::Utc::now().timestamp_millis() as u64,
+                )?;
+            }
+        }
 
         let mut lp_ledger = LpLedger::default();
         for position in lp_store.positions()? {
@@ -88,7 +111,8 @@ impl Processing {
             lp_ledger.mint(faucet_id, lp_id, position.shares);
         }
 
-        Ok(Self {
+        let lp_chain_rx = message_broker.subscribe_lp_chain();
+        let mut processing = Self {
             oracle_pricing,
             message_broker,
             orders,
@@ -100,12 +124,22 @@ impl Processing {
             user_pools: HashMap::new(),
             balances: HashMap::new(),
             lp_ledger,
-            processed_lp_notes: HashMap::new(),
+            lp_store,
+            lp_chain_rx,
+            lp_recovery_pending: false,
             execution_store,
+            fee_store,
             pending_swaps: HashMap::new(),
             execution_finished: false,
             analytics_store,
-        })
+            worker_id: format!("processing-{}", Uuid::new_v4()),
+        };
+        processing.recover_unapplied_lp_operations()?;
+        Ok(processing)
+    }
+
+    pub fn pool_states(&self) -> HashMap<AccountId, PoolState> {
+        self.pool_states.clone()
     }
 
     /// Returns the user's balance for `faucet_id`, fetching the opening balance from
@@ -154,15 +188,20 @@ impl Processing {
         let mut orders_rx = self.message_broker.subscribe_order_updates();
         let mut pool_state_rx = self.message_broker.subscribe_pool_state();
         let mut amm_rx = self.message_broker.subscribe_amm();
-        let mut lp_chain_rx = self.message_broker.subscribe_lp_chain();
         let mut fee_state_rx = self.message_broker.subscribe_fee_state();
+        let mut durable_poll = tokio::time::interval(std::time::Duration::from_millis(250));
 
         loop {
             let event = select! {
+                _ = durable_poll.tick() => {
+                    self.try_start_batch().await;
+                    continue;
+                }
                 prices = price_rx.recv() => {
                     match prices {
                         Ok(ev) => MessageBrokerEvent::OraclePrice(ev),
                         Err(RecvError::Lagged(n)) => {
+                            self.message_broker.record_lag("oracle", n);
                             warn!("orders lagged behind by {n} messages");
                             continue;
                         }
@@ -175,6 +214,7 @@ impl Processing {
                     match orders {
                         Ok(ev) => MessageBrokerEvent::Order(ev),
                         Err(RecvError::Lagged(n)) => {
+                            self.message_broker.record_lag("order", n);
                             warn!("orders lagged behind by {n} messages");
                             continue;
                         }
@@ -187,6 +227,7 @@ impl Processing {
                     match pool_states {
                         Ok(ev) => MessageBrokerEvent::PoolState(ev),
                         Err(RecvError::Lagged(n)) => {
+                            self.message_broker.record_lag("pool_state", n);
                             eprintln!("pool_states lagged behind by {n} messages");
                             continue;
                         }
@@ -199,6 +240,7 @@ impl Processing {
                     match amm {
                         Ok(ev) => MessageBrokerEvent::Amm(ev),
                         Err(RecvError::Lagged(n)) => {
+                            self.message_broker.record_lag("amm", n);
                             eprintln!("amm lagged behind by {n} messages");
                             continue;
                         }
@@ -207,11 +249,17 @@ impl Processing {
                         }
                     }
                 }
-                lp = lp_chain_rx.recv() => {
+                lp = self.lp_chain_rx.recv() => {
                     match lp {
                         Ok(ev) => MessageBrokerEvent::LpChain(ev),
                         Err(RecvError::Lagged(n)) => {
+                            self.message_broker.record_lag("lp", n);
                             warn!("LP chain events lagged behind by {n} messages");
+                            if !self.pending_swaps.is_empty() {
+                                self.lp_recovery_pending = true;
+                            } else if let Err(error) = self.recover_unapplied_lp_operations() {
+                                error!(%error, "failed to recover lagged LP chain events");
+                            }
                             continue;
                         }
                         Err(RecvError::Closed) => break,
@@ -221,7 +269,14 @@ impl Processing {
                     match fees {
                         Ok(ev) => MessageBrokerEvent::FeeState(ev),
                         Err(RecvError::Lagged(n)) => {
-                            warn!("fee state events lagged behind by {n} messages");
+                            self.message_broker.record_lag("fee_state", n);
+                            let now = chrono::Utc::now().timestamp() as u64;
+                            match self.fee_store.active_states(now) {
+                                Ok(states) => apply_fee_states(&mut self.pool_states, &states),
+                                Err(error) => {
+                                    error!(%error, "failed to recover fee state after broker lag")
+                                }
+                            }
                             continue;
                         }
                         Err(RecvError::Closed) => break,
@@ -237,11 +292,21 @@ impl Processing {
         match event {
             MessageBrokerEvent::Order(ev) => {
                 let is_new = matches!(ev, OrderUpdate::New(_));
-                let snapshot = ev.snapshot();
                 match &ev {
-                    OrderUpdate::Executed(order) => {
+                    OrderUpdate::Confirmed(order) => {
                         let now = chrono::Utc::now().timestamp_millis() as u64;
-                        if let Some(pending) = self.pending_swaps.remove(&order.id) {
+                        let pending = self.pending_swaps.remove(&order.id).or_else(|| {
+                            self.execution_store
+                                .swap_finalization(&order.id.to_string())
+                                .ok()
+                                .flatten()
+                                .and_then(|stored| self.restore_pending_swap(stored).ok())
+                                .map(|pending| {
+                                    self.apply_pending_swap(&pending);
+                                    pending
+                                })
+                        });
+                        if let Some(pending) = pending {
                             if let Err(error) =
                                 self.analytics_store.record_swap(&pending.analytics_swap)
                             {
@@ -251,18 +316,10 @@ impl Processing {
                                 user_id: pending.user_id,
                                 timestamp: now,
                             });
-                        }
-                        if !self
-                            .execution_store
-                            .executed_swap(&order.id.to_string())
-                            .unwrap_or(false)
-                            && let Err(error) = self.execution_store.finalize_swap(
-                                &order.id.to_string(),
-                                snapshot.tx_hash.as_deref(),
-                                now,
-                            )
-                        {
-                            error!(order_id = %order.id, %error, "failed to finalize swap accounting");
+                            let _ = self.message_broker.broadcast_pool_state(PoolStateEvent {
+                                pool_states: self.pool_states.clone(),
+                                timestamp: now,
+                            });
                         }
                     }
                     OrderUpdate::Failed(order) => {
@@ -324,13 +381,15 @@ impl Processing {
                 _ => {}
             },
             MessageBrokerEvent::LpChain(ev) => {
-                if let Err(error) = self.apply_lp_chain_event(ev.clone()) {
+                if !self.pending_swaps.is_empty() {
+                    self.lp_recovery_pending = true;
+                    return;
+                }
+                // The broadcast is only a wake-up. Read the ordered durable journal so
+                // dropped or reordered notifications cannot choose accounting order.
+                if let Err(error) = self.recover_unapplied_lp_operations() {
                     error!(note_id = %ev.note_id, %error, "failed to apply LP chain event");
-                    let _ = self.message_broker.broadcast_lp_applied(LpAppliedEvent {
-                        note_id: ev.note_id,
-                        lp_shares: 0,
-                        error: Some(error.to_string()),
-                    });
+                    self.lp_recovery_pending = true;
                 }
             }
             MessageBrokerEvent::FeeState(ev) => {
@@ -342,92 +401,164 @@ impl Processing {
             }
             _ => {}
         }
+        self.retry_pending_lp_recovery();
+    }
+
+    fn recover_unapplied_lp_operations(&mut self) -> Result<()> {
+        for operation in self.lp_store.confirmed_operations()? {
+            if let Some(lp_shares) = self.execution_store.applied_lp_shares(&operation.note_id)? {
+                // During startup this was already reconciled before the ledger rebuild.
+                // During normal operation this closes an acknowledgement retry window.
+                self.lp_store.apply_operation(
+                    &operation.note_id,
+                    lp_shares,
+                    chrono::Utc::now().timestamp_millis() as u64,
+                )?;
+                continue;
+            }
+            self.apply_lp_chain_event(self.lp_event_from_operation(&operation)?)?;
+        }
+        Ok(())
+    }
+
+    fn lp_event_from_operation(
+        &self,
+        operation: &crate::lp_store::LpOperation,
+    ) -> Result<LpChainEvent> {
+        let kind = if operation.kind == "deposit" {
+            LpOperationKind::Deposit
+        } else {
+            LpOperationKind::Withdraw
+        };
+        let lp_id = AccountId::from_hex(&operation.lp_id)?;
+        let faucet_id = AccountId::from_hex(&operation.faucet_id)?;
+        let shares_hint = if kind == LpOperationKind::Withdraw {
+            self.lp_store
+                .position(lp_id, faucet_id)?
+                .filter(|position| {
+                    position.checkpoint_value != 0 && position.checkpoint_shares != 0
+                })
+                .map(|position| {
+                    let numerator =
+                        u128::from(operation.asset_amount) * u128::from(position.checkpoint_shares);
+                    u64::try_from(
+                        numerator
+                            .div_ceil(u128::from(position.checkpoint_value))
+                            .min(u128::from(position.shares)),
+                    )
+                    .map_err(anyhow::Error::from)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(LpChainEvent {
+            note_id: operation.note_id.clone(),
+            kind,
+            lp_id,
+            faucet_id,
+            asset_amount: operation.asset_amount,
+            shares_hint,
+        })
+    }
+
+    fn retry_pending_lp_recovery(&mut self) {
+        if !self.pending_swaps.is_empty() {
+            return;
+        }
+        if !self.lp_recovery_pending {
+            return;
+        }
+        self.lp_recovery_pending = false;
+        if let Err(error) = self.recover_unapplied_lp_operations() {
+            error!(%error, "failed to recover queued LP chain events");
+            self.lp_recovery_pending = true;
+        }
     }
 
     fn apply_lp_chain_event(&mut self, event: LpChainEvent) -> Result<()> {
-        if let Some(lp_shares) = self.processed_lp_notes.get(&event.note_id).copied() {
-            self.message_broker.broadcast_lp_applied(LpAppliedEvent {
-                note_id: event.note_id.clone(),
+        if let Some(lp_shares) = self.execution_store.applied_lp_shares(&event.note_id)? {
+            self.lp_store.apply_operation(
+                &event.note_id,
                 lp_shares,
-                error: None,
-            })?;
+                chrono::Utc::now().timestamp_millis() as u64,
+            )?;
             self.record_lp_analytics(&event, lp_shares);
             return Ok(());
         }
 
-        let result = (|| {
-            let pool = self
-                .pool_states
-                .get(&event.faucet_id)
-                .copied()
-                .ok_or_else(|| anyhow!("no pool for LP asset {}", event.faucet_id.to_hex()))?;
-            let (lp_shares, new_supply, new_balances) = match event.kind {
-                LpOperationKind::Deposit => {
-                    let (shares, supply, balances) =
-                        pool.get_deposit_lp_amount_out(U256::from(event.asset_amount))?;
-                    (shares.saturating_to::<u64>(), supply, balances)
-                }
-                LpOperationKind::Withdraw => {
-                    let owned = self.lp_ledger.shares_of(event.faucet_id, event.lp_id);
-                    let shares = if let Some(shares) = event
-                        .shares_hint
-                        .filter(|shares| *shares > 0 && *shares <= owned)
-                    {
-                        shares
-                    } else {
-                        self.shares_for_withdrawal(pool, event.asset_amount, owned)?
-                    };
-                    let (payout, supply, balances) =
-                        pool.get_withdraw_asset_amount_out(U256::from(shares))?;
-                    if payout.saturating_to::<u64>() < event.asset_amount {
-                        return Err(anyhow!(
-                            "LP shares value {} is below confirmed withdrawal {}",
-                            payout,
-                            event.asset_amount
-                        ));
-                    }
-                    (shares, supply, balances)
-                }
-            };
-
-            match event.kind {
-                LpOperationKind::Deposit => {
-                    self.lp_ledger.mint(event.faucet_id, event.lp_id, lp_shares);
-                }
-                LpOperationKind::Withdraw => {
-                    self.lp_ledger
-                        .burn(event.faucet_id, event.lp_id, lp_shares)?;
-                }
+        let pool = self
+            .pool_states
+            .get(&event.faucet_id)
+            .copied()
+            .ok_or_else(|| anyhow!("no pool for LP asset {}", event.faucet_id.to_hex()))?;
+        let (lp_shares, new_supply, new_balances) = match event.kind {
+            LpOperationKind::Deposit => {
+                let (shares, supply, balances) =
+                    pool.get_deposit_lp_amount_out(U256::from(event.asset_amount))?;
+                (shares.saturating_to::<u64>(), supply, balances)
             }
-            self.pool_states
-                .get_mut(&event.faucet_id)
-                .unwrap()
-                .update_state(new_balances, new_supply);
-            self.message_broker.broadcast_pool_state(PoolStateEvent {
-                pool_states: self.pool_states.clone(),
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            })?;
-            if self.pending_swaps.is_empty() {
-                self.execution_store.save_pool_states(
-                    &self.pool_states,
-                    chrono::Utc::now().timestamp_millis() as u64,
-                )?;
+            LpOperationKind::Withdraw => {
+                let owned = self.lp_ledger.shares_of(event.faucet_id, event.lp_id);
+                let shares = if let Some(shares) = event
+                    .shares_hint
+                    .filter(|shares| *shares > 0 && *shares <= owned)
+                {
+                    shares
+                } else {
+                    self.shares_for_withdrawal(pool, event.asset_amount, owned)?
+                };
+                let (payout, supply, balances) =
+                    pool.get_withdraw_asset_amount_out(U256::from(shares))?;
+                if payout.saturating_to::<u64>() < event.asset_amount {
+                    return Err(anyhow!(
+                        "LP shares value {} is below confirmed withdrawal {}",
+                        payout,
+                        event.asset_amount
+                    ));
+                }
+                (shares, supply, balances)
             }
-            self.processed_lp_notes
-                .insert(event.note_id.clone(), lp_shares);
-            self.message_broker.broadcast_lp_applied(LpAppliedEvent {
-                note_id: event.note_id.clone(),
-                lp_shares,
-                error: None,
-            })?;
-            self.record_lp_analytics(&event, lp_shares);
-            Ok(())
-        })();
+        };
 
-        if result.is_err() {
-            self.processed_lp_notes.remove(&event.note_id);
+        // Build the next state off to the side. Nothing becomes visible in RAM until
+        // SQLite has atomically committed both the snapshot and note marker.
+        let mut next_pool_states = self.pool_states.clone();
+        next_pool_states
+            .get_mut(&event.faucet_id)
+            .expect("validated LP pool exists")
+            .update_state(new_balances, new_supply);
+        let mut next_lp_ledger = self.lp_ledger.clone();
+        match event.kind {
+            LpOperationKind::Deposit => {
+                next_lp_ledger.mint(event.faucet_id, event.lp_id, lp_shares);
+            }
+            LpOperationKind::Withdraw => {
+                next_lp_ledger.burn(event.faucet_id, event.lp_id, lp_shares)?;
+            }
         }
-        result
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let inserted = self.execution_store.save_lp_application(
+            &event.note_id,
+            event.faucet_id,
+            lp_shares,
+            &next_pool_states,
+            now,
+        )?;
+        if inserted {
+            self.pool_states = next_pool_states;
+            self.lp_ledger = next_lp_ledger;
+        }
+        self.message_broker.broadcast_pool_state(PoolStateEvent {
+            pool_states: self.pool_states.clone(),
+            timestamp: now,
+        })?;
+        // This acknowledgement may crash independently. The durable marker makes the
+        // next startup reconcile only the journal without touching the curve again.
+        self.lp_store
+            .apply_operation(&event.note_id, lp_shares, now)?;
+        self.record_lp_analytics(&event, lp_shares);
+        Ok(())
     }
 
     fn shares_for_withdrawal(
@@ -482,15 +613,24 @@ impl Processing {
         if self.engine_busy {
             return;
         }
-        let batch = self.orders.orders_new();
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let batch =
+            match self
+                .execution_store
+                .claim_admitted_orders(&self.worker_id, now, 600_000, 100)
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    error!(%error, "Failed to claim durable admitted orders");
+                    return;
+                }
+            };
         if batch.is_empty() {
             return;
         }
         info!(count = batch.len(), "Starting processing batch");
         self.engine_busy = true;
         self.execution_finished = false;
-        // Informational event for WebSocket clients.
-        let _ = self.message_broker.broadcast_amm(AmmEvent::StartProcessing);
         if let Err(e) = self.process_orders(batch).await {
             error!("Failed to process orders: {e:?}");
             self.engine_busy = false;
@@ -549,6 +689,19 @@ impl Processing {
     }
 
     fn publish_order_update(&self, update: OrderUpdate) -> Result<()> {
+        if let OrderUpdate::Failed(order) = &update {
+            let snapshot = update.snapshot();
+            let reason = snapshot
+                .failure_reason
+                .map(|reason| format!("{reason:?}"))
+                .unwrap_or_else(|| "ExecutionError".to_owned());
+            self.execution_store.fail_claimed_order(
+                order.id,
+                &self.worker_id,
+                &reason,
+                chrono::Utc::now().timestamp_millis() as u64,
+            )?;
+        }
         self.orders.apply_order_update(update.clone());
         self.message_broker.broadcast_order_update(update)
     }
@@ -561,12 +714,20 @@ impl Processing {
         }
 
         let mut processed_batch = Vec::with_capacity(orders.len());
+        let mut proposed_swaps = Vec::with_capacity(orders.len());
         let mut pool_states_changed = false;
         for order in orders {
             let details = order.details();
             let buy_faucet = details.asset_out;
             let sell_faucet = details.asset_in;
             let user_id = order.user_id();
+
+            if is_expired_at(order.expires_at(), chrono::Utc::now().timestamp() as u64) {
+                warn!(order_id = %order.id, "Signed intent expired before processing");
+                let failed = order.failed(OrderFailureReason::Expired);
+                self.publish_order_update(OrderUpdate::Failed(failed))?;
+                continue;
+            }
 
             if sell_faucet == buy_faucet
                 || !self.asset_ids.contains(&sell_faucet)
@@ -770,39 +931,61 @@ impl Processing {
                         .map(|pool| pool.settings().volatility_fee_version)
                         .unwrap_or(0),
                 );
-            self.execution_store.record_proposed_swap(
-                &processed.id.to_string(),
+            proposed_swaps.push(ProposedSwap {
+                order_id: processed.id.to_string(),
                 user_id,
-                sell_faucet,
-                buy_faucet,
-                details.amount_in,
-                executed_amount_out,
-                quote.amount_out,
-                quote.fees.raw_amount_out,
-                quote.fees.lp_fee,
-                quote.fees.backstop_fee,
-                quote.fees.protocol_fee,
-                quote.fees.volatility_fee,
-                sell_price,
-                buy_price,
+                asset_in: sell_faucet,
+                asset_out: buy_faucet,
+                amount_in: details.amount_in,
+                amount_out: executed_amount_out,
+                quoted_amount_out: quote.amount_out,
+                raw_amount_out: quote.fees.raw_amount_out,
+                lp_fee: quote.fees.lp_fee,
+                backstop_fee: quote.fees.backstop_fee,
+                protocol_fee: quote.fees.protocol_fee,
+                volatility_fee: quote.fees.volatility_fee,
+                oracle_price_in: sell_price,
+                oracle_price_out: buy_price,
                 fee_version,
-                chrono::Utc::now().timestamp_millis() as u64,
-            )?;
-            self.publish_order_update(OrderUpdate::Processed(processed.clone()))?;
+                finalization: SwapFinalization {
+                    user_id: user_id.to_hex(),
+                    sell_faucet: sell_faucet.to_hex(),
+                    buy_faucet: buy_faucet.to_hex(),
+                    amount_in: details.amount_in,
+                    amount_out: executed_amount_out,
+                    sell_before: balances_to_strings(sell_before),
+                    sell_after: balances_to_strings(quote.new_base_pool_balances),
+                    buy_before: balances_to_strings(buy_before),
+                    buy_after: balances_to_strings(quote.new_quote_pool_balances),
+                    analytics_swap: self
+                        .pending_swaps
+                        .get(&processed.id)
+                        .expect("pending swap was inserted")
+                        .analytics_swap
+                        .clone(),
+                },
+            });
             processed_batch.push(processed);
         }
 
-        if pool_states_changed {
-            self.message_broker.broadcast_pool_state(PoolStateEvent {
-                pool_states: self.pool_states.clone(),
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            })?;
-        }
+        let _ = pool_states_changed;
 
-        self.message_broker
-            .broadcast_amm(AmmEvent::OrdersProcessed)?;
-        self.message_broker
-            .broadcast_processed_batch(processed_batch)?;
+        let batch_id = self.execution_store.create_execution_batch(
+            &self.worker_id,
+            &processed_batch,
+            &proposed_swaps,
+            chrono::Utc::now().timestamp_millis() as u64,
+        )?;
+        for processed in &processed_batch {
+            self.publish_order_update(OrderUpdate::Processed(processed.clone()))?;
+        }
+        if batch_id.is_some() {
+            // Notification-only fast path. Miden execution claims the committed batch.
+            self.message_broker
+                .broadcast_processed_batch(processed_batch)?;
+        } else {
+            self.engine_busy = false;
+        }
 
         Ok(())
     }
@@ -833,6 +1016,38 @@ impl Processing {
             .get_mut(&(pending.user_id, pending.buy_faucet))
         {
             *balance = balance.saturating_sub(pending.amount_out);
+        }
+    }
+
+    fn restore_pending_swap(&self, stored: SwapFinalization) -> Result<PendingSwap> {
+        Ok(PendingSwap {
+            user_id: AccountId::from_hex(&stored.user_id)?,
+            sell_faucet: AccountId::from_hex(&stored.sell_faucet)?,
+            buy_faucet: AccountId::from_hex(&stored.buy_faucet)?,
+            amount_in: stored.amount_in,
+            amount_out: stored.amount_out,
+            sell_before: balances_from_strings(stored.sell_before)?,
+            sell_after: balances_from_strings(stored.sell_after)?,
+            buy_before: balances_from_strings(stored.buy_before)?,
+            buy_after: balances_from_strings(stored.buy_after)?,
+            analytics_swap: stored.analytics_swap,
+        })
+    }
+
+    fn apply_pending_swap(&mut self, pending: &PendingSwap) {
+        if let Some(pool) = self.pool_states.get_mut(&pending.sell_faucet) {
+            pool.update_balances(revert_balances(
+                *pool.balances(),
+                pending.sell_after,
+                pending.sell_before,
+            ));
+        }
+        if let Some(pool) = self.pool_states.get_mut(&pending.buy_faucet) {
+            pool.update_balances(revert_balances(
+                *pool.balances(),
+                pending.buy_after,
+                pending.buy_before,
+            ));
         }
     }
 
@@ -888,6 +1103,22 @@ fn oracle_value(amount: u64, price: Option<u64>, decimals: u8) -> u128 {
 
 fn oracle_value_u256(amount: U256, price: Option<u64>, decimals: u8) -> u128 {
     oracle_value(amount.saturating_to::<u64>(), price, decimals)
+}
+
+fn balances_to_strings(balances: PoolBalances) -> [String; 3] {
+    [
+        balances.reserve.to_string(),
+        balances.reserve_with_slippage.to_string(),
+        balances.total_liabilities.to_string(),
+    ]
+}
+
+fn balances_from_strings(values: [String; 3]) -> Result<PoolBalances> {
+    Ok(PoolBalances {
+        reserve: U256::from_str(&values[0])?,
+        reserve_with_slippage: U256::from_str(&values[1])?,
+        total_liabilities: U256::from_str(&values[2])?,
+    })
 }
 
 fn revert_balances(

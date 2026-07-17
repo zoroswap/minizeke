@@ -1,13 +1,29 @@
+use miden_client::account::AccountId;
 use miden_core::{Felt, Word};
 use miden_protocol::crypto::hash::poseidon2::Poseidon2;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-/// Domain-separation tag — stops a signature for one action type being
-/// replayed as another. See the cancel/withdraw tags in the perp repo.
-///
-/// A user's authorization to move `amount` to a recipient, bound to the
-/// depositor's account id so the operator knows whose funds are moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Breaking v2 wire/on-chain intent constants. These values are also asserted by
+/// `pool.masm`; changing any of them requires deploying fresh pool accounts.
+pub const INTENT_VERSION: u8 = 2;
+pub const SWAP_PURPOSE_TAG: u64 = u64::from_be_bytes(*b"ZKSWPV2\0");
+pub const INTENT_DOMAIN_TAG: u64 = u64::from_be_bytes(*b"minizeke");
+pub const TESTNET_NETWORK_TAG: u64 = u64::from_be_bytes(*b"testnet\0");
+pub const INTENT_FELT_COUNT: usize = 16;
+
+/// Returns whether a Unix-seconds intent expiry has elapsed. Equality is expired.
+pub const fn is_expired_at(expires_at: u64, unix_timestamp_seconds: u64) -> bool {
+    unix_timestamp_seconds >= expires_at
+}
+
+/// The exact v2 authorization consumed by a pool. The client-generated UUID is
+/// represented as four 32-bit limbs so every value is a valid Miden field element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intent {
+    pub purpose: u64,
+    pub domain: u64,
+    pub network: u64,
     pub user_suffix: u64,
     pub user_prefix: u64,
     pub sell_asset_suffix: u64,
@@ -16,13 +32,44 @@ pub struct Intent {
     pub buy_asset_suffix: u64,
     pub buy_asset_prefix: u64,
     pub buy_amount: u64,
+    pub client_order_id: [u64; 4],
+    pub expires_at: u64,
 }
 
 impl Intent {
+    pub fn new_swap(
+        user_id: AccountId,
+        sell_asset: AccountId,
+        sell_amount: u64,
+        buy_asset: AccountId,
+        buy_amount: u64,
+        client_order_id: Uuid,
+        expires_at: u64,
+    ) -> Self {
+        Self {
+            purpose: SWAP_PURPOSE_TAG,
+            domain: INTENT_DOMAIN_TAG,
+            network: TESTNET_NETWORK_TAG,
+            user_suffix: user_id.suffix().as_canonical_u64(),
+            user_prefix: user_id.prefix().as_u64(),
+            sell_asset_suffix: sell_asset.suffix().as_canonical_u64(),
+            sell_asset_prefix: sell_asset.prefix().as_u64(),
+            sell_amount,
+            buy_asset_suffix: buy_asset.suffix().as_canonical_u64(),
+            buy_asset_prefix: buy_asset.prefix().as_u64(),
+            buy_amount,
+            client_order_id: uuid_felts(client_order_id),
+            expires_at,
+        }
+    }
+
     /// The exact field elements hashed to the signed Word.
     /// MUST match the TypeScript `intentFelts` ordering byte-for-byte.
-    pub fn canonical_felts(&self) -> Vec<u64> {
-        vec![
+    pub fn canonical_felts(&self) -> [u64; INTENT_FELT_COUNT] {
+        [
+            self.purpose,
+            self.domain,
+            self.network,
             self.user_suffix,
             self.user_prefix,
             self.sell_asset_suffix,
@@ -31,12 +78,21 @@ impl Intent {
             self.buy_asset_suffix,
             self.buy_asset_prefix,
             self.buy_amount,
+            self.client_order_id[0],
+            self.client_order_id[1],
+            self.client_order_id[2],
+            self.client_order_id[3],
+            self.expires_at,
         ]
     }
 
     /// The Word the user signs.
     pub fn message_word(&self) -> Word {
         message_word(&self.canonical_felts())
+    }
+
+    pub fn client_order_uuid(&self) -> Uuid {
+        uuid_from_felts(self.client_order_id)
     }
 }
 
@@ -50,4 +106,171 @@ impl Intent {
 pub fn message_word(felts: &[u64]) -> Word {
     let elements: Vec<Felt> = felts.iter().map(|&v| Felt::new(v).unwrap()).collect();
     Poseidon2::hash_elements(&elements)
+}
+
+pub fn uuid_felts(id: Uuid) -> [u64; 4] {
+    let bytes = id.as_bytes();
+    [
+        u64::from(u32::from_be_bytes(bytes[0..4].try_into().unwrap())),
+        u64::from(u32::from_be_bytes(bytes[4..8].try_into().unwrap())),
+        u64::from(u32::from_be_bytes(bytes[8..12].try_into().unwrap())),
+        u64::from(u32::from_be_bytes(bytes[12..16].try_into().unwrap())),
+    ]
+}
+
+pub fn uuid_from_felts(limbs: [u64; 4]) -> Uuid {
+    let mut bytes = [0_u8; 16];
+    for (index, limb) in limbs.into_iter().enumerate() {
+        let limb = u32::try_from(limb)
+            .expect("v2 UUID limbs are always unsigned 32-bit integers")
+            .to_be_bytes();
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&limb);
+    }
+    Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use miden_assembly::Assembler;
+    use miden_core_lib::CoreLibrary;
+    use miden_processor::{
+        DefaultHost, ExecutionOptions, StackInputs, advice::AdviceInputs, execute_sync,
+    };
+
+    use super::*;
+
+    fn golden_intent() -> Intent {
+        Intent {
+            purpose: SWAP_PURPOSE_TAG,
+            domain: INTENT_DOMAIN_TAG,
+            network: TESTNET_NETWORK_TAG,
+            user_suffix: 11,
+            user_prefix: 12,
+            sell_asset_suffix: 21,
+            sell_asset_prefix: 22,
+            sell_amount: 23,
+            buy_asset_suffix: 31,
+            buy_asset_prefix: 32,
+            buy_amount: 33,
+            client_order_id: [0x0011_2233, 0x4455_6677, 0x8899_aabb, 0xccdd_eeff],
+            expires_at: 1_800_000_000,
+        }
+    }
+
+    #[test]
+    fn v2_intent_encoding_and_message_are_golden() {
+        let intent = golden_intent();
+        assert_eq!(
+            intent.canonical_felts(),
+            [
+                6_506_385_721_141_899_776,
+                7_883_954_021_992_852_325,
+                8_387_236_824_952_960_000,
+                11,
+                12,
+                21,
+                22,
+                23,
+                31,
+                32,
+                33,
+                0x0011_2233,
+                0x4455_6677,
+                0x8899_aabb,
+                0xccdd_eeff,
+                1_800_000_000,
+            ]
+        );
+        let message = intent.message_word();
+        let elements = message.as_elements();
+        let actual = [
+            elements[0].as_canonical_u64(),
+            elements[1].as_canonical_u64(),
+            elements[2].as_canonical_u64(),
+            elements[3].as_canonical_u64(),
+        ];
+        assert_eq!(
+            actual,
+            [
+                1_287_624_692_678_322_763,
+                16_579_098_118_194_020_297,
+                3_915_596_742_747_418_088,
+                16_468_033_906_718_177_848,
+            ]
+        );
+    }
+
+    #[test]
+    fn masm_v2_hash_matches_rust_golden() {
+        let operator_source = include_str!("../masm/accounts/operator.masm");
+        assert!(operator_source.contains("loc_storew_le.0 dropw"));
+        assert!(!operator_source.contains("\n    loc_storew_be."));
+
+        let intent = golden_intent();
+        let felts = intent.canonical_felts();
+        let reversed = felts
+            .iter()
+            .rev()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        let source = format!(
+            r#"
+            use miden::core::crypto::hashes::poseidon2
+            use miden::core::sys
+
+            @locals(16)
+            proc hash_intent
+                loc_storew_le.0 dropw
+                loc_storew_le.4 dropw
+                loc_storew_le.8 dropw
+                loc_storew_le.12 dropw
+                push.16 locaddr.0
+                exec.poseidon2::hash_elements
+            end
+
+            begin
+                push.{reversed}
+                exec.hash_intent
+                exec.sys::truncate_stack
+            end
+            "#
+        );
+        let mut assembler = Assembler::default();
+        assembler
+            .link_static_library(CoreLibrary::default().library())
+            .unwrap();
+        let program = assembler.assemble_program(source).unwrap();
+        let output = execute_sync(
+            &program,
+            StackInputs::default(),
+            AdviceInputs::default(),
+            &mut DefaultHost::default(),
+            ExecutionOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(output.stack.get_word(0).unwrap(), intent.message_word());
+    }
+
+    #[test]
+    fn uuid_limb_encoding_is_big_endian_and_lossless() {
+        let id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let limbs = [0x0011_2233, 0x4455_6677, 0x8899_aabb, 0xccdd_eeff];
+        assert_eq!(uuid_felts(id), limbs);
+        assert_eq!(uuid_from_felts(limbs), id);
+    }
+
+    #[test]
+    fn expiry_uses_strict_unix_seconds_ordering_on_and_off_chain() {
+        assert!(!is_expired_at(1_800_000_001, 1_800_000_000));
+        assert!(is_expired_at(1_800_000_000, 1_800_000_000));
+        assert!(is_expired_at(1_799_999_999, 1_800_000_000));
+
+        // Miden block timestamps are Unix seconds. With stack [timestamp, expiry], the swap makes
+        // `lt` evaluate timestamp < expiry; omitting it reverses the comparison.
+        let pool_source = include_str!("../masm/accounts/pool.masm");
+        assert!(pool_source.contains("exec.tx::get_block_timestamp\n    # => [block_timestamp_unix_seconds, expires_at_unix_seconds]\n"));
+        assert!(pool_source.contains("swap lt assert.err=ERR_INTENT_EXPIRED"));
+    }
 }

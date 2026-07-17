@@ -247,6 +247,8 @@ mod tests {
                 created: 1,
                 processing: 1,
                 processed: 0,
+                submitted: 0,
+                confirmed: 0,
                 executed: 1,
                 settled: 0,
                 failed: 0,

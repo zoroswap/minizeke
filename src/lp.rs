@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::{
     asset_utils::word_to_asset,
     deployment::{AssetInfo, Deployment},
-    lp_store::{LpOperationKind as StoredOperationKind, LpPosition, LpStore},
+    lp_store::{LpOperationKind as StoredOperationKind, LpPosition, LpStore, NoteCursor},
     message_broker::message_broker::{
         LpChainEvent, LpOperationKind, MessageBroker, PoolStateEvent,
     },
@@ -187,17 +187,23 @@ impl LpWorker {
     }
 
     async fn initialize_sync_cursor(&self) -> Result<()> {
-        if self.store.sync_cursor()? != 0 {
+        if self.store.sync_cursor()? != NoteCursor::default() {
             return Ok(());
         }
         let notes = self.client.get_input_notes(NoteFilter::Consumed).await?;
         let baseline = notes
             .iter()
-            .filter_map(|note| note.state().consumed_block_height())
-            .map(|block| block.as_u32())
+            .filter_map(|note| {
+                note.state()
+                    .consumed_block_height()
+                    .map(|block| NoteCursor {
+                        block_num: block.as_u32(),
+                        note_id: stable_note_id(note),
+                    })
+            })
             .max()
-            .unwrap_or(0);
-        self.store.set_sync_cursor(baseline)?;
+            .unwrap_or_default();
+        self.store.set_sync_cursor(&baseline)?;
         Ok(())
     }
 
@@ -214,7 +220,6 @@ impl LpWorker {
             tokio::time::interval(Duration::from_secs(checkpoint_secs.max(1)));
         checkpoint_interval.reset();
         let mut pool_rx = self.broker.subscribe_pool_state();
-        let mut applied_rx = self.broker.subscribe_lp_applied();
 
         loop {
             tokio::select! {
@@ -235,27 +240,8 @@ impl LpWorker {
                         }
                     }
                     Err(RecvError::Lagged(skipped)) => {
+                        self.broker.record_lag("pool_state", skipped);
                         warn!(skipped, "LP pool-state subscriber lagged");
-                    }
-                    Err(RecvError::Closed) => break,
-                },
-                event = applied_rx.recv() => match event {
-                    Ok(event) => {
-                        let result = if let Some(reason) = event.error {
-                            self.store.mark_failed(&event.note_id, &reason).map(|_| false)
-                        } else {
-                            self.store.apply_operation(
-                                &event.note_id,
-                                event.lp_shares,
-                                now_millis(),
-                            )
-                        };
-                        if let Err(error) = result {
-                            error!(note_id = %event.note_id, %error, "failed to persist applied LP event");
-                        }
-                    }
-                    Err(RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "LP applied-event subscriber lagged");
                     }
                     Err(RecvError::Closed) => break,
                 },
@@ -266,8 +252,17 @@ impl LpWorker {
     async fn sync_lp_notes(&mut self) -> Result<()> {
         self.client.sync_state().await?;
         let cursor = self.store.sync_cursor()?;
-        let notes = self.client.get_input_notes(NoteFilter::Consumed).await?;
-        let mut max_block = cursor;
+        let mut notes = self.client.get_input_notes(NoteFilter::Consumed).await?;
+        notes.sort_by_key(|note| {
+            (
+                note.state()
+                    .consumed_block_height()
+                    .map(|block| block.as_u32())
+                    .unwrap_or_default(),
+                stable_note_id(note),
+            )
+        });
+        let mut max_cursor = cursor.clone();
         for note in notes {
             let Some(block_num) = note
                 .state()
@@ -276,10 +271,15 @@ impl LpWorker {
             else {
                 continue;
             };
-            if block_num < cursor {
+            let note_id = stable_note_id(&note);
+            let note_cursor = NoteCursor {
+                block_num,
+                note_id: note_id.clone(),
+            };
+            if note_cursor <= cursor {
                 continue;
             }
-            max_block = max_block.max(block_num);
+            max_cursor = max_cursor.max(note_cursor);
             if note.details().script().root() != self.deposit_root
                 && note.details().script().root() != self.withdraw_root
             {
@@ -297,10 +297,6 @@ impl LpWorker {
                 continue;
             }
             let lp_id = AccountId::try_from_elements(storage[8], storage[9])?;
-            let note_id = note
-                .id()
-                .map(|id| id.to_hex())
-                .unwrap_or_else(|| note.details_commitment().to_hex());
             let nullifier = note.nullifier().map(|value| value.to_hex());
             let created_at = note.created_at().unwrap_or_else(now_millis);
 
@@ -345,35 +341,25 @@ impl LpWorker {
                     &note_id,
                     &format!("deposit below minimum {}", self.minimum_deposit),
                 )?;
+                continue;
+            }
+            if inserted {
+                let shares_hint = if kind == LpOperationKind::Withdraw {
+                    self.withdrawal_shares_hint(lp_id, asset.faucet_id(), asset.amount().as_u64())?
+                } else {
+                    None
+                };
+                self.broker.broadcast_lp_chain(LpChainEvent {
+                    note_id,
+                    kind,
+                    lp_id,
+                    faucet_id: asset.faucet_id(),
+                    asset_amount: asset.amount().as_u64(),
+                    shares_hint,
+                })?;
             }
         }
-        self.store.set_sync_cursor(max_block)?;
-        self.replay_confirmed()
-    }
-
-    fn replay_confirmed(&self) -> Result<()> {
-        for operation in self.store.confirmed_operations()? {
-            let lp_id = AccountId::from_hex(&operation.lp_id)?;
-            let faucet_id = AccountId::from_hex(&operation.faucet_id)?;
-            let kind = if operation.kind == "deposit" {
-                LpOperationKind::Deposit
-            } else {
-                LpOperationKind::Withdraw
-            };
-            let shares_hint = if kind == LpOperationKind::Withdraw {
-                self.withdrawal_shares_hint(lp_id, faucet_id, operation.asset_amount)?
-            } else {
-                None
-            };
-            self.broker.broadcast_lp_chain(LpChainEvent {
-                note_id: operation.note_id,
-                kind,
-                lp_id,
-                faucet_id,
-                asset_amount: operation.asset_amount,
-                shares_hint,
-            })?;
-        }
+        self.store.set_sync_cursor(&max_cursor)?;
         Ok(())
     }
 
@@ -487,6 +473,12 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
 
 fn now_millis() -> u64 {
     Utc::now().timestamp_millis() as u64
+}
+
+fn stable_note_id(note: &miden_client::store::InputNoteRecord) -> String {
+    note.id()
+        .map(|id| id.to_hex())
+        .unwrap_or_else(|| note.details_commitment().to_hex())
 }
 
 fn checkpoint_share_burn(position: &LpPosition, amount: u64) -> Result<u64> {

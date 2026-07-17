@@ -76,9 +76,9 @@ The pool component defines 253 slots. `AuthSingleSig` adds two more, so the acco
 
 ### Generic cells
 
-There are 248 value slots:
+There are 247 value slots:
 
-`zoropool::cell_0` through `zoropool::cell_247`
+`zoropool::cell_0` through `zoropool::cell_246`
 
 Each starts as `[0, 0, 0, 0]` and later stores:
 
@@ -87,7 +87,7 @@ Each starts as `[0, 0, 0, 0]` and later stores:
 ### Metadata slots
 
 - `zoropool::cell_slot_ids`
-  - key: `[index, 0, 0, 0]`, where `0 <= index < 248`
+  - key: `[index, 0, 0, 0]`, where `0 <= index < 247`
   - value: slot ID word for `zoropool::cell_<index>`
   - fully populated at deployment
 - `zoropool::cell_index`
@@ -101,12 +101,14 @@ Each starts as `[0, 0, 0, 0]` and later stores:
   - value: `[vault_suffix, vault_prefix, 0, 0]`
 - `zoropool::user_trading_details_proc_root`
   - value: MAST root of `vault::get_user_trading_details`
+- `zoropool::consumed_orders`
+  - authenticated map from the four-limb client UUID to `[1, 0, 0, 0]`
 
-Allocation uses `cell_slot_ids[next_index]`, writes `cell_index[asset-user key]`, then increments `next_cell`. It requires `next_index < 248`.
+Allocation uses `cell_slot_ids[next_index]`, writes `cell_index[asset-user key]`, then increments `next_cell`. It requires `next_index < 247`.
 
 The slot count is:
 
-`248 cells + 5 pool metadata + 2 AuthSingleSig = 255`
+`247 cells + 6 pool metadata + 2 AuthSingleSig = 255`
 
 A new swap can allocate its sell cell, buy cell, or both. The two asset-user keys are in the same shard.
 
@@ -205,9 +207,12 @@ journal and Processing deduplicate it before changing shares or curve state.
 
 `execution.<network>.sqlite3` contains:
 
-- `swap_accounting`: proposed/executed/failed swaps, oracle marks, quoted and credited output,
+- `swap_accounting`: proposed/submitted/confirmed/failed swaps, oracle marks, quoted and credited output,
   retained surplus, fee version, and exact LP/backstop/protocol/volatility components.
 - `pool_snapshots`: the latest finalized curve state per faucet, restored after restart.
+- `execution_submissions`: node-accepted transaction IDs, shard/order membership,
+  submission/expiration heights, expected initial/final account commitments, serialized Miden
+  local-store updates, retry metadata, and submitted/confirmed/failed state.
 
 `fees.<network>.sqlite3` contains versioned fee batches and their per-asset expansion. An
 automatic or manual batch is atomic and idempotent by `batch_id`. The public fee precision is
@@ -244,22 +249,30 @@ share amount, the configured minimum deposit, and `pricing: \"execution_time\"`.
 
 ## Signed intent
 
-The canonical intent is exactly eight felts:
+Intent v1 is rejected. The canonical testnet intent v2 is exactly sixteen felts:
 
-1. `user_suffix`
-2. `user_prefix`
-3. `sell_asset_suffix`
-4. `sell_asset_prefix`
-5. `sell_amount`
-6. `buy_asset_suffix`
-7. `buy_asset_prefix`
-8. `buy_amount`
+1. `purpose = u64::from_be_bytes("ZKSWPV2\0")`
+2. `domain = u64::from_be_bytes("minizeke")`
+3. `network = u64::from_be_bytes("testnet\0")`
+4. `user_suffix`
+5. `user_prefix`
+6. `sell_asset_suffix`
+7. `sell_asset_prefix`
+8. `sell_amount`
+9. `buy_asset_suffix`
+10. `buy_asset_prefix`
+11. `buy_amount`
+12-15. the signed client UUID as four big-endian `u32` limbs
+16. `expires_at`, Unix seconds
 
-Rust hashes these felts with `Poseidon2::hash_elements`. MASM absorbs the eight felts as one full sponge rate, sets the capacity initializer to `8 % 8 = 0`, runs one `hperm`, and uses the first rate word as the message.
+Rust and MASM hash the same sixteen felts with `Poseidon2::hash_elements`. The API verifies
+the signature before atomically reserving the client UUID in `execution.<network>.sqlite3`.
+An identical retry returns the original server lifecycle ID; rebinding the UUID returns HTTP
+409. Processing checks expiry again before quoting.
 
 The pool verifier receives:
 
-`[m0, m1, m2, m3, m4, m5, m6, m7, PK_COMM]`
+`[m0, ..., m15, PK_COMM]`
 
 Its advice data for each order is:
 
@@ -267,9 +280,11 @@ Its advice data for each order is:
 
 The transaction script pushes:
 
-`[user_suffix, user_prefix, sell_asset_suffix, sell_asset_prefix, sell_amount, buy_asset_suffix, buy_asset_prefix, buy_amount, pad(8)]`
+`[purpose, domain, network, user_suffix, user_prefix, sell_asset_suffix, sell_asset_prefix, sell_amount, buy_asset_suffix, buy_asset_prefix, buy_amount, uuid0, uuid1, uuid2, uuid3, expires_at]`
 
-and calls `pool::execute_swap`.
+and calls `pool::execute_swap`. The pool asserts the fixed purpose/domain/network, checks the
+chain timestamp, and rejects a UUID already present in its authenticated
+`zoropool::consumed_orders` map. The UUID is consumed atomically with the balance-counter writes.
 
 ## FPI interfaces
 
@@ -308,7 +323,7 @@ The pool computes:
 - `balance = total_funding + bought - sold - total_redeemed`
 - `available_balance = balance - pending_redeem`
 
-## Deployment schema v2
+## Deployment schema v3
 
 Deploy-time assets come from `assets.toml`:
 
@@ -326,7 +341,7 @@ pool. `oracle_feed_id` is resolved from the oracle catalog; it is not copied int
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "network": "testnet",
   "operator_account_id": "0x...",
   "vault_id": "0x...",
@@ -352,7 +367,7 @@ pool. `oracle_feed_id` is resolved from the oracle catalog; it is not copied int
 ```
 
 - Account IDs serialize as hex strings.
-- `schema_version` must equal `2`.
+- `schema_version` must equal `3`.
 - `network` must equal the active network name.
 - `assets` must contain at least two entries.
 - `pools` must contain at least one account ID.

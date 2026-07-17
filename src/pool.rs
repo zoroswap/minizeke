@@ -32,9 +32,9 @@ use crate::{
 
 /// Maximum number of lazily allocated `(asset, user)` accounting cells.
 ///
-/// The pool component uses five additional slots, `AuthSingleSig` uses two, and
-/// `BasicWallet` uses none: `248 + 5 + 2 = 255`, the account storage limit.
-pub const MAX_POOL_CELLS: usize = 248;
+/// The pool component uses six additional slots (including the consumed-intent map),
+/// `AuthSingleSig` uses two, and `BasicWallet` uses none: `247 + 6 + 2 = 255`.
+pub const MAX_POOL_CELLS: usize = 247;
 
 /// Amount of each asset a user funds into the vault before trading (service flow).
 pub const USER_INITIAL_ON_CHAIN_BALANCE: u64 = 1_000;
@@ -44,8 +44,10 @@ pub const CELL_INDEX_SLOT: &str = "zoropool::cell_index";
 pub const NEXT_CELL_SLOT: &str = "zoropool::next_cell";
 pub const VAULT_ACCOUNT_ID_SLOT: &str = "zoropool::vault_account_id";
 pub const USER_TRADING_DETAILS_PROC_ROOT_SLOT: &str = "zoropool::user_trading_details_proc_root";
+pub const CONSUMED_ORDERS_SLOT: &str = "zoropool::consumed_orders";
 
 static FETCH_RPC: OnceLock<Arc<GrpcClient>> = OnceLock::new();
+static FETCH_RPC_LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 fn get_fetch_rpc() -> &'static Arc<GrpcClient> {
     FETCH_RPC.get_or_init(|| {
@@ -55,6 +57,16 @@ fn get_fetch_rpc() -> &'static Arc<GrpcClient> {
 }
 
 pub async fn fetch_account_storage_from_rpc(account_id: AccountId) -> Result<AccountStorage> {
+    let concurrency = std::env::var("MIDEN_RPC_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8_usize)
+        .max(1);
+    let _permit = FETCH_RPC_LIMIT
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(concurrency)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("Miden RPC concurrency is saturated; retry later"))?;
     let account = get_fetch_rpc()
         .get_account_details(account_id)
         .await
@@ -584,7 +596,7 @@ pub fn build_pool_component(cb: CodeBuilder, vault_id: AccountId) -> Result<Acco
 
     let zero_word = Word::new([Felt::ZERO; 4]);
 
-    let mut slots: Vec<StorageSlot> = Vec::with_capacity(MAX_POOL_CELLS + 5);
+    let mut slots: Vec<StorageSlot> = Vec::with_capacity(MAX_POOL_CELLS + 6);
 
     // Generic cells are assigned lazily to full (asset, user) keys.
     for i in 0..MAX_POOL_CELLS {
@@ -615,6 +627,11 @@ pub fn build_pool_component(cb: CodeBuilder, vault_id: AccountId) -> Result<Acco
 
     slots.push(StorageSlot::with_map(
         storage_slot_name(CELL_INDEX_SLOT),
+        StorageMap::new(),
+    ));
+
+    slots.push(StorageSlot::with_map(
+        storage_slot_name(CONSUMED_ORDERS_SLOT),
         StorageMap::new(),
     ));
 
@@ -660,7 +677,13 @@ mod tests {
     fn test_build_components_and_roots() -> Result<()> {
         let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
         let cb = CodeBuilder::new();
-        build_pool_component(cb.clone(), vault_id)?;
+        let pool = build_pool_component(cb.clone(), vault_id)?;
+        assert_eq!(pool.storage_size(), 253);
+        assert!(
+            pool.storage_slots()
+                .iter()
+                .any(|slot| slot.name().id() == storage_slot_name(CONSUMED_ORDERS_SLOT).id())
+        );
         crate::vault::build_vault_component(cb.clone(), vault_id)?;
 
         let vault_root = vault_trading_details_proc_root(cb.clone())?;

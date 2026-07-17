@@ -27,6 +27,10 @@ async fn main() -> Result<()> {
 
     let bind_address =
         env::var("FAUCET_SERVER_URL").unwrap_or_else(|_| DEFAULT_FAUCET_SERVER_URL.to_string());
+    let socket_address: std::net::SocketAddr = bind_address.parse()?;
+    if !socket_address.ip().is_loopback() {
+        anyhow::bail!("FAUCET_SERVER_URL must bind to a loopback address");
+    }
     let state = initialize().await?;
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     info!(address = %bind_address, "Faucet server listening");

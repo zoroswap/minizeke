@@ -12,7 +12,7 @@ The vault accepts only the eight note scripts in `masm/notes/`. It does not use 
 
 ### Pool shards
 
-Each pool shard is a public account controlled by an ECDSA single-signature key held by the server. A shard stores `bought` and `sold` counters for each allocated `(asset, user)` pair. It does not hold trading custody or curve state.
+Each pool shard is a public account controlled by an ECDSA single-signature key held by the server. A shard stores `bought` and `sold` counters for each allocated `(asset, user)` pair plus an authenticated map of consumed client order UUIDs. It does not hold trading custody or curve state.
 
 A swap runs with the shard as the native account. The transaction calls the vault as a foreign account to read fresh funding, redeem, pending-redeem, and public-key values. Both the sell and buy counters are changed in the same native account transaction.
 
@@ -29,7 +29,15 @@ The operator cannot lower an entitlement. User and LP payout limits are enforced
 
 Each listed asset has a public fungible faucet account. `faucet_server` owns an independent Miden client and SQLite store. It shares the deployment keystore so it can sign faucet transactions.
 
-The main server only proxies `POST /mint`. The faucet process limits requests by `(recipient, faucet)` in memory. The default amount is `10000000`; the default cooldown is 240 seconds.
+Public `POST /mint` is disabled by default. If explicitly enabled, the main server
+proxies only to a loopback faucet and authenticates with a scoped primary/next service
+credential; direct unauthenticated mint calls are rejected. The faucet process limits
+accepted requests by `(recipient, faucet)` in memory. The default amount is `10000000`;
+the default cooldown is 240 seconds.
+
+Automatic fee updates and manual fee administration use separate primary/next
+credentials on a second loopback-only listener. The public listener does not install
+those routes.
 
 ### Oracle
 
@@ -41,12 +49,12 @@ The resolved feed IDs are stored in deployment JSON. Server startup checks that 
 
 A Miden account can use at most 255 storage slots. One pool shard uses:
 
-- 248 generic asset-user cell slots.
-- Five pool metadata slots.
+- 247 generic asset-user cell slots.
+- Six pool metadata slots, including the consumed-order map.
 - Two `AuthSingleSig` slots.
 - No `BasicWallet` storage slots.
 
-This is exactly `248 + 5 + 2 = 255`.
+This is exactly `247 + 6 + 2 = 255`.
 
 One swap must update both the sell and buy legs in one native account. A user is therefore assigned to one shard, and all asset cells for that user are allocated there. Splitting the two legs across accounts would lose the single native-account transaction boundary.
 
@@ -78,13 +86,14 @@ Available balance subtracts pending redeems:
 
 ### Swap
 
-1. The client submits an order, serialized public key, and signature.
-2. The server quotes against in-memory curve state and current oracle prices.
-3. The server checks a lazy local balance mirror. This is only a pre-flight check.
-4. The execution worker resolves the user's shard from public vault storage.
-5. The shard transaction fetches fresh vault values by FPI.
-6. The pool verifies the canonical eight-felt intent and checks the sell balance.
-7. The pool increments `sold` for the sell asset and `bought` for the buy asset.
+1. The client submits a v2 order with a signed client UUID and expiry, serialized public key, and signature.
+2. The API verifies the purpose/domain/network/user/assets/amounts/UUID/expiry signature and durably reserves the client UUID before publishing a separate server lifecycle ID. Identical retries return that ID; conflicting reuse returns 409.
+3. The server quotes against in-memory curve state and current oracle prices after rechecking expiry.
+4. The server checks a lazy local balance mirror. This is only a pre-flight check.
+5. The execution worker resolves the user's shard from public vault storage.
+6. The shard transaction fetches fresh vault values by FPI.
+7. The pool verifies the canonical sixteen-felt intent, chain-time expiry, and unused UUID, then checks the sell balance.
+8. The pool increments `sold` and `bought` and consumes the UUID atomically.
 
 The on-chain FPI check and signature check are authoritative. The server quote determines `buy_amount`; the signed intent binds that amount.
 
@@ -144,10 +153,22 @@ The execution worker groups accepted orders by assigned shard. It submits shard 
 
 A failed placement lookup fails only that order. A failed shard transaction marks every order in that shard failed. Earlier shard transactions stay submitted, and later shard groups are still attempted. There is no cross-shard atomic transaction.
 
-Accepted swaps are journaled as proposed. `Executed` finalizes their accounting, while a failed
-shard reverses the recorded balance and curve deltas. Once the logical batch resolves, finalized
-pool snapshots are committed to `execution.<network>.sqlite3`; restart overlays these snapshots
-on the liquidity-derived baseline.
+Accepted swaps are journaled as proposed and become `Submitted` only after the node accepts the
+transaction and its transaction ID, submission/expiration heights, expected pool-account
+commitments, and serialized local-store update have been persisted. A submitted transaction is
+`Confirmed` only after `miden-client` synchronization reports that exact transaction record as
+`Committed` and its account ID plus initial/final account commitments match the persisted
+submission. This is chain-observed inclusion according to the Miden 0.15 client API, not a claim
+of a separate confirmation depth or stronger probabilistic finality.
+
+Local-store apply is retried from the durable serialized update before each sync. A client-reported
+discard is terminal. A transaction that remains pending past its expiration-height grace, the
+configured wall-clock timeout, or the configured retry limit is terminally failed. Until
+`Confirmed`, order states are owner-private and no public trade, trade candle, trading statistic,
+trade WebSocket event, analytics swap, or finalized pool snapshot is produced. Failed shards
+reverse their recorded balance and curve deltas. Once the logical batch resolves, finalized pool
+snapshots are committed to `execution.<network>.sqlite3`; restart overlays these snapshots on the
+liquidity-derived baseline.
 
 ## Oracle delivery and volatility fees
 
@@ -190,8 +211,8 @@ Users can query `GET /users/{id}/placement`, then verify the returned vault assi
 
 ## Capacity and compatibility
 
-Each new `(asset, user)` pair touched by a swap consumes one of 248 cells. A swap can allocate two cells. Reusing an existing pair consumes no new cell. At capacity, allocation raises `POOL: maximum asset-user cells reached`, which fails the whole shard transaction.
+Each new `(asset, user)` pair touched by a swap consumes one of 247 cells. A swap can allocate two cells. Reusing an existing pair consumes no new cell. At capacity, allocation raises `POOL: maximum asset-user cells reached`, which fails the whole shard transaction.
 
 Capacity does not trigger automatic shard creation or user migration. Operators must add a shard before assigning more users, based on expected asset use.
 
-Pool and vault FPI procedure roots are stored when accounts are built. Allowed vault note roots are also fixed at deployment. Changes to account MASM or note scripts are incompatible with already deployed accounts. Create a fresh deployment after such changes. A schema-v2 JSON file alone does not upgrade on-chain code.
+Pool and vault FPI procedure roots are stored when accounts are built. Allowed vault note roots are also fixed at deployment. Changes to account MASM or note scripts are incompatible with already deployed accounts. Create a fresh deployment after such changes. A schema-v3 JSON file alone does not upgrade on-chain code.

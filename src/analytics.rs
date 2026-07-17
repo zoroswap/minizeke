@@ -9,7 +9,7 @@ use miden_core::Word;
 use tracing::{error, info, warn};
 
 use crate::{
-    analytics_store::{AnalyticsStore, CashFlow, CashFlowKind},
+    analytics_store::{AnalyticsStore, CashFlow, CashFlowKind, NoteCursor},
     asset_utils::word_to_asset,
     deployment::Deployment,
     note::{NoteKind, ZekeNote},
@@ -100,21 +100,50 @@ impl AnalyticsWorker {
     }
 
     async fn sync_notes(&mut self) -> Result<()> {
+        const SOURCE: &str = "vault_cash_flows";
         self.client.sync_state().await?;
-        for note in self.client.get_input_notes(NoteFilter::Consumed).await? {
+        let cursor = self.store.note_cursor(SOURCE)?;
+        let mut notes = self.client.get_input_notes(NoteFilter::Consumed).await?;
+        notes.sort_by_key(|note| {
+            (
+                note.state()
+                    .consumed_block_height()
+                    .map(|block| block.as_u32())
+                    .unwrap_or_default(),
+                stable_note_id(note),
+            )
+        });
+        for note in notes {
+            let Some(block_num) = note
+                .state()
+                .consumed_block_height()
+                .map(|block| block.as_u32())
+            else {
+                continue;
+            };
+            let note_cursor = NoteCursor {
+                block_num,
+                note_id: stable_note_id(&note),
+            };
+            if note_cursor <= cursor {
+                continue;
+            }
             if note
                 .consumer_account()
                 .is_some_and(|account| account != self.vault_id)
             {
+                self.store.set_note_cursor(SOURCE, &note_cursor)?;
                 continue;
             }
             let root = note.details().script().root();
             if root != self.fund_root && root != self.init_redeem_root && root != self.redeem_root {
+                self.store.set_note_cursor(SOURCE, &note_cursor)?;
                 continue;
             }
             let storage = note.details().storage().items();
             if storage.len() < 12 {
                 warn!("ignoring malformed user cash-flow note");
+                self.store.set_note_cursor(SOURCE, &note_cursor)?;
                 continue;
             }
             let (kind, user_id, asset) = if root == self.fund_root {
@@ -143,29 +172,33 @@ impl AnalyticsWorker {
                 (kind, user_id, asset)
             };
             if !self.supported_assets.contains(&asset.faucet_id()) {
+                self.store.set_note_cursor(SOURCE, &note_cursor)?;
                 continue;
             }
             if !self.store.has_mark(&asset.faucet_id().to_hex())? {
-                // Keep the note unjournaled so the next scan can price it once the oracle
-                // listener has supplied a mark.
-                continue;
+                // Do not advance beyond an unpriced cash flow. Tuple ordering makes this
+                // retry bounded to the unprocessed suffix instead of replaying all history.
+                return Ok(());
             }
-            let event_id = note
-                .id()
-                .map(|id| id.to_hex())
-                .unwrap_or_else(|| note.details_commitment().to_hex());
             let event_time = note
                 .created_at()
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
             self.store.record_cash_flow(&CashFlow {
-                event_id: format!("vault:{event_id}"),
+                event_id: format!("vault:{}", note_cursor.note_id),
                 kind,
                 user_id: user_id.to_hex(),
                 asset_id: asset.faucet_id().to_hex(),
                 amount: asset.amount().as_u64(),
                 event_time,
             })?;
+            self.store.set_note_cursor(SOURCE, &note_cursor)?;
         }
         Ok(())
     }
+}
+
+fn stable_note_id(note: &miden_client::store::InputNoteRecord) -> String {
+    note.id()
+        .map(|id| id.to_hex())
+        .unwrap_or_else(|| note.details_commitment().to_hex())
 }
