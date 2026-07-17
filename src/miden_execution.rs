@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use miden_client::{
-    Client, account::AccountId, asset::FungibleAsset, keystore::FilesystemKeyStore,
+    Client, account::AccountId, keystore::FilesystemKeyStore,
     transaction::TransactionRequestBuilder,
 };
 use miden_core::{Felt, Word};
@@ -21,30 +21,17 @@ use crate::{
     deployment::{AssetInfo, Deployment},
     execution_script::make_exec_script,
     intent::Intent,
-    message_broker::message_broker::{AmmEvent, MessageBroker, PoolStateEvent},
+    lp_store::LpStore,
+    message_broker::message_broker::{AmmEvent, MessageBroker},
     miden_env::MidenNetwork,
     oracle_sse::{fetch_price_feeds, oracle_base_url, validate_asset_feeds},
     order::{Order, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{
-        LpLedger, PoolBalances, PoolMetadata, PoolSettings, PoolState,
-        fetch_account_storage_from_rpc,
-    },
-    test_utils::{
-        consume_all_notes_for, deposit_liquidity_on_vault, get_client, get_pool_client,
-        vault_foreign_account, withdraw_liquidity_from_vault,
-    },
-    vault::{
-        checkpoint_lp_entitlement_on_vault, get_vault_lp_info, user_pool_from_storage,
-        vault_user_registration,
-    },
+    pool::{PoolBalances, PoolMetadata, PoolSettings, PoolState, fetch_account_storage_from_rpc},
+    test_utils::{get_pool_client, vault_foreign_account},
+    vault::{user_pool_from_storage, vault_user_registration},
 };
 
-/// How often the operator checkpoints LP entitlements on the vault (fees accrued since the
-/// last checkpoint become self-custodially withdrawable).
-const DEFAULT_LP_CHECKPOINT_INTERVAL_SECS: u64 = 600;
-
 pub struct MidenExecution {
-    client: Client<FilesystemKeyStore>,
     /// Separate client (own store) for pool-native swap txs. The vault must stay
     /// untracked here: for tracked foreign accounts the client fetches the vault with
     /// `VaultFetch::IfChangedFrom`, the node then omits the asset list and the
@@ -57,14 +44,10 @@ pub struct MidenExecution {
     assets: Vec<AssetInfo>,
     pools: Vec<AccountId>,
     vault_id: AccountId,
-    operator_id: AccountId,
     orders: Orders,
     /// Vault-assigned pool shard per trader, filled lazily from vault storage.
     user_pools: HashMap<AccountId, AccountId>,
     pool_states: HashMap<AccountId, PoolState>,
-    /// Per-depositor LP shares, server-side only. On-chain the vault keeps entitlement /
-    /// withdrawn counters per (asset, lp) so withdrawals stay self-custodial.
-    lp_ledger: LpLedger,
 }
 
 impl MidenExecution {
@@ -100,7 +83,6 @@ impl MidenExecution {
         // `spawn` / `deposit_pools` binaries. `Deployment::load` errors with a pointer to
         // `cargo run --bin spawn` when the file is missing.
         let deployment = Deployment::load()?;
-        let operator_id = deployment.operator_account_id;
         let vault_id = deployment.vault_id;
         let assets = deployment.assets.clone();
         let pools = deployment.pools.clone();
@@ -114,28 +96,16 @@ impl MidenExecution {
             "Loaded deployment config"
         );
 
-        let mut client = get_client().await?;
-        client.ensure_genesis_in_place().await?;
-        client.sync_state().await?;
-
         let mut pool_client = get_pool_client().await?;
         pool_client.ensure_genesis_in_place().await?;
         pool_client.sync_state().await?;
 
         println!("Clients ready.");
 
-        // Attach idempotently: `import_account_by_id` fetches the public account from the
-        // network and overwrites any already-tracked copy. The vault must stay untracked
-        // in the pool client (see the `pool_client` field docs).
-        client.import_account_by_id(operator_id).await?;
-        client.import_account_by_id(vault_id).await?;
-        for asset in &assets {
-            client.import_account_by_id(asset.faucet_id).await?;
-        }
+        // The vault must stay untracked in the pool client (see the `pool_client` field docs).
         for pool_id in &pools {
             pool_client.import_account_by_id(*pool_id).await?;
         }
-        client.sync_state().await?;
         pool_client.sync_state().await?;
         println!(
             "Attached to vault {} and {} pool shards.",
@@ -162,8 +132,6 @@ impl MidenExecution {
                 ),
             );
         }
-        let mut lp_ledger = LpLedger::default();
-
         for record in &deployment.deposits {
             let pool = pool_states.get_mut(&record.faucet_id).ok_or_else(|| {
                 anyhow!(
@@ -171,11 +139,27 @@ impl MidenExecution {
                     record.faucet_id.to_hex()
                 )
             })?;
-            let (lp_amount, new_supply, new_balances) =
+            let (_, new_supply, new_balances) =
                 pool.get_deposit_lp_amount_out(U256::from(record.amount))?;
             pool.update_state(new_balances, new_supply);
-            if let Some(lp_id) = deployment.lp_account_id {
-                lp_ledger.mint(record.faucet_id, lp_id, lp_amount.saturating_to::<u64>());
+        }
+        let lp_store = LpStore::open_from_env()?;
+        for operation in lp_store.applied_operations()? {
+            let faucet_id = AccountId::from_hex(&operation.faucet_id)?;
+            let pool = pool_states.get_mut(&faucet_id).ok_or_else(|| {
+                anyhow!(
+                    "LP journal references unknown faucet {}",
+                    operation.faucet_id
+                )
+            })?;
+            if operation.kind == "deposit" {
+                let (_, supply, balances) =
+                    pool.get_deposit_lp_amount_out(U256::from(operation.asset_amount))?;
+                pool.update_state(balances, supply);
+            } else {
+                let (_, supply, balances) =
+                    pool.get_withdraw_asset_amount_out(U256::from(operation.lp_shares))?;
+                pool.update_state(balances, supply);
             }
         }
         info!(
@@ -187,8 +171,6 @@ impl MidenExecution {
             cycle: 0,
             pools,
             vault_id,
-            operator_id,
-            client,
             pool_client,
             message_broker,
             prover_timeout,
@@ -196,7 +178,6 @@ impl MidenExecution {
             user_pools: HashMap::new(),
             orders: Orders::default(),
             pool_states,
-            lp_ledger,
         })
     }
 
@@ -226,22 +207,8 @@ impl MidenExecution {
         let mut pool_state_rx = self.message_broker.subscribe_pool_state();
         let mut processed_batch_rx = self.message_broker.subscribe_processed_batch();
 
-        let checkpoint_interval_secs = env::var("LP_CHECKPOINT_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_LP_CHECKPOINT_INTERVAL_SECS);
-        let mut checkpoint_interval =
-            tokio::time::interval(Duration::from_secs(checkpoint_interval_secs));
-        // don't fire immediately on startup
-        checkpoint_interval.reset();
-
         loop {
             tokio::select! {
-                _ = checkpoint_interval.tick() => {
-                    if let Err(e) = self.checkpoint_lp_entitlements().await {
-                        error!("LP entitlement checkpoint failed: {e:?}");
-                    }
-                }
                 orders = orders_rx.recv() => {
                     match orders {
                         Ok(ev) => self.orders.apply_order_update(ev),
@@ -449,161 +416,6 @@ impl MidenExecution {
             "Shard batch executed"
         );
         Ok(())
-    }
-
-    /// Deposits `asset` from `lp_id` into the vault (DEPOSIT note: the vault takes custody
-    /// and credits the LP's on-chain entitlement with the principal), then mints LP shares
-    /// into the server-side ledger and applies the curve's deposit math to the pool state.
-    ///
-    /// Returns the amount of LP shares minted.
-    pub async fn deposit_liquidity(
-        &mut self,
-        lp_id: AccountId,
-        asset: FungibleAsset,
-    ) -> Result<u64> {
-        let faucet_id = asset.faucet_id();
-        let pool = self
-            .pool_states
-            .get(&faucet_id)
-            .ok_or_else(|| anyhow!("no pool for asset {}", faucet_id.to_hex()))?;
-
-        let (lp_amount, new_lp_total_supply, new_balances) =
-            pool.get_deposit_lp_amount_out(U256::from(asset.amount().as_u64()))?;
-        let lp_amount = lp_amount.saturating_to::<u64>();
-
-        // on-chain leg first: only account for the deposit once custody has moved
-        deposit_liquidity_on_vault(&mut self.client, self.vault_id, lp_id, asset).await?;
-
-        if let Some(pool) = self.pool_states.get_mut(&faucet_id) {
-            pool.update_state(new_balances, new_lp_total_supply);
-        }
-        self.lp_ledger.mint(faucet_id, lp_id, lp_amount);
-        self.broadcast_pool_states()?;
-
-        info!(
-            lp = %lp_id.to_hex(),
-            asset = %faucet_id.to_hex(),
-            amount = asset.amount().as_u64(),
-            lp_shares = lp_amount,
-            "Liquidity deposited"
-        );
-        Ok(lp_amount)
-    }
-
-    /// Redeems `lp_shares` of `lp_id`'s position in the `faucet_id` pool: burns the shares
-    /// server-side, makes sure the on-chain entitlement covers the payout (checkpointing it
-    /// if fees have accrued past the principal), then runs the self-custodial WITHDRAW note
-    /// and consumes the P2ID payout as the LP.
-    ///
-    /// Returns the paid-out asset amount.
-    pub async fn withdraw_liquidity(
-        &mut self,
-        lp_id: AccountId,
-        faucet_id: AccountId,
-        lp_shares: u64,
-    ) -> Result<u64> {
-        let pool = self
-            .pool_states
-            .get(&faucet_id)
-            .ok_or_else(|| anyhow!("no pool for asset {}", faucet_id.to_hex()))?;
-
-        let (payout, new_lp_total_supply, new_balances) =
-            pool.get_withdraw_asset_amount_out(U256::from(lp_shares))?;
-        let payout = payout.saturating_to::<u64>();
-
-        // validates the LP owns enough shares
-        self.lp_ledger.burn(faucet_id, lp_id, lp_shares)?;
-
-        // if accrued fees pushed the position's value past the checkpointed entitlement,
-        // raise it so the vault accepts the withdrawal
-        let lp_info = get_vault_lp_info(&self.client, self.vault_id, faucet_id, lp_id).await?;
-        if lp_info.withdrawable() < payout {
-            checkpoint_lp_entitlement_on_vault(
-                &mut self.client,
-                self.operator_id,
-                self.vault_id,
-                faucet_id,
-                lp_id,
-                lp_info.withdrawn + payout,
-            )
-            .await?;
-        }
-
-        let payout_asset = FungibleAsset::new(faucet_id, payout)
-            .map_err(|e| anyhow!("invalid payout asset: {e:?}"))?;
-        withdraw_liquidity_from_vault(&mut self.client, self.vault_id, lp_id, payout_asset).await?;
-        // consume the P2ID payout as the LP
-        consume_all_notes_for(&mut self.client, lp_id).await?;
-
-        if let Some(pool) = self.pool_states.get_mut(&faucet_id) {
-            pool.update_state(new_balances, new_lp_total_supply);
-        }
-        self.broadcast_pool_states()?;
-
-        info!(
-            lp = %lp_id.to_hex(),
-            asset = %faucet_id.to_hex(),
-            lp_shares,
-            payout,
-            "Liquidity withdrawn"
-        );
-        Ok(payout)
-    }
-
-    /// Periodic operator maintenance: for every LP position, raises the vault's entitlement
-    /// counter to `withdrawn + current value of the LP's shares` so accrued fees become
-    /// self-custodially withdrawable even if the operator later disappears.
-    pub async fn checkpoint_lp_entitlements(&mut self) -> Result<()> {
-        for faucet_id in self.assets.iter().map(|asset| asset.faucet_id) {
-            let Some(pool) = self.pool_states.get(&faucet_id) else {
-                continue;
-            };
-            let pool = *pool;
-
-            for (lp_id, shares) in self.lp_ledger.depositors(faucet_id) {
-                if shares == 0 {
-                    continue;
-                }
-                // quote (not apply): value of the shares at the current pool state
-                let (value, _, _) = pool.get_withdraw_asset_amount_out(U256::from(shares))?;
-                let value = value.saturating_to::<u64>();
-
-                let lp_info =
-                    get_vault_lp_info(&self.client, self.vault_id, faucet_id, lp_id).await?;
-                let target = lp_info.withdrawn.saturating_add(value);
-                if target <= lp_info.entitlement {
-                    continue; // entitlement only ever goes up
-                }
-                checkpoint_lp_entitlement_on_vault(
-                    &mut self.client,
-                    self.operator_id,
-                    self.vault_id,
-                    faucet_id,
-                    lp_id,
-                    target,
-                )
-                .await?;
-                info!(
-                    lp = %lp_id.to_hex(),
-                    asset = %faucet_id.to_hex(),
-                    entitlement = target,
-                    "LP entitlement checkpointed"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn broadcast_pool_states(&self) -> Result<()> {
-        self.message_broker.broadcast_pool_state(PoolStateEvent {
-            pool_states: self.pool_states.clone(),
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
-        })?;
-        Ok(())
-    }
-
-    pub fn lp_ledger(&self) -> &LpLedger {
-        &self.lp_ledger
     }
 
     pub fn pool_id(&self) -> AccountId {

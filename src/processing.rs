@@ -1,12 +1,16 @@
 use crate::{
     curve::get_curve_amount_out,
     deployment::AssetInfo,
+    lp_store::LpStore,
     message_broker::message_broker::{
-        AmmEvent, MessageBroker, MessageBrokerEvent, PoolStateEvent, UserEvent,
+        AmmEvent, LpAppliedEvent, LpChainEvent, LpOperationKind, MessageBroker, MessageBrokerEvent,
+        PoolStateEvent, UserEvent,
     },
     oracle_sse::OraclePricing,
     order::{Created, Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders},
-    pool::{PoolState, fetch_account_storage_from_rpc, get_user_available_balance_from_pool},
+    pool::{
+        LpLedger, PoolState, fetch_account_storage_from_rpc, get_user_available_balance_from_pool,
+    },
     vault::user_pool_from_storage,
 };
 
@@ -34,6 +38,8 @@ pub struct Processing {
     /// on first use, then deltas are applied locally. This is only a pre-flight check —
     /// the on-chain FPI assert in the swap tx remains the real enforcement.
     balances: HashMap<(AccountId, AccountId), u64>,
+    lp_ledger: LpLedger,
+    processed_lp_notes: HashMap<String, u64>,
 }
 
 impl Processing {
@@ -43,9 +49,17 @@ impl Processing {
         vault_id: AccountId,
         assets: Vec<AssetInfo>,
         pools: Vec<AccountId>,
+        lp_store: Arc<LpStore>,
     ) -> Result<Self> {
         let oracle_pricing = OraclePricing::new(&assets);
         let orders = Orders::default();
+
+        let mut lp_ledger = LpLedger::default();
+        for position in lp_store.positions()? {
+            let lp_id = AccountId::from_hex(&position.lp_id)?;
+            let faucet_id = AccountId::from_hex(&position.faucet_id)?;
+            lp_ledger.mint(faucet_id, lp_id, position.shares);
+        }
 
         Ok(Self {
             oracle_pricing,
@@ -58,6 +72,8 @@ impl Processing {
             pool_ids: pools.into_iter().collect(),
             user_pools: HashMap::new(),
             balances: HashMap::new(),
+            lp_ledger,
+            processed_lp_notes: HashMap::new(),
         })
     }
 
@@ -107,6 +123,7 @@ impl Processing {
         let mut orders_rx = self.message_broker.subscribe_order_updates();
         let mut pool_state_rx = self.message_broker.subscribe_pool_state();
         let mut amm_rx = self.message_broker.subscribe_amm();
+        let mut lp_chain_rx = self.message_broker.subscribe_lp_chain();
 
         loop {
             let event = select! {
@@ -158,6 +175,16 @@ impl Processing {
                         }
                     }
                 }
+                lp = lp_chain_rx.recv() => {
+                    match lp {
+                        Ok(ev) => MessageBrokerEvent::LpChain(ev),
+                        Err(RecvError::Lagged(n)) => {
+                            warn!("LP chain events lagged behind by {n} messages");
+                            continue;
+                        }
+                        Err(RecvError::Closed) => break,
+                    }
+                }
 
             };
             self.handle_event(event).await;
@@ -191,8 +218,125 @@ impl Processing {
                 }
                 _ => {}
             },
+            MessageBrokerEvent::LpChain(ev) => {
+                if let Err(error) = self.apply_lp_chain_event(ev.clone()) {
+                    error!(note_id = %ev.note_id, %error, "failed to apply LP chain event");
+                    let _ = self.message_broker.broadcast_lp_applied(LpAppliedEvent {
+                        note_id: ev.note_id,
+                        lp_shares: 0,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
             _ => {}
         }
+    }
+
+    fn apply_lp_chain_event(&mut self, event: LpChainEvent) -> Result<()> {
+        if let Some(lp_shares) = self.processed_lp_notes.get(&event.note_id).copied() {
+            self.message_broker.broadcast_lp_applied(LpAppliedEvent {
+                note_id: event.note_id,
+                lp_shares,
+                error: None,
+            })?;
+            return Ok(());
+        }
+
+        let result = (|| {
+            let pool = self
+                .pool_states
+                .get(&event.faucet_id)
+                .copied()
+                .ok_or_else(|| anyhow!("no pool for LP asset {}", event.faucet_id.to_hex()))?;
+            let (lp_shares, new_supply, new_balances) = match event.kind {
+                LpOperationKind::Deposit => {
+                    let (shares, supply, balances) =
+                        pool.get_deposit_lp_amount_out(U256::from(event.asset_amount))?;
+                    (shares.saturating_to::<u64>(), supply, balances)
+                }
+                LpOperationKind::Withdraw => {
+                    let owned = self.lp_ledger.shares_of(event.faucet_id, event.lp_id);
+                    let shares = if let Some(shares) = event
+                        .shares_hint
+                        .filter(|shares| *shares > 0 && *shares <= owned)
+                    {
+                        shares
+                    } else {
+                        self.shares_for_withdrawal(pool, event.asset_amount, owned)?
+                    };
+                    let (payout, supply, balances) =
+                        pool.get_withdraw_asset_amount_out(U256::from(shares))?;
+                    if payout.saturating_to::<u64>() < event.asset_amount {
+                        return Err(anyhow!(
+                            "LP shares value {} is below confirmed withdrawal {}",
+                            payout,
+                            event.asset_amount
+                        ));
+                    }
+                    (shares, supply, balances)
+                }
+            };
+
+            match event.kind {
+                LpOperationKind::Deposit => {
+                    self.lp_ledger.mint(event.faucet_id, event.lp_id, lp_shares);
+                }
+                LpOperationKind::Withdraw => {
+                    self.lp_ledger
+                        .burn(event.faucet_id, event.lp_id, lp_shares)?;
+                }
+            }
+            self.pool_states
+                .get_mut(&event.faucet_id)
+                .unwrap()
+                .update_state(new_balances, new_supply);
+            self.message_broker.broadcast_pool_state(PoolStateEvent {
+                pool_states: self.pool_states.clone(),
+                timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            })?;
+            self.processed_lp_notes
+                .insert(event.note_id.clone(), lp_shares);
+            self.message_broker.broadcast_lp_applied(LpAppliedEvent {
+                note_id: event.note_id.clone(),
+                lp_shares,
+                error: None,
+            })?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.processed_lp_notes.remove(&event.note_id);
+        }
+        result
+    }
+
+    fn shares_for_withdrawal(
+        &self,
+        pool: PoolState,
+        asset_amount: u64,
+        owned_shares: u64,
+    ) -> Result<u64> {
+        if owned_shares == 0 {
+            return Err(anyhow!("LP owns no shares"));
+        }
+        let mut low = 1_u64;
+        let mut high = owned_shares;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let (payout, _, _) = pool.get_withdraw_asset_amount_out(U256::from(middle))?;
+            if payout >= U256::from(asset_amount) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let (payout, _, _) = pool.get_withdraw_asset_amount_out(U256::from(low))?;
+        if payout < U256::from(asset_amount) {
+            return Err(anyhow!(
+                "confirmed withdrawal exceeds the LP position value"
+            ));
+        }
+        Ok(low)
     }
 
     /// Start processing a batch of new orders if the engine is idle.

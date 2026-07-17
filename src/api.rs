@@ -1,3 +1,4 @@
+use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
@@ -10,8 +11,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose};
 use chrono::Utc;
 use miden_client::{
-    Deserializable,
+    Deserializable, Serializable,
     account::AccountId,
+    asset::FungibleAsset,
     auth::{PublicKey, Signature},
 };
 use reqwest::header;
@@ -24,6 +26,7 @@ use uuid::Uuid;
 use crate::{
     faucet::{DEFAULT_FAUCET_SERVER_URL, MintRequest},
     history::HistoryStore,
+    lp::LpService,
     market::derive_depth,
     message_broker::message_broker::MessageBroker,
     order::{Order, OrderDetails, OrderType, SerializableOrder},
@@ -44,6 +47,7 @@ pub struct AppState {
     /// never holds faucet keys or connects to its Miden client/store.
     pub faucet_server_url: String,
     pub faucet_http: reqwest::Client,
+    pub lp_service: LpService,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,6 +86,7 @@ pub async fn start(
     message_broker: Arc<MessageBroker>,
     store: Arc<Store>,
     history: Arc<HistoryStore>,
+    lp_service: LpService,
 ) -> Result<()> {
     let server_url: &'static str = env::var("SERVER_URL").unwrap().leak();
     let faucet_server_url = normalize_http_url(
@@ -94,6 +99,7 @@ pub async fn start(
         history,
         faucet_server_url,
         faucet_http: reqwest::Client::new(),
+        lp_service,
     });
     let listener = tokio::net::TcpListener::bind(server_url)
         .await
@@ -102,7 +108,8 @@ pub async fn start(
     println!("Server: {server_url}");
     println!("GET  /health /pools/info /stats /candles /trades /depth");
     println!("GET  /orders /orders/{{id}} /users/{{id}}/placement /ws");
-    println!("POST /orders/new /mint");
+    println!("GET  /lp/operations/{{note_id}} /lp/positions/{{lp_id}}/{{faucet_id}}");
+    println!("POST /orders/new /mint /lp/deposits/note");
 
     if let Err(e) = axum::serve(listener, app).await {
         error!("Critical error on server: {e}. Exiting with status 1.");
@@ -133,10 +140,99 @@ pub fn create_router(state: AppState) -> Router {
         .route("/users/{id}/placement", get(user_placement))
         .route("/depth", get(depth))
         .route("/mint", post(proxy_mint))
+        .route("/lp/deposits/note", post(build_lp_deposit_note))
+        .route("/lp/operations/{note_id}", get(lp_operation))
+        .route("/lp/positions/{lp_id}/{faucet_id}", get(lp_position))
         .route("/ws", get(websocket_handler))
         .route("/orders/new", post(order_new))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct LpDepositNoteRequest {
+    lp_id: String,
+    faucet_id: String,
+    amount: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct LpDepositNoteResponse {
+    note_id: String,
+    note: String,
+    expected_lp_shares: u64,
+    minimum_deposit: u64,
+    pricing: &'static str,
+}
+
+async fn build_lp_deposit_note(
+    State(state): State<AppState>,
+    Json(request): Json<LpDepositNoteRequest>,
+) -> Response<Body> {
+    let lp_id = match AccountId::from_hex(&request.lp_id) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("invalid lp_id: {error}")),
+    };
+    let faucet_id = match AccountId::from_hex(&request.faucet_id) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("invalid faucet_id: {error}")),
+    };
+    let asset = match FungibleAsset::new(faucet_id, request.amount) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("invalid deposit asset: {error}")),
+    };
+    let pool_states = state.store.pool_states();
+    let Some(pool) = pool_states.get(&faucet_id) else {
+        return bad_request("unsupported LP asset");
+    };
+    let expected_lp_shares = match pool.get_deposit_lp_amount_out(U256::from(request.amount)) {
+        Ok((shares, _, _)) => shares.saturating_to::<u64>(),
+        Err(error) => return service_unavailable(format!("deposit quote unavailable: {error}")),
+    };
+    let note = match state.lp_service.build_deposit_note(lp_id, asset) {
+        Ok(note) => note,
+        Err(error) => return bad_request(error.to_string()),
+    };
+    Json(ApiResponse {
+        data: LpDepositNoteResponse {
+            note_id: note.note().id().to_hex(),
+            note: general_purpose::STANDARD.encode(note.note().to_bytes()),
+            expected_lp_shares,
+            minimum_deposit: state.lp_service.minimum_deposit(),
+            pricing: "execution_time",
+        },
+    })
+    .into_response()
+}
+
+async fn lp_operation(
+    State(state): State<AppState>,
+    Path(note_id): Path<String>,
+) -> Response<Body> {
+    match state.lp_service.store().operation(&note_id) {
+        Ok(Some(operation)) => Json(ApiResponse { data: operation }).into_response(),
+        Ok(None) => not_found("LP operation not found"),
+        Err(error) => service_unavailable(format!("LP journal unavailable: {error}")),
+    }
+}
+
+async fn lp_position(
+    State(state): State<AppState>,
+    Path((lp_id, faucet_id)): Path<(String, String)>,
+) -> Response<Body> {
+    let lp_id = match AccountId::from_hex(&lp_id) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("invalid lp_id: {error}")),
+    };
+    let faucet_id = match AccountId::from_hex(&faucet_id) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("invalid faucet_id: {error}")),
+    };
+    match state.lp_service.position(lp_id, faucet_id) {
+        Ok(Some(position)) => Json(ApiResponse { data: position }).into_response(),
+        Ok(None) => not_found("LP position not found"),
+        Err(error) => service_unavailable(format!("LP journal unavailable: {error}")),
+    }
 }
 
 async fn health_check() -> impl IntoResponse {

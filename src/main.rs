@@ -13,6 +13,7 @@ use minizeke::*;
 use crate::{
     deployment::AssetInfo,
     history::{HistoryStore, start_history_service},
+    lp::LpService,
     message_broker::message_broker::{MessageBroker, StatsEvent},
     miden_execution::MidenExecution,
     oracle_sse::OracleSSEClient,
@@ -155,12 +156,16 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
     oracle_client.init_prices().await?;
 
     println!("[INIT] Initializing Processing");
+    println!("[INIT] Initializing LP worker");
+    let lp_service: LpService =
+        lp::initialize(message_broker.clone(), init_data.pool_states.clone()).await?;
     let mut processing = Processing::new(
         message_broker.clone(),
         init_data.pool_states.clone(),
         init_data.vault_id,
         init_data.assets,
         init_data.pools,
+        lp_service.store(),
     )
     .await?;
 
@@ -225,7 +230,14 @@ async fn main_tokio(init_data: InitData, message_broker: Arc<MessageBroker>) -> 
     }
 
     println!("[RUN] Starting ZEKE server");
-    api::start(connection_manager, message_broker, store, history).await?;
+    api::start(
+        connection_manager,
+        message_broker,
+        store,
+        history,
+        lp_service,
+    )
+    .await?;
 
     Ok(())
 }

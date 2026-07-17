@@ -73,6 +73,13 @@ pub async fn get_faucet_client() -> Result<Client<FilesystemKeyStore>> {
     build_client(format!("faucet.{}", network.store_path())).await
 }
 
+/// Client with an independent store for LP note observation and operator checkpoints.
+/// It never shares an account nonce or SQLite connection with swap execution.
+pub async fn get_lp_client() -> Result<Client<FilesystemKeyStore>> {
+    let network = MidenNetwork::from_env();
+    build_client(format!("lp.{}", network.store_path())).await
+}
+
 async fn build_client(store_path: String) -> Result<Client<FilesystemKeyStore>> {
     dotenv().ok();
 

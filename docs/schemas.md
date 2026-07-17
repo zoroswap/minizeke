@@ -188,6 +188,28 @@ The beneficiary word is always `[beneficiary_suffix, beneficiary_prefix, 0, 0]`.
 
 All eight are public notes targeted at the vault with `NoteExecutionHint::Always`. Their script roots are allow-listed in the vault's network-account auth component.
 
+## Runtime LP journal
+
+Runtime LP accounting is stored in `lp.<network>.sqlite3` by default:
+
+- `lp_operations`: one row per consumed DEPOSIT or WITHDRAW note, uniquely keyed by
+  `note_id` and `nullifier`. Status advances from `confirmed` to `applied`, or `failed`.
+- `lp_positions`: current shares plus the most recent checkpoint's shares, asset value,
+  and cumulative withdrawn amount for each `(lp_id, faucet_id)`.
+- `lp_meta.sync_cursor`: last consumed-note block scanned by the LP worker.
+
+The note is the chain commit point. Replaying a confirmed note is safe because both the
+journal and Processing deduplicate it before changing shares or curve state.
+
+`POST /lp/deposits/note` accepts:
+
+```json
+{"lp_id":"0x...","faucet_id":"0x...","amount":100000000}
+```
+
+It returns the note ID, a base64-encoded serialized public note, an informational expected
+share amount, the configured minimum deposit, and `pricing: \"execution_time\"`.
+
 ## Signed intent
 
 The canonical intent is exactly eight felts:

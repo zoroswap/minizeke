@@ -8,6 +8,8 @@ pub mod execution_script;
 pub mod faucet;
 pub mod history;
 pub mod intent;
+pub mod lp;
+pub mod lp_store;
 pub mod market;
 pub mod message_broker;
 pub mod miden_env;

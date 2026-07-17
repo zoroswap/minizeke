@@ -42,8 +42,11 @@ Optional values:
 - `TX_PROVER_TIMEOUT_SECS`: prover timeout. Default: `30`.
 - `NETWORK_NOTE_TIMEOUT_SECS`: network-note wait timeout.
 - `HISTORY_DB_PATH`: history SQLite path. Default: `history.<network>.sqlite3`.
+- `LP_DB_PATH`: durable LP journal path. Default: `lp.<network>.sqlite3`.
 - `LOG_DIR`: daily diagnostic log directory. Default: `logs`.
 - `LP_CHECKPOINT_INTERVAL_SECS`: LP entitlement checkpoint interval. Default: `600`.
+- `LP_SYNC_INTERVAL_SECS`: interval for discovering consumed LP notes. Default: `2`.
+- `LP_MIN_DEPOSIT_AMOUNT`: minimum permissionless deposit in base units. Default: `1`.
 - `FAUCET_MINT_AMOUNT`: amount minted per request. Default: `10000000`.
 - `FAUCET_MINT_COOLDOWN_SECS`: cooldown per recipient and faucet. Default: `240`.
 - `ASSETS_FILE`: deploy-time asset config. Default: `assets.toml`.
@@ -186,6 +189,13 @@ The main server exposes:
 - `GET /ws`: order, pool, oracle, user, and stats events.
 - `POST /orders/new`: submit an order, base64 signature, and base64 public key.
 - `POST /mint`: proxy a mint request to the faucet process.
+- `POST /lp/deposits/note`: quote and build a self-custodial DEPOSIT note. The response
+  contains a base64-encoded public note for the LP to submit from its own account.
+- `GET /lp/operations/{note_id}`: confirmed/applied status from the durable LP journal.
+- `GET /lp/positions/{lp_id}/{faucet_id}`: current shares and checkpoint snapshot.
+
+LP shares use execution-time pricing. The quote returned while building a note is
+informational; the confirmed note's chain order determines the minted shares.
 
 The faucet process also exposes `GET /health` and `POST /mint`. A mint body is:
 

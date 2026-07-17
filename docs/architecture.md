@@ -101,19 +101,40 @@ Pending redeems reduce the amount available to later swaps before the payout is 
 
 ### Deposit
 
-A `DEPOSIT` note carries an asset into the vault. The vault increases the LP's entitlement by the principal. The server applies curve deposit math and mints LP shares in an in-memory ledger.
+A permissionless `DEPOSIT` note carries an asset into the vault. The LP creates and
+submits the note from its own account; the server never holds LP keys. The vault increases
+the LP's entitlement by the principal.
 
-`deposit_pools` records each successful seed deposit in deployment JSON. Startup replays those records to rebuild initial curve state and LP shares for the deployment LP.
+The dedicated LP worker discovers consumed DEPOSIT notes, journals each note ID/nullifier,
+and sends a short accounting event to Processing. Processing prices the deposit against
+the curve state at that point and mints shares exactly once. Quotes returned before note
+submission are informational execution-time quotes. Deposits below
+`LP_MIN_DEPOSIT_AMOUNT` receive no shares and remain recoverable through the vault
+entitlement.
+
+`deposit_pools` records seed deposits in deployment JSON. Startup replays those records,
+then the applied LP journal, to rebuild LP state.
 
 ### Checkpoint
 
-The server periodically values each in-memory LP position. If `withdrawn + current value` is above the on-chain entitlement, the operator sends a `CHECKPOINT` note. The vault only accepts non-decreasing values.
+The LP worker periodically values each persisted LP position. If `withdrawn + current
+value` is above the on-chain entitlement, the operator sends a `CHECKPOINT` note. The
+vault only accepts non-decreasing values. The worker stores the checkpoint's share count,
+value, and withdrawn counter for offline partial-withdrawal recovery.
 
 ### Withdraw
 
-The server validates and burns LP shares, checkpoints first if needed, then sends a `WITHDRAW` note. The vault permits at most `entitlement - withdrawn`, increments `withdrawn`, and creates a P2ID payout.
+The LP submits `WITHDRAW` directly. The vault permits at most
+`entitlement - withdrawn`, increments `withdrawn`, and creates a P2ID payout. This remains
+available while every server process is offline.
 
-The on-chain entitlement counters preserve the last checkpointed withdrawal right. LP share ownership and current curve valuation remain server-side.
+After restart, the LP worker syncs consumed WITHDRAW notes in chain order. Processing
+burns the checkpoint-equivalent shares only after the withdrawal is confirmed. The
+durable journal deduplicates replay by note ID/nullifier, and vault counters are the final
+consistency check.
+
+LP RPC synchronization and operator checkpoint waits run on a dedicated current-thread
+runtime with `lp.<network-store>` and never run in the swap execution loop.
 
 ## Batches and failures
 

@@ -12,6 +12,31 @@ use crate::{
     pool::PoolState,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LpOperationKind {
+    Deposit,
+    Withdraw,
+}
+
+#[derive(Debug, Clone)]
+pub struct LpChainEvent {
+    pub note_id: String,
+    pub kind: LpOperationKind,
+    pub lp_id: AccountId,
+    pub faucet_id: AccountId,
+    pub asset_amount: u64,
+    /// Checkpoint-derived share burn for an offline withdrawal. Processing validates it
+    /// against the live ledger and falls back to curve inversion when unavailable.
+    pub shares_hint: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LpAppliedEvent {
+    pub note_id: String,
+    pub lp_shares: u64,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PoolStateEvent {
     pub pool_states: HashMap<AccountId, PoolState>,
@@ -76,6 +101,7 @@ pub enum MessageBrokerEvent {
     Amm(AmmEvent),
     User(UserEvent),
     Trade(TradeEvent),
+    LpChain(LpChainEvent),
 }
 
 #[derive(Clone)]
@@ -88,6 +114,8 @@ pub struct MessageBroker {
     pub amm_tx: broadcast::Sender<AmmEvent>,
     pub processed_batch_tx: broadcast::Sender<Vec<Order<Processed>>>,
     pub trades_tx: broadcast::Sender<TradeEvent>,
+    pub lp_chain_tx: broadcast::Sender<LpChainEvent>,
+    pub lp_applied_tx: broadcast::Sender<LpAppliedEvent>,
 }
 
 impl MessageBroker {
@@ -102,6 +130,8 @@ impl MessageBroker {
         let (user_tx, _) = broadcast::channel(100);
         let (processed_batch_tx, _) = broadcast::channel(100);
         let (trades_tx, _) = broadcast::channel(1000);
+        let (lp_chain_tx, _) = broadcast::channel(100);
+        let (lp_applied_tx, _) = broadcast::channel(100);
 
         Self {
             order_updates_tx,
@@ -112,6 +142,8 @@ impl MessageBroker {
             user_tx,
             processed_batch_tx,
             trades_tx,
+            lp_chain_tx,
+            lp_applied_tx,
         }
     }
 
@@ -193,6 +225,20 @@ impl MessageBroker {
         Ok(())
     }
 
+    pub fn broadcast_lp_chain(&self, event: LpChainEvent) -> Result<()> {
+        if let Err(error) = self.lp_chain_tx.send(event) {
+            warn!("Failed to broadcast LP chain event: {error}");
+        }
+        Ok(())
+    }
+
+    pub fn broadcast_lp_applied(&self, event: LpAppliedEvent) -> Result<()> {
+        if let Err(error) = self.lp_applied_tx.send(event) {
+            warn!("Failed to broadcast LP applied event: {error}");
+        }
+        Ok(())
+    }
+
     /// Broadcast a batch of processed orders to the execution engine
     pub fn broadcast_processed_batch(&self, batch: Vec<Order<Processed>>) -> Result<()> {
         match self.processed_batch_tx.send(batch) {
@@ -241,6 +287,14 @@ impl MessageBroker {
 
     pub fn subscribe_trades(&self) -> broadcast::Receiver<TradeEvent> {
         self.trades_tx.subscribe()
+    }
+
+    pub fn subscribe_lp_chain(&self) -> broadcast::Receiver<LpChainEvent> {
+        self.lp_chain_tx.subscribe()
+    }
+
+    pub fn subscribe_lp_applied(&self) -> broadcast::Receiver<LpAppliedEvent> {
+        self.lp_applied_tx.subscribe()
     }
 }
 
