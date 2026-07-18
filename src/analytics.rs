@@ -12,11 +12,15 @@ use crate::{
     analytics_store::{AnalyticsStore, CashFlow, CashFlowKind, NoteCursor},
     asset_utils::word_to_asset,
     deployment::Deployment,
+    message_broker::message_broker::{MessageBroker, VaultCashFlowEvent, VaultCashFlowKind},
     note::{NoteKind, ZekeNote},
     test_utils::get_analytics_client,
 };
 
-pub async fn initialize(store: Arc<AnalyticsStore>) -> Result<()> {
+pub async fn initialize(
+    store: Arc<AnalyticsStore>,
+    message_broker: Arc<MessageBroker>,
+) -> Result<()> {
     let deployment = Deployment::load()?;
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -30,7 +34,7 @@ pub async fn initialize(store: Arc<AnalyticsStore>) -> Result<()> {
                 return;
             }
         };
-        match runtime.block_on(AnalyticsWorker::new(deployment, store)) {
+        match runtime.block_on(AnalyticsWorker::new(deployment, store, message_broker)) {
             Ok(worker) => {
                 let _ = started_tx.send(Ok(()));
                 runtime.block_on(worker.run());
@@ -49,6 +53,7 @@ pub async fn initialize(store: Arc<AnalyticsStore>) -> Result<()> {
 struct AnalyticsWorker {
     client: Client<FilesystemKeyStore>,
     store: Arc<AnalyticsStore>,
+    message_broker: Arc<MessageBroker>,
     vault_id: AccountId,
     supported_assets: HashSet<AccountId>,
     fund_root: NoteScriptRoot,
@@ -57,7 +62,11 @@ struct AnalyticsWorker {
 }
 
 impl AnalyticsWorker {
-    async fn new(deployment: Deployment, store: Arc<AnalyticsStore>) -> Result<Self> {
+    async fn new(
+        deployment: Deployment,
+        store: Arc<AnalyticsStore>,
+        message_broker: Arc<MessageBroker>,
+    ) -> Result<Self> {
         let mut client = get_analytics_client().await?;
         client.ensure_genesis_in_place().await?;
         client.import_account_by_id(deployment.vault_id).await?;
@@ -71,6 +80,7 @@ impl AnalyticsWorker {
         Ok(Self {
             client,
             store,
+            message_broker,
             vault_id: deployment.vault_id,
             supported_assets: deployment
                 .assets
@@ -94,7 +104,8 @@ impl AnalyticsWorker {
         loop {
             interval.tick().await;
             if let Err(error) = self.sync_notes().await {
-                error!(%error, "analytics note sync failed");
+                // Surface the full chain — bare "RPC error" Display is useless for ops.
+                error!(error = %format!("{error:#}"), "analytics note sync failed");
             }
         }
     }
@@ -183,14 +194,29 @@ impl AnalyticsWorker {
             let event_time = note
                 .created_at()
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
-            self.store.record_cash_flow(&CashFlow {
+            let amount = asset.amount().as_u64();
+            let faucet_id = asset.faucet_id();
+            let inserted = self.store.record_cash_flow(&CashFlow {
                 event_id: format!("vault:{}", note_cursor.note_id),
                 kind,
                 user_id: user_id.to_hex(),
-                asset_id: asset.faucet_id().to_hex(),
-                amount: asset.amount().as_u64(),
+                asset_id: faucet_id.to_hex(),
+                amount,
                 event_time,
             })?;
+            if inserted {
+                let kind = match kind {
+                    CashFlowKind::Fund => VaultCashFlowKind::Fund,
+                    CashFlowKind::InitRedeem => VaultCashFlowKind::InitRedeem,
+                    CashFlowKind::Redeem => VaultCashFlowKind::Redeem,
+                };
+                let _ = self.message_broker.broadcast_vault_cashflow(VaultCashFlowEvent {
+                    user_id,
+                    faucet_id,
+                    amount,
+                    kind,
+                });
+            }
             self.store.set_note_cursor(SOURCE, &note_cursor)?;
         }
         Ok(())

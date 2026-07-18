@@ -206,9 +206,11 @@ impl ExecutionStore {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            -- At most one prove/submit batch. Reconciling batches no longer block a
+            -- successor so Processing can overlap Created→Processing with finality.
             CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_execution_batch
                 ON execution_batches((1))
-                WHERE state IN ('pending', 'claimed', 'reconciling');
+                WHERE state IN ('pending', 'claimed');
             CREATE TABLE IF NOT EXISTS execution_submissions (
                 tx_hash TEXT PRIMARY KEY,
                 tx_id BLOB NOT NULL,
@@ -246,12 +248,12 @@ impl ExecutionStore {
                 [],
             )?;
         }
-        // Upgrade databases created before the reconciliation gate became a durable state.
+        // Upgrade: allow a new pending/claimed batch while a prior one reconciles.
         connection.execute_batch(
             "DROP INDEX IF EXISTS idx_single_active_execution_batch;
              CREATE UNIQUE INDEX idx_single_active_execution_batch
                 ON execution_batches((1))
-                WHERE state IN ('pending', 'claimed', 'reconciling');",
+                WHERE state IN ('pending', 'claimed');",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -417,8 +419,10 @@ impl ExecutionStore {
         Ok(IntentReservation::New { order_id })
     }
 
-    /// Claims admitted work only when no execution batch is active. Expired processing
-    /// claims are eligible, allowing crash-after-admit and crash-after-claim recovery.
+    /// Claims admitted work when no prove/submit batch is active. A batch that is only
+    /// `reconciling` (submitted, awaiting finality) does not block the next claim so
+    /// Created→Processing can overlap with chain confirmation. Expired processing claims
+    /// are eligible, allowing crash-after-admit and crash-after-claim recovery.
     pub fn claim_admitted_orders(
         &self,
         worker: &str,
@@ -430,7 +434,7 @@ impl ExecutionStore {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let active: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM execution_batches
-             WHERE state IN ('pending', 'claimed', 'reconciling'))",
+             WHERE state IN ('pending', 'claimed'))",
             [],
             |row| row.get(0),
         )?;
@@ -439,20 +443,26 @@ impl ExecutionStore {
             return Ok(Vec::new());
         }
         let mut statement = tx.prepare(
-            "SELECT order_id, payload FROM durable_orders
+            "SELECT order_id, payload, created_at FROM durable_orders
              WHERE state = 'admitted'
                 OR (state = 'processing_claimed' AND claim_until < ?1)
              ORDER BY created_at, order_id LIMIT ?2",
         )?;
         let rows = statement
             .query_map(params![to_i64(now)?, i64::try_from(limit)?], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    from_sql_u64(row.get(2)?)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         let claim_until = now.saturating_add(lease_ms);
         let mut orders = Vec::with_capacity(rows.len());
-        for (id, payload) in rows {
+        let mut oldest_created_at = now;
+        for (id, payload, created_at) in rows {
+            oldest_created_at = oldest_created_at.min(created_at);
             tx.execute(
                 "UPDATE durable_orders SET state = 'processing_claimed',
                     claim_owner = ?2, claim_until = ?3, updated_at = ?4
@@ -477,6 +487,13 @@ impl ExecutionStore {
             )?;
         }
         tx.commit()?;
+        if !orders.is_empty() {
+            tracing::info!(
+                count = orders.len(),
+                claim_wait_ms = now.saturating_sub(oldest_created_at),
+                "Claimed admitted orders"
+            );
+        }
         Ok(orders)
     }
 
@@ -863,8 +880,9 @@ impl ExecutionStore {
         Ok(())
     }
 
-    /// Ends transaction submission without releasing the single-batch gate. The gate remains
-    /// held while submitted transactions are reconciled with the synced Miden client store.
+    /// Ends transaction submission and moves the batch to `reconciling`. Prove/submit stays
+    /// single-flight (`pending`/`claimed`); the admit gate may release so Processing can
+    /// claim new orders while finality runs.
     pub fn begin_reconciliation(
         &self,
         batch_id: uuid::Uuid,
@@ -1542,6 +1560,12 @@ fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).context("value exceeds sqlite INTEGER")
 }
 
+fn from_sql_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))
+    })
+}
+
 fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let names = statement
@@ -2034,7 +2058,7 @@ mod tests {
     }
 
     #[test]
-    fn submitted_confirmation_progression_holds_gate() {
+    fn submitted_confirmation_releases_admit_gate_while_reconciling() {
         let store = ExecutionStore::open(":memory:").unwrap();
         let (batch_id, processed) = create_claimed_test_batch(&store, "processing");
         let pool_id = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
@@ -2060,8 +2084,7 @@ mod tests {
             store.order_state(processed.id).unwrap().as_deref(),
             Some("submitted")
         );
-        assert!(store.begin_reconciliation(batch_id, "executor", 6).unwrap());
-
+        // Still claimed (prove/submit): admit gate holds.
         let next_client = uuid::Uuid::new_v4();
         let next = test_order(next_client);
         store.admit_order(next_client, "next", &next, 7).unwrap();
@@ -2072,17 +2095,20 @@ mod tests {
                 .is_empty()
         );
 
+        assert!(store.begin_reconciliation(batch_id, "executor", 6).unwrap());
+        // Reconciling only: next admitted order may be claimed (overlap with finality).
+        assert_eq!(
+            store
+                .claim_admitted_orders("processing", 8, 100, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
         assert!(store.confirm_submission("tx-1", 12, 9).unwrap());
         assert_eq!(
             store.order_state(processed.id).unwrap().as_deref(),
             Some("confirmed")
-        );
-        assert_eq!(
-            store
-                .claim_admitted_orders("processing", 10, 100, 10)
-                .unwrap()
-                .len(),
-            1
         );
     }
 

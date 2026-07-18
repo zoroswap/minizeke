@@ -37,7 +37,10 @@ struct InitData {
 
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,minizeke=debug,miden_core=off,log=warn")
+        tracing_subscriber::EnvFilter::new(
+            "info,minizeke=info,miden_client=warn,miden_tx_prover=warn,miden_prover=warn,\
+             miden_core=off,tower_http=warn,hyper=warn,reqwest=warn,log=warn",
+        )
     });
     let log_dir = env::var("LOG_DIR")
         .map(PathBuf::from)
@@ -163,7 +166,7 @@ async fn main_tokio(
     }
     println!("[INIT] Initializing analytics database");
     let analytics_store = Arc::new(AnalyticsStore::open_from_env()?);
-    analytics::initialize(analytics_store.clone()).await?;
+    analytics::initialize(analytics_store.clone(), message_broker.clone()).await?;
     println!("[INIT] Initializing dynamic fee database");
     let fee_store = Arc::new(FeeStore::open_from_env()?);
     let now = chrono::Utc::now().timestamp() as u64;

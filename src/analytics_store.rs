@@ -305,6 +305,7 @@ impl AnalyticsStore {
         }
 
         let fee = swap.total_fee()?;
+        seed_missing_sell_basis(&tx, swap)?;
         dispose(
             &tx,
             &swap.user_id,
@@ -1098,6 +1099,45 @@ fn empty_position(user: &str, asset: &str, quote: &str) -> PositionState {
     }
 }
 
+/// When a confirmed sell predates journal coverage, seed only the shortfall at event-time
+/// fair value so dispose can proceed without inventing historical volume.
+fn seed_missing_sell_basis(tx: &Transaction<'_>, swap: &FinalizedSwap) -> Result<()> {
+    if swap.amount_in == 0 {
+        return Ok(());
+    }
+    let available = load_position(tx, &swap.user_id, &swap.asset_in, &swap.quote_asset)?
+        .map(|position| position.quantity)
+        .unwrap_or(0);
+    if available >= swap.amount_in {
+        return Ok(());
+    }
+    let missing = swap.amount_in - available;
+    let cost = swap
+        .quote_value
+        .checked_mul(u128::from(missing))
+        .ok_or_else(|| anyhow!("swap opening basis cost overflow"))?
+        / u128::from(swap.amount_in);
+    acquire(
+        tx,
+        &swap.user_id,
+        &swap.asset_in,
+        &swap.quote_asset,
+        missing,
+        cost,
+        swap.event_time,
+    )?;
+    tx.execute(
+        "INSERT INTO analytics_coverage
+         (subject_id, coverage_start, opening_snapshot, trades_covered, cash_flows_covered, marks_covered, fill_metrics_covered)
+         VALUES (?1, ?2, 1, 0, 0, 0, 0)
+         ON CONFLICT(subject_id) DO UPDATE SET
+           coverage_start = MIN(coverage_start, excluded.coverage_start),
+           opening_snapshot = 1",
+        params![swap.user_id, to_i64(swap.event_time)?],
+    )?;
+    Ok(())
+}
+
 fn acquire(
     tx: &Transaction<'_>,
     user: &str,
@@ -1760,6 +1800,76 @@ mod tests {
         assert!(summary.coverage.opening_snapshot);
         assert_eq!(summary.coverage.coverage_start, Some(1));
         assert!(!summary.coverage.marks_covered);
+    }
+
+    #[test]
+    fn untracked_sell_seeds_opening_basis_and_records_swap() {
+        let store = AnalyticsStore::open(":memory:").unwrap();
+        assert!(
+            store
+                .record_swap(&swap("orphan-sell", "A", "B", 10, 100, 200))
+                .unwrap()
+        );
+        let positions = store
+            .positions("user", "USD", 100, Pagination::default())
+            .unwrap();
+        let a = positions.items.iter().find(|p| p.asset_id == "A");
+        assert!(a.is_none() || a.unwrap().quantity == 0);
+        let b = positions.items.iter().find(|p| p.asset_id == "B").unwrap();
+        assert_eq!(b.quantity, 100);
+        assert_eq!(b.cost_quote, 200);
+        let summary = store.user_summary("user", "USD", 100).unwrap();
+        assert!(summary.coverage.partial);
+        assert!(summary.coverage.opening_snapshot);
+        assert!(summary.coverage.trades_covered);
+        assert_eq!(summary.volume_quote, 200);
+        assert_eq!(summary.fills, 1);
+        // Seeded cost equals quote_value, so realized PnL is -fees.
+        let a_realized = store
+            .positions("user", "USD", 100, Pagination::default())
+            .unwrap()
+            .items
+            .iter()
+            .find(|p| p.asset_id == "A")
+            .map(|p| p.realized_pnl_quote)
+            .unwrap_or(0);
+        assert_eq!(a_realized, -3);
+    }
+
+    #[test]
+    fn short_tracked_sell_seeds_only_the_gap() {
+        let store = AnalyticsStore::open(":memory:").unwrap();
+        opening(&store, "A", 4, 40);
+        assert!(
+            store
+                .record_swap(&swap("partial-sell", "A", "B", 10, 100, 200))
+                .unwrap()
+        );
+        let positions = store
+            .positions("user", "USD", 100, Pagination::default())
+            .unwrap();
+        let a = positions.items.iter().find(|p| p.asset_id == "A").unwrap();
+        assert_eq!(a.quantity, 0);
+        // Tracked 4@40 plus gap 6@(200*6/10=120) => cost 160 disposed for 200-3 proceeds => +37.
+        assert_eq!(a.realized_pnl_quote, 37);
+        let b = positions.items.iter().find(|p| p.asset_id == "B").unwrap();
+        assert_eq!(b.quantity, 100);
+        assert_eq!(b.cost_quote, 200);
+        let summary = store.user_summary("user", "USD", 100).unwrap();
+        assert!(summary.coverage.opening_snapshot);
+        assert_eq!(summary.volume_quote, 200);
+    }
+
+    #[test]
+    fn untracked_sell_replay_is_idempotent() {
+        let store = AnalyticsStore::open(":memory:").unwrap();
+        let event = swap("orphan-sell-replay", "A", "B", 10, 100, 200);
+        assert!(store.record_swap(&event).unwrap());
+        assert!(!store.record_swap(&event).unwrap());
+        let summary = store.user_summary("user", "USD", 100).unwrap();
+        assert_eq!(summary.volume_quote, 200);
+        assert_eq!(summary.fills, 1);
+        assert!(summary.coverage.opening_snapshot);
     }
 
     #[test]

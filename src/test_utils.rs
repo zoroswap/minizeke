@@ -394,6 +394,22 @@ pub async fn consume_all_notes_for(
     client: &mut Client<FilesystemKeyStore>,
     account_id: AccountId,
 ) -> Result<()> {
+    consume_notes_for(client, account_id, true).await
+}
+
+/// Like [`consume_all_notes_for`], but skips the post-consume block wait (faster for bulk setup).
+pub async fn consume_all_notes_for_setup(
+    client: &mut Client<FilesystemKeyStore>,
+    account_id: AccountId,
+) -> Result<()> {
+    consume_notes_for(client, account_id, false).await
+}
+
+async fn consume_notes_for(
+    client: &mut Client<FilesystemKeyStore>,
+    account_id: AccountId,
+    wait_block: bool,
+) -> Result<()> {
     loop {
         client.sync_state().await?;
 
@@ -407,11 +423,38 @@ pub async fn consume_all_notes_for(
             let tx_req = TransactionRequestBuilder::new().build_consume_notes(notes)?;
             submit_tx_resilient(client, account_id, tx_req).await?;
             client.sync_state().await?;
-            wait_for_blocks(client, 1).await;
+            if wait_block {
+                wait_for_blocks(client, 1).await;
+            }
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Sends public notes to a network account and waits until every note is consumed.
+pub async fn send_notes_to_network(
+    client: &mut Client<FilesystemKeyStore>,
+    notes: &[ZekeNote],
+    sender_id: AccountId,
+) -> Result<()> {
+    if notes.is_empty() {
+        return Ok(());
+    }
+    let output_notes = notes
+        .iter()
+        .map(|note| note.note().clone())
+        .collect::<Vec<_>>();
+    let tx_req = TransactionRequestBuilder::new()
+        .own_output_notes(output_notes)
+        .build()?;
+    submit_tx_resilient(client, sender_id, tx_req).await?;
+
+    let note_ids = notes
+        .iter()
+        .map(|note| note.note().id())
+        .collect::<Vec<_>>();
+    wait_for_notes_consumed(client, &note_ids).await
 }
 
 /// Sends a public note to a network account and waits for the node's network transaction builder
@@ -421,11 +464,13 @@ pub async fn send_note_to_network(
     note: &ZekeNote,
     sender_id: AccountId,
 ) -> Result<()> {
-    let tx_req = TransactionRequestBuilder::new()
-        .own_output_notes(vec![note.note().clone()])
-        .build()?;
-    submit_tx_resilient(client, sender_id, tx_req).await?;
+    send_notes_to_network(client, std::slice::from_ref(note), sender_id).await
+}
 
+async fn wait_for_notes_consumed(
+    client: &mut Client<FilesystemKeyStore>,
+    note_ids: &[miden_client::note::NoteId],
+) -> Result<()> {
     let timeout_secs = env::var("NETWORK_NOTE_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -433,18 +478,24 @@ pub async fn send_note_to_network(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         client.sync_state().await?;
-        if client
-            .get_output_note(note.note().id())
-            .await?
-            .is_some_and(|record| record.is_consumed())
-        {
+        let mut pending = Vec::new();
+        for note_id in note_ids {
+            let consumed = client
+                .get_output_note(*note_id)
+                .await?
+                .is_some_and(|record| record.is_consumed());
+            if !consumed {
+                pending.push(note_id.to_hex());
+            }
+        }
+        if pending.is_empty() {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(anyhow!(
-                "network note {} was not consumed within {timeout_secs}s; verify that the node's \
-                 network transaction builder is running",
-                note.note().id().to_hex()
+                "network notes not consumed within {timeout_secs}s (still pending: {}); verify \
+                 that the node's network transaction builder is running",
+                pending.join(", ")
             ));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -485,6 +536,37 @@ pub async fn fund_user_on_vault(
         client.code_builder(),
     )?;
     send_note_to_network(client, &note, user_id).await
+}
+
+/// Submits REGISTER + all FUND notes in one user transaction, then waits until every note is
+/// network-consumed. Much faster than register-then-fund-per-asset when onboarding many traders.
+pub async fn register_and_fund_user_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    user_id: AccountId,
+    pubkey_commitment: Word,
+    assets: &[FungibleAsset],
+) -> Result<()> {
+    let mut notes = Vec::with_capacity(1 + assets.len());
+    notes.push(ZekeNote::new(
+        ZekeNoteInstructions::Register(RegisterInstructions {
+            user_id,
+            vault_id,
+            pubkey_commitment,
+        }),
+        client.code_builder(),
+    )?);
+    for asset in assets {
+        notes.push(ZekeNote::new(
+            ZekeNoteInstructions::Fund(FundInstructions {
+                user_id,
+                vault_id,
+                note_assets: vec![*asset],
+            }),
+            client.code_builder(),
+        )?);
+    }
+    send_notes_to_network(client, &notes, user_id).await
 }
 
 /// Deposits liquidity into the vault via a DEPOSIT note carrying `asset`; the vault

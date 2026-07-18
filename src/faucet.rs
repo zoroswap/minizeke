@@ -1,5 +1,9 @@
 //! Standalone, rate-limited faucet service. It owns its own Miden client/store while
 //! sharing the deployment `keystore` with `spawn`, which holds each faucet's signing key.
+//!
+//! Concurrent mint requests are batched per faucet into one transaction via
+//! [`TransactionRequestBuilder::own_output_notes`] — the same path as a single
+//! `build_mint_fungible_asset`, with N public P2ID notes.
 
 use std::{collections::HashMap, env, time::Duration};
 
@@ -15,14 +19,16 @@ use miden_client::{
     Client,
     account::AccountId,
     address::{Address, AddressId},
-    asset::FungibleAsset,
+    asset::{Asset, FungibleAsset},
     keystore::FilesystemKeyStore,
-    note::NoteType,
-    transaction::TransactionRequestBuilder,
+    note::{Note, NoteType},
+    transaction::{TransactionRequest, TransactionRequestBuilder},
 };
+use miden_protocol::note::NoteAttachments;
+use miden_standards::note::P2idNote;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
     deployment::Deployment,
@@ -33,6 +39,7 @@ use crate::{
 pub const DEFAULT_FAUCET_SERVER_URL: &str = "127.0.0.1:7800";
 pub const DEFAULT_MINT_AMOUNT: u64 = 10_000_000;
 pub const DEFAULT_MINT_COOLDOWN_SECS: u64 = 240;
+pub const DEFAULT_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MintRequest {
@@ -56,6 +63,7 @@ struct FaucetWorker {
     supported_faucets: Vec<AccountId>,
     mint_amount: u64,
     cooldown: Duration,
+    batch_size: usize,
     last_mint: HashMap<(AccountId, AccountId), tokio::time::Instant>,
 }
 
@@ -90,6 +98,12 @@ pub async fn initialize() -> Result<FaucetService> {
         .map(|value| value.parse())
         .transpose()?
         .unwrap_or(DEFAULT_MINT_COOLDOWN_SECS);
+    let batch_size = env::var("FAUCET_BATCH_SIZE")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(DEFAULT_BATCH_SIZE)
+        .max(1);
 
     let (commands, receiver) = mpsc::channel(100);
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -104,7 +118,12 @@ pub async fn initialize() -> Result<FaucetService> {
                 return;
             }
         };
-        match runtime.block_on(FaucetWorker::new(deployment, mint_amount, cooldown_secs)) {
+        match runtime.block_on(FaucetWorker::new(
+            deployment,
+            mint_amount,
+            cooldown_secs,
+            batch_size,
+        )) {
             Ok(worker) => {
                 let _ = started_tx.send(Ok(()));
                 runtime.block_on(worker.run(receiver));
@@ -126,7 +145,12 @@ pub async fn initialize() -> Result<FaucetService> {
 }
 
 impl FaucetWorker {
-    async fn new(deployment: Deployment, mint_amount: u64, cooldown_secs: u64) -> Result<Self> {
+    async fn new(
+        deployment: Deployment,
+        mint_amount: u64,
+        cooldown_secs: u64,
+        batch_size: usize,
+    ) -> Result<Self> {
         let mut client = get_faucet_client().await?;
         client.ensure_genesis_in_place().await?;
         client.sync_state().await?;
@@ -141,25 +165,57 @@ impl FaucetWorker {
         client.sync_state().await?;
         info!(
             assets = supported_faucets.len(),
-            mint_amount, cooldown_secs, "Standalone faucet service initialized"
+            mint_amount,
+            cooldown_secs,
+            batch_size,
+            "Standalone faucet service initialized"
         );
         Ok(Self {
             client,
             supported_faucets,
             mint_amount,
             cooldown: Duration::from_secs(cooldown_secs),
+            batch_size,
             last_mint: HashMap::new(),
         })
     }
 
     async fn run(mut self, mut receiver: mpsc::Receiver<FaucetCommand>) {
-        while let Some(command) = receiver.recv().await {
-            let result = self.mint(command.recipient, command.faucet_id).await;
-            let _ = command.response.send(result);
+        let mut buffer = Vec::with_capacity(self.batch_size);
+        loop {
+            buffer.clear();
+            let Some(first) = receiver.recv().await else {
+                break;
+            };
+            buffer.push(first);
+            let _ = receiver.recv_many(&mut buffer, self.batch_size - 1).await;
+            self.process_batch(std::mem::take(&mut buffer)).await;
         }
     }
 
-    async fn mint(&mut self, recipient: AccountId, faucet_id: AccountId) -> Result<String, String> {
+    async fn process_batch(&mut self, commands: Vec<FaucetCommand>) {
+        let mut by_faucet: HashMap<AccountId, Vec<FaucetCommand>> = HashMap::new();
+        for command in commands {
+            if let Err(error) = self.validate_command(command.recipient, command.faucet_id) {
+                let _ = command.response.send(Err(error));
+                continue;
+            }
+            by_faucet
+                .entry(command.faucet_id)
+                .or_default()
+                .push(command);
+        }
+
+        for (faucet_id, group) in by_faucet {
+            self.mint_group(faucet_id, group).await;
+        }
+    }
+
+    fn validate_command(
+        &self,
+        recipient: AccountId,
+        faucet_id: AccountId,
+    ) -> Result<(), String> {
         if !self.supported_faucets.contains(&faucet_id) {
             return Err(format!("faucet {} is not supported", faucet_id.to_hex()));
         }
@@ -174,26 +230,103 @@ impl FaucetWorker {
                 ));
             }
         }
+        Ok(())
+    }
 
+    async fn mint_group(&mut self, faucet_id: AccountId, group: Vec<FaucetCommand>) {
+        let mut notes = Vec::with_capacity(group.len());
+        let mut accepted = Vec::with_capacity(group.len());
+
+        for command in group {
+            match self.create_mint_note(faucet_id, command.recipient) {
+                Ok(note) => {
+                    notes.push(note);
+                    accepted.push(command);
+                }
+                Err(error) => {
+                    let _ = command.response.send(Err(error));
+                }
+            }
+        }
+
+        if notes.is_empty() {
+            return;
+        }
+
+        let request = match build_batch_mint_request(notes) {
+            Ok(request) => request,
+            Err(error) => {
+                for command in accepted {
+                    let _ = command.response.send(Err(error.clone()));
+                }
+                return;
+            }
+        };
+
+        match submit_tx_resilient(&mut self.client, faucet_id, request).await {
+            Ok(transaction_id) => {
+                let tx_hex = transaction_id.to_hex();
+                let now = tokio::time::Instant::now();
+                for command in &accepted {
+                    self.last_mint
+                        .insert((command.recipient, faucet_id), now);
+                }
+                info!(
+                    faucet = %faucet_id.to_hex(),
+                    recipients = accepted.len(),
+                    amount = self.mint_amount,
+                    transaction = %tx_hex,
+                    "Faucet batch mint submitted"
+                );
+                for command in accepted {
+                    let _ = command.response.send(Ok(tx_hex.clone()));
+                }
+            }
+            Err(error) => {
+                // Surface the full chain — bare "RPC error" Display is useless for ops.
+                let message = format!("{error:#}");
+                error!(
+                    faucet = %faucet_id.to_hex(),
+                    recipients = accepted.len(),
+                    error = %message,
+                    "Faucet batch mint failed"
+                );
+                for command in accepted {
+                    let _ = command.response.send(Err(message.clone()));
+                }
+            }
+        }
+    }
+
+    fn create_mint_note(
+        &mut self,
+        faucet_id: AccountId,
+        recipient: AccountId,
+    ) -> Result<Note, String> {
         let asset =
             FungibleAsset::new(faucet_id, self.mint_amount).map_err(|error| error.to_string())?;
-        let request = TransactionRequestBuilder::new()
-            .build_mint_fungible_asset(asset, recipient, NoteType::Public, self.client.rng())
-            .map_err(|error| error.to_string())?;
-        let transaction_id = submit_tx_resilient(&mut self.client, faucet_id, request)
-            .await
-            .map_err(|error| error.to_string())?;
-
-        self.last_mint.insert(key, tokio::time::Instant::now());
-        info!(
-            faucet = %faucet_id.to_hex(),
-            recipient = %recipient.to_hex(),
-            amount = self.mint_amount,
-            transaction = %transaction_id.to_hex(),
-            "Faucet mint submitted"
-        );
-        Ok(transaction_id.to_hex())
+        P2idNote::create(
+            faucet_id,
+            recipient,
+            vec![Asset::from(asset)],
+            NoteType::Public,
+            NoteAttachments::empty(),
+            self.client.rng(),
+        )
+        .map_err(|error| error.to_string())
     }
+}
+
+/// Builds a multi-recipient mint request using the standard faucet `send_notes` script
+/// (same mechanism as [`TransactionRequestBuilder::build_mint_fungible_asset`]).
+pub fn build_batch_mint_request(notes: Vec<Note>) -> Result<TransactionRequest, String> {
+    if notes.is_empty() {
+        return Err("batch mint requires at least one note".into());
+    }
+    TransactionRequestBuilder::new()
+        .own_output_notes(notes)
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 pub fn router(state: FaucetService) -> Router {
@@ -296,7 +429,30 @@ fn mint_error(status: StatusCode, message: String) -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_account_id;
+    use miden_client::{
+        Felt, Word,
+        account::AccountId,
+        asset::{Asset, FungibleAsset},
+        crypto::RandomCoin,
+        note::NoteType,
+        testing::account_id::{
+            ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1, ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        },
+        transaction::TransactionScriptTemplate,
+    };
+    use miden_protocol::note::NoteAttachments;
+    use miden_standards::note::P2idNote;
+
+    use super::{build_batch_mint_request, parse_account_id};
+
+    fn test_rng(seed: u64) -> RandomCoin {
+        RandomCoin::new(Word::from([
+            Felt::new_unchecked(seed),
+            Felt::new_unchecked(seed.wrapping_add(1)),
+            Felt::new_unchecked(seed.wrapping_add(2)),
+            Felt::new_unchecked(seed.wrapping_add(3)),
+        ]))
+    }
 
     #[test]
     fn parses_bech32_address_with_routing_parameters() {
@@ -305,5 +461,52 @@ mod tests {
         let plain_account_id = parse_account_id("mtst1apdp0kf27ytzqcf5zn4dynclecpw7z8z").unwrap();
 
         assert_eq!(account_id, plain_account_id);
+    }
+
+    #[test]
+    fn batch_mint_request_uses_send_notes_with_all_recipients() {
+        let faucet_id = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
+        let recipient =
+            AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
+        let amount = 10_000_000u64;
+        let mut rng = test_rng(1);
+        let note1 = P2idNote::create(
+            faucet_id,
+            recipient,
+            vec![Asset::from(FungibleAsset::new(faucet_id, amount).unwrap())],
+            NoteType::Public,
+            NoteAttachments::empty(),
+            &mut rng,
+        )
+        .unwrap();
+        let note2 = P2idNote::create(
+            faucet_id,
+            recipient,
+            vec![Asset::from(FungibleAsset::new(faucet_id, amount).unwrap())],
+            NoteType::Public,
+            NoteAttachments::empty(),
+            &mut rng,
+        )
+        .unwrap();
+
+        let request = build_batch_mint_request(vec![note1.clone(), note2.clone()]).unwrap();
+        match request.script_template() {
+            Some(TransactionScriptTemplate::SendNotes(notes)) => {
+                assert_eq!(notes.len(), 2);
+            }
+            other => panic!("expected SendNotes template, got {other:?}"),
+        }
+        let expected: Vec<_> = [note1, note2]
+            .iter()
+            .map(|note| note.recipient().digest())
+            .collect();
+        let got: Vec<_> = request
+            .expected_output_recipients()
+            .map(|recipient| recipient.digest())
+            .collect();
+        assert_eq!(got.len(), 2);
+        for digest in expected {
+            assert!(got.contains(&digest));
+        }
     }
 }

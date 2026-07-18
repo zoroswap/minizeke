@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
@@ -8,12 +11,17 @@ use miden_client::{
     auth::{AuthSecretKey, PublicKey},
 };
 use miden_core::{Felt, Word};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{faucet::MintRequest, intent::INTENT_VERSION, order::OrderDetails};
+
+/// Caps concurrent challenge+login pairs so we do not stampede the server's
+/// `MIDEN_RPC_MAX_CONCURRENCY` vault lookups (default 8) or auth rate bucket.
+const AUTH_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct SimulationApi {
@@ -21,6 +29,7 @@ pub struct SimulationApi {
     api_url: String,
     faucet_url: String,
     faucet_token: Option<String>,
+    auth_slots: Arc<Semaphore>,
 }
 
 impl SimulationApi {
@@ -29,8 +38,9 @@ impl SimulationApi {
         faucet_url: impl Into<String>,
         faucet_token: Option<String>,
     ) -> Result<Self> {
+        // Mint batches can spend a long time proving; concurrent setup waits share that cost.
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .context("build simulation HTTP client")?;
         Ok(Self {
@@ -38,6 +48,7 @@ impl SimulationApi {
             api_url: normalize_url(api_url.into()),
             faucet_url: normalize_url(faucet_url.into()),
             faucet_token,
+            auth_slots: Arc::new(Semaphore::new(AUTH_CONCURRENCY)),
         })
     }
 
@@ -88,8 +99,50 @@ impl SimulationApi {
         &self,
         user_id: AccountId,
         key: &AuthSecretKey,
-    ) -> Result<(Session, Duration)> {
-        let started = Instant::now();
+    ) -> Result<(Session, AuthTiming)> {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut http = Duration::ZERO;
+        let mut wait_total = Duration::ZERO;
+        loop {
+            // Hold the slot only around the HTTP round-trip, not during Retry-After sleeps.
+            let slot = self
+                .auth_slots
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("auth concurrency closed"))?;
+            let attempt_started = Instant::now();
+            let result = self.authenticate_once(user_id, key).await;
+            drop(slot);
+            match result {
+                Ok(session) => {
+                    http += attempt_started.elapsed();
+                    return Ok((session, AuthTiming { http, wait: wait_total }));
+                }
+                Err(error) => {
+                    let Some(wait) = retry_after_from_error(&error) else {
+                        return Err(error);
+                    };
+                    if Instant::now() + wait > deadline {
+                        return Err(error).context("auth retries exhausted");
+                    }
+                    warn!(
+                        user = %user_id.to_hex(),
+                        wait_secs = wait.as_secs().max(1),
+                        %error,
+                        "auth saturated; retrying"
+                    );
+                    wait_total += wait;
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+
+    async fn authenticate_once(
+        &self,
+        user_id: AccountId,
+        key: &AuthSecretKey,
+    ) -> Result<Session> {
         let challenge_response = self
             .client
             .post(format!("{}/auth/challenge", self.api_url))
@@ -121,13 +174,10 @@ impl SimulationApi {
             .await
             .context("submit auth login")?;
         let login: ApiResponse<AuthLogin> = decode_success(login_response, "auth login").await?;
-        Ok((
-            Session {
-                access_token: login.data.access_token,
-                expires_at: login.data.expires_at,
-            },
-            started.elapsed(),
-        ))
+        Ok(Session {
+            access_token: login.data.access_token,
+            expires_at: login.data.expires_at,
+        })
     }
 
     pub async fn submit_order(
@@ -183,6 +233,13 @@ impl SimulationApi {
 pub struct Session {
     pub access_token: String,
     pub expires_at: u64,
+}
+
+/// Split so retry/backoff sleeps are not mistaken for slow challenge/login HTTP.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthTiming {
+    pub http: Duration,
+    pub wait: Duration,
 }
 
 impl Session {
@@ -241,8 +298,9 @@ async fn ensure_success(response: reqwest::Response, operation: &str) -> Result<
     if status.is_success() {
         return Ok(());
     }
+    let retry_after = retry_after_header(&response);
     let body = response.text().await.unwrap_or_default();
-    Err(anyhow!("{operation} returned {status}: {body}"))
+    Err(http_error(operation, status, &body, retry_after))
 }
 
 async fn decode_success<T: for<'de> Deserialize<'de>>(
@@ -250,11 +308,54 @@ async fn decode_success<T: for<'de> Deserialize<'de>>(
     operation: &str,
 ) -> Result<T> {
     let status = response.status();
+    let retry_after = retry_after_header(&response);
     let body = response.text().await.context("read HTTP response")?;
     if !status.is_success() {
-        return Err(anyhow!("{operation} returned {status}: {body}"));
+        return Err(http_error(operation, status, &body, retry_after));
     }
     serde_json::from_str(&body).with_context(|| format!("decode {operation} response"))
+}
+
+fn retry_after_header(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn http_error(
+    operation: &str,
+    status: StatusCode,
+    body: &str,
+    retry_after: Option<u64>,
+) -> anyhow::Error {
+    match retry_after {
+        Some(secs) => anyhow!("{operation} returned {status}: {body} (retry-after={secs})"),
+        None => anyhow!("{operation} returned {status}: {body}"),
+    }
+}
+
+/// Transient ingress pressure: 429 rate limits and 503 worker saturation.
+fn retry_after_from_error(error: &anyhow::Error) -> Option<Duration> {
+    let message = error.to_string();
+    let retryable = message.contains("429 Too Many Requests")
+        || message.contains("503 Service Unavailable");
+    if !retryable {
+        return None;
+    }
+    let secs = message
+        .rsplit_once("retry-after=")
+        .and_then(|(_, rest)| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(1)
+        .max(1);
+    Some(Duration::from_secs(secs))
 }
 
 fn normalize_url(url: String) -> String {
@@ -275,7 +376,9 @@ fn parse_cooldown_secs(message: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cooldown_secs;
+    use super::{parse_cooldown_secs, retry_after_from_error};
+    use anyhow::anyhow;
+    use std::time::Duration;
 
     #[test]
     fn parses_faucet_cooldown_message() {
@@ -284,5 +387,17 @@ mod tests {
             Some(42)
         );
         assert_eq!(parse_cooldown_secs("unrelated failure"), None);
+    }
+
+    #[test]
+    fn parses_auth_retry_after() {
+        let err = anyhow!(
+            "auth challenge returned 503 Service Unavailable: vault unavailable \
+             (retry-after=1)"
+        );
+        assert_eq!(retry_after_from_error(&err), Some(Duration::from_secs(1)));
+        let err = anyhow!("auth login returned 429 Too Many Requests: rate limit exceeded (retry-after=42)");
+        assert_eq!(retry_after_from_error(&err), Some(Duration::from_secs(42)));
+        assert_eq!(retry_after_from_error(&anyhow!("auth login returned 401")), None);
     }
 }

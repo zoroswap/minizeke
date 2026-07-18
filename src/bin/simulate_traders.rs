@@ -10,7 +10,8 @@ use minizeke::{
         metrics::Metrics,
         oracle::OracleClient,
         trader::{
-            build_simulation_client, load_traders, run_trader, setup_traders, validate_deployment,
+            build_simulation_client, load_traders, reset_setup_artifacts, run_trader, setup_traders,
+            validate_deployment, warm_auth_sessions,
         },
     },
 };
@@ -33,6 +34,11 @@ async fn main() -> Result<()> {
     )?;
     let oracle = OracleClient::new(&config.oracle_url)?;
     let metrics = Metrics::default();
+
+    if !config.skip_setup {
+        reset_setup_artifacts(&config)?;
+    }
+
     let (mut miden_client, keystore) = build_simulation_client(&config).await?;
 
     let traders = if config.skip_setup {
@@ -66,14 +72,22 @@ async fn main() -> Result<()> {
         low = tier_counts[0],
         average = tier_counts[1],
         high_frequency = tier_counts[2],
-        "starting simulation"
+        "warming auth sessions"
     );
+    let sessions = warm_auth_sessions(
+        &traders,
+        &api,
+        Duration::from_millis(config.auth_warmup_gap_ms),
+    )
+    .await?;
+
+    info!(traders = traders.len(), "starting simulation");
 
     let config = Arc::new(config);
     let deployment = Arc::new(deployment);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    for trader in traders {
+    for (trader, session) in traders.into_iter().zip(sessions) {
         tasks.spawn(run_trader(
             trader,
             config.clone(),
@@ -81,6 +95,7 @@ async fn main() -> Result<()> {
             api.clone(),
             oracle.clone(),
             metrics.clone(),
+            Some(session),
             shutdown_rx.clone(),
         ));
     }

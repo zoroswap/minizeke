@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
     about = "Run synthetic traders against a minizeke staging deployment",
     long_about = "Creates and funds synthetic Miden wallets, then continuously submits \
                   oracle-priced swaps through the production HTTP API. Runs until Ctrl+C unless \
-                  --duration is set.\n\nSetup mints each asset once to a bank wallet (raising \
-                  FAUCET_MINT_AMOUNT or waiting through FAUCET_MINT_COOLDOWN_SECS when \
-                  num_traders * fund_amount exceeds one mint), then distributes via public P2ID \
-                  notes before vault register/fund.\n\nStaging example:\n  MIDEN_NETWORK=testnet \
+                  --duration is set.\n\nSetup mints each asset directly to every trader via the \
+                  faucet (concurrent /mint calls so the faucet can batch many recipients into \
+                  one tx), then onboards traders in parallel workers (consume mint notes, \
+                  register+fund vault in one tx per trader). Each mint delivers FAUCET_MINT_AMOUNT; \
+                  fund_amount must not exceed that (extra mint rounds wait on \
+                  FAUCET_MINT_COOLDOWN_SECS).\n\nStaging example:\n  MIDEN_NETWORK=testnet \
                   SIMULATE_API_URL=https://staging-api.example \
                   SIMULATE_FAUCET_URL=https://staging-faucet.example \
                   ORACLE_URL=https://oracle.zoroswap.com FAUCET_SERVICE_TOKEN=... \
@@ -46,17 +48,29 @@ pub struct Config {
     /// Uniform interval jitter as a fraction (0.2 means +/-20%).
     #[arg(long, default_value_t = 0.2)]
     pub jitter: f64,
+    /// Delay between launching each trader at startup (ms). Spreads the initial
+    /// trade stampede after sessions are warmed.
+    #[arg(long, default_value_t = 400)]
+    pub start_stagger_ms: u64,
+    /// Gap between successive auth warmups (ms). Keeps challenge+login under
+    /// `RATE_LIMIT_AUTH_PER_MINUTE` (default 20) before trade loops start.
+    #[arg(long, default_value_t = 3500)]
+    pub auth_warmup_gap_ms: u64,
 
     /// Input amount for every swap, in asset base units.
     #[arg(long, default_value_t = 1_000)]
     pub trade_amount: u64,
-    /// Amount funded into the vault per trader and asset. Default fits 10 traders in one
-    /// FAUCET_MINT_AMOUNT of 10_000_000.
+    /// Amount funded into the vault per trader and asset. Must be <= FAUCET_MINT_AMOUNT
+    /// (default 10_000_000) unless you accept cooldown waits for extra mint rounds.
     #[arg(long, default_value_t = 1_000_000)]
     pub fund_amount: u64,
     /// Oracle-price cushion applied to min_amount_out.
     #[arg(long, default_value_t = 500)]
     pub slippage_bps: u16,
+    /// Signed intent lifetime in seconds. Must cover queueing under load before
+    /// the execution engine proves the swap (default 30 minutes).
+    #[arg(long, default_value_t = 1_800)]
+    pub intent_ttl_secs: u64,
 
     /// Minizeke public API base URL.
     #[arg(
@@ -93,6 +107,10 @@ pub struct Config {
     #[arg(long, default_value = "simulate.store.sqlite3")]
     pub store_path: PathBuf,
 
+    /// Max concurrent per-trader setup workers (consume/register/fund). Default: 8.
+    #[arg(long, default_value_t = 8)]
+    pub setup_concurrency: usize,
+
     /// Create, register, and fund traders, then exit.
     #[arg(long, conflicts_with = "skip_setup")]
     pub setup_only: bool,
@@ -115,6 +133,9 @@ impl Config {
         if self.num_traders == 0 {
             bail!("NUM_TRADERS must be at least 1");
         }
+        if self.setup_concurrency == 0 {
+            bail!("--setup-concurrency must be at least 1");
+        }
         let ratios = [self.low_ratio, self.avg_ratio, self.hf_ratio];
         if ratios
             .iter()
@@ -126,11 +147,20 @@ impl Config {
         if self.jitter < 0.0 || self.jitter > 1.0 || !self.jitter.is_finite() {
             bail!("--jitter must be between 0 and 1");
         }
+        if self.start_stagger_ms > 60_000 {
+            bail!("--start-stagger-ms must be at most 60000");
+        }
+        if self.auth_warmup_gap_ms > 60_000 {
+            bail!("--auth-warmup-gap-ms must be at most 60000");
+        }
         if self.slippage_bps >= 10_000 {
             bail!("--slippage-bps must be less than 10000");
         }
         if self.trade_amount == 0 || self.fund_amount == 0 {
             bail!("trade and funding amounts must be non-zero");
+        }
+        if self.intent_ttl_secs == 0 {
+            bail!("--intent-ttl-secs must be non-zero");
         }
         if self.trade_amount > self.fund_amount {
             bail!("--trade-amount cannot exceed --fund-amount");

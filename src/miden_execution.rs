@@ -26,6 +26,7 @@ use crate::{
     deployment::{AssetInfo, Deployment},
     execution_script::make_exec_script,
     execution_store::{BatchOrderOutcome, ExecutionStore},
+    intent::is_expired_at,
     lp_store::LpStore,
     message_broker::message_broker::{AmmEvent, MessageBroker},
     miden_env::MidenNetwork,
@@ -35,6 +36,16 @@ use crate::{
     test_utils::{get_pool_client, vault_foreign_account},
     vault::{user_pool_from_storage, vault_user_registration},
 };
+
+/// Miden vault FPI allows at most 64 storage-map keys per slot; stay under that.
+const MAX_FPI_ASSET_USER_PAIRS: usize = 48;
+/// Soft cap on swaps packed into one pool tx (sizes that already succeed under load).
+const MAX_ORDERS_PER_SHARD_TX: usize = 16;
+
+struct ShardSubmit {
+    tx_hash: String,
+    orders: Vec<Order<Processed>>,
+}
 
 pub struct MidenExecution {
     /// Separate client (own store) for pool-native swap txs. The vault must stay
@@ -229,44 +240,26 @@ impl MidenExecution {
         }
         let mut orders_rx = self.message_broker.subscribe_order_updates();
         let mut pool_state_rx = self.message_broker.subscribe_pool_state();
+        let mut processed_rx = self.message_broker.subscribe_processed_batch();
         let mut durable_poll = tokio::time::interval(Duration::from_millis(250));
 
         loop {
             tokio::select! {
                 _ = durable_poll.tick() => {
-                    let now = chrono::Utc::now().timestamp_millis() as u64;
-                    if let Err(error) = self.reconcile_submissions(now).await {
-                        error!(%error, "Failed to reconcile submitted transactions");
-                    }
-                    match self.execution_store.pending_outbox(100) {
-                        Ok(entries) => {
-                            for entry in entries.into_iter().filter(|entry| entry.topic == "batch_terminal") {
-                                let Ok(batch_id) = uuid::Uuid::parse_str(&entry.aggregate_id) else {
-                                    continue;
-                                };
-                                match self.execution_store.recover_terminal_batch(batch_id) {
-                                    Ok(Some(batch)) => {
-                                        self.publish_terminal_notifications(
-                                            batch.id,
-                                            &batch.orders,
-                                            &batch.outcomes,
-                                        );
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => error!(%batch_id, %error, "Failed to recover terminal batch notifications"),
-                                }
-                            }
+                    self.poll_durable_work().await;
+                }
+                batch = processed_rx.recv() => {
+                    match batch {
+                        Ok(_) => {
+                            // Wake immediately when Processing commits a batch; durable
+                            // claim remains authoritative (payload comes from the store).
+                            self.claim_and_handle_pending_batch().await;
                         }
-                        Err(error) => error!(%error, "Failed to read execution outbox"),
-                    }
-                    match self.execution_store.claim_pending_batch(
-                        &self.worker_id,
-                        now,
-                        600_000,
-                    ) {
-                        Ok(Some(batch)) => self.handle_durable_batch(batch.id, batch.orders).await,
-                        Ok(None) => {}
-                        Err(error) => error!(%error, "Failed to claim durable execution batch"),
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(lagged = n, "processed_batch lagged; polling durable store");
+                            self.claim_and_handle_pending_batch().await;
+                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
                 orders = orders_rx.recv() => {
@@ -296,6 +289,52 @@ impl MidenExecution {
         Err(anyhow!("Termination of miden execution."))
     }
 
+    async fn poll_durable_work(&mut self) {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        if let Err(error) = self.reconcile_submissions(now).await {
+            error!(%error, "Failed to reconcile submitted transactions");
+        }
+        match self.execution_store.pending_outbox(100) {
+            Ok(entries) => {
+                for entry in entries
+                    .into_iter()
+                    .filter(|entry| entry.topic == "batch_terminal")
+                {
+                    let Ok(batch_id) = uuid::Uuid::parse_str(&entry.aggregate_id) else {
+                        continue;
+                    };
+                    match self.execution_store.recover_terminal_batch(batch_id) {
+                        Ok(Some(batch)) => {
+                            self.publish_terminal_notifications(
+                                batch.id,
+                                &batch.orders,
+                                &batch.outcomes,
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            error!(%batch_id, %error, "Failed to recover terminal batch notifications")
+                        }
+                    }
+                }
+            }
+            Err(error) => error!(%error, "Failed to read execution outbox"),
+        }
+        self.claim_and_handle_pending_batch().await;
+    }
+
+    async fn claim_and_handle_pending_batch(&mut self) {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        match self
+            .execution_store
+            .claim_pending_batch(&self.worker_id, now, 600_000)
+        {
+            Ok(Some(batch)) => self.handle_durable_batch(batch.id, batch.orders).await,
+            Ok(None) => {}
+            Err(error) => error!(%error, "Failed to claim durable execution batch"),
+        }
+    }
+
     /// Route one logical batch to its pool shards and release the processing gate once all
     /// shard submissions have succeeded or failed.
     pub async fn handle_durable_batch(
@@ -318,8 +357,9 @@ impl MidenExecution {
         orders: Vec<Order<Processed>>,
     ) {
         info!(
-            count = orders.len(),
-            "Received processed batch for execution"
+            batch_id = ?batch_id,
+            trades = orders.len(),
+            "Execution engine claimed trading batch"
         );
         let started = Instant::now();
         let mut shard_orders: HashMap<AccountId, Vec<Order<Processed>>> = HashMap::new();
@@ -345,40 +385,44 @@ impl MidenExecution {
         }
 
         // Deployment order gives deterministic sequential shard submission.
+        let mut submitted_txs = Vec::new();
+        let mut submitted_trades = 0_usize;
+        let mut failed_chunks = 0_usize;
         for pool_id in self.pools.clone() {
             let Some(shard) = shard_orders.remove(&pool_id) else {
                 continue;
             };
-            match self.execute_shard(batch_id, pool_id, shard.clone()).await {
-                Ok(tx_hash) => {
-                    self.publish_submitted_notifications(&shard, &tx_hash);
-                }
-                Err(e) => {
-                    error!(
-                        pool = %pool_id.to_hex(),
-                        count = shard.len(),
-                        "Shard execution failed: {e:?}"
-                    );
-                    for order in shard {
-                        if let Some(batch_id) = batch_id
-                            && let Err(store_error) =
-                                self.execution_store.mark_pre_submission_failed(
-                                    batch_id,
-                                    &self.worker_id,
-                                    &[order.id],
-                                    &e.to_string(),
-                                    chrono::Utc::now().timestamp_millis() as u64,
-                                )
-                        {
-                            error!(order_id = %order.id, %store_error, "Failed to persist pre-submission failure");
+            for chunk in chunk_orders_for_fpi(shard) {
+                let chunk_len = chunk.len();
+                match self.execute_shard(batch_id, pool_id, chunk).await {
+                    Ok(ShardSubmit { tx_hash, orders }) => {
+                        if tx_hash.is_empty() || orders.is_empty() {
+                            continue;
                         }
+                        submitted_trades += orders.len();
+                        submitted_txs.push(tx_hash.clone());
+                        self.publish_submitted_notifications(&orders, &tx_hash);
+                    }
+                    Err(e) => {
+                        failed_chunks += 1;
+                        error!(
+                            pool = %pool_id.to_hex(),
+                            count = chunk_len,
+                            "Shard execution failed: {e:?}"
+                        );
                     }
                 }
             }
         }
 
         let Some(batch_id) = batch_id else {
-            info!(elapsed = ?started.elapsed(), "Direct integration batch submission finished");
+            info!(
+                trades = submitted_trades,
+                txs = submitted_txs.len(),
+                failed_chunks,
+                submit_ms = started.elapsed().as_millis(),
+                "Direct integration batch submission finished"
+            );
             return;
         };
         let now = chrono::Utc::now().timestamp_millis() as u64;
@@ -387,9 +431,12 @@ impl MidenExecution {
             .begin_reconciliation(batch_id, &self.worker_id, now)
         {
             Ok(true) => {
-                // Submitted orders remain behind the durable single-batch gate until sync observes
-                // commitment or discard. A batch containing only pre-submission failures is
-                // finalized by begin_reconciliation and replayed through the outbox.
+                // Admit gate may release while finality runs. A batch containing only
+                // pre-submission failures is finalized by begin_reconciliation and
+                // replayed through the outbox.
+                let _ = self
+                    .message_broker
+                    .broadcast_amm(AmmEvent::BatchSubmitted);
             }
             Ok(false) => {
                 warn!(%batch_id, "Execution batch lease was no longer owned");
@@ -400,7 +447,47 @@ impl MidenExecution {
                 return;
             }
         }
-        info!(elapsed = ?started.elapsed(), "Logical batch submission phase finished");
+        info!(
+            batch_id = %batch_id,
+            trades = submitted_trades,
+            failed_chunks,
+            tx_hashes = %submitted_txs.join(","),
+            submit_ms = started.elapsed().as_millis(),
+            "Execution batch submitted; awaiting finality"
+        );
+    }
+
+    /// Fail expired intents individually so one stale order cannot abort a whole shard tx.
+    async fn filter_live_orders(
+        &self,
+        batch_id: Option<uuid::Uuid>,
+        orders: Vec<Order<Processed>>,
+    ) -> Vec<Order<Processed>> {
+        let now_secs = chrono::Utc::now().timestamp() as u64;
+        let mut live = Vec::with_capacity(orders.len());
+        for order in orders {
+            if is_expired_at(order.intent().expires_at, now_secs) {
+                warn!(order_id = %order.id, "Signed intent expired before execution");
+                if let Some(batch_id) = batch_id
+                    && let Err(store_error) = self.execution_store.mark_pre_submission_failed(
+                        batch_id,
+                        &self.worker_id,
+                        &[order.id],
+                        "signed intent expired before execution",
+                        chrono::Utc::now().timestamp_millis() as u64,
+                    )
+                {
+                    error!(order_id = %order.id, %store_error, "Failed to persist expiry failure");
+                }
+                let update = OrderUpdate::Failed(
+                    order.failed(OrderFailureReason::Expired, None),
+                );
+                let _ = self.message_broker.broadcast_order_update(update);
+                continue;
+            }
+            live.push(order);
+        }
+        live
     }
 
     fn publish_submitted_notifications(&self, orders: &[Order<Processed>], tx_hash: &str) {
@@ -421,14 +508,25 @@ impl MidenExecution {
             .cloned()
             .map(|order| (order.id, order))
             .collect();
+        let mut confirmed = 0_usize;
+        let mut failed = 0_usize;
+        let mut tx_hashes = Vec::new();
         for outcome in outcomes {
             let Some(order) = orders_by_id.get(&outcome.order_id).cloned() else {
                 continue;
             };
             let update = if let Some(error) = &outcome.error {
+                failed += 1;
                 warn!(order_id = %order.id, %error, "Order execution failed");
                 OrderUpdate::Failed(order.failed(OrderFailureReason::ExecutionError, None))
             } else {
+                confirmed += 1;
+                if let Some(tx_hash) = outcome.tx_hash.as_deref()
+                    && !tx_hash.is_empty()
+                    && !tx_hashes.iter().any(|existing| existing == tx_hash)
+                {
+                    tx_hashes.push(tx_hash.to_owned());
+                }
                 OrderUpdate::Confirmed(
                     order
                         .clone()
@@ -437,6 +535,17 @@ impl MidenExecution {
             };
             let _ = self.message_broker.broadcast_order_update(update);
         }
+        if failed > 0 {
+            let _ = self.message_broker.broadcast_amm(AmmEvent::BatchFailed);
+        }
+        info!(
+            batch_id = %batch_id,
+            trades = outcomes.len(),
+            confirmed,
+            failed,
+            tx_hashes = %tx_hashes.join(","),
+            "Execution batch confirmed"
+        );
         let _ = self.message_broker.broadcast_amm(AmmEvent::OrdersExecuted);
         let now = chrono::Utc::now().timestamp_millis() as u64;
         if let Ok(entries) = self.execution_store.pending_outbox(100) {
@@ -558,11 +667,20 @@ impl MidenExecution {
                         && record.details.final_account_state.to_bytes()
                             == submission.expected_final_state;
                     if commitments_match {
+                        let finality_ms = now.saturating_sub(submission.submitted_at);
                         self.execution_store.confirm_submission(
                             &submission.tx_hash,
                             block_number.as_u32(),
                             now,
                         )?;
+                        info!(
+                            tx_hash = %submission.tx_hash,
+                            pool = %submission.pool_id.to_hex(),
+                            trades = submission.order_ids.len(),
+                            block = block_number.as_u32(),
+                            finality_ms,
+                            "Shard transaction confirmed on chain"
+                        );
                     } else {
                         self.execution_store.fail_submission(
                             &submission.tx_hash,
@@ -607,17 +725,16 @@ impl MidenExecution {
         batch_id: Option<uuid::Uuid>,
         pool_id: AccountId,
         orders: Vec<Order<Processed>>,
-    ) -> Result<String> {
-        info!(
-            cycle = self.cycle,
-            pool = %pool_id.to_hex(),
-            count = orders.len(),
-            "Executing batch on pool shard"
-        );
+    ) -> Result<ShardSubmit> {
+        let cycle = self.cycle;
         self.cycle += 1;
 
+        let orders = self.filter_live_orders(batch_id, orders).await;
         if orders.is_empty() {
-            return Ok(String::new());
+            return Ok(ShardSubmit {
+                tx_hash: String::new(),
+                orders: Vec::new(),
+            });
         }
 
         let instant = Instant::now();
@@ -631,7 +748,6 @@ impl MidenExecution {
             fpi_asset_user_pairs.push((details.asset_in, user_id));
 
             let intent = order.intent();
-
             let msg = intent.message_word();
             let prepared: Vec<Felt> = order.signed_order().to_prepared_signature(msg);
             advice_data.extend_from_slice(&prepared);
@@ -656,27 +772,49 @@ impl MidenExecution {
             )?])
             .build()?;
 
-        let submit_started = Instant::now();
-        let tx_result = self
+        let execute_started = Instant::now();
+        let tx_result = match self
             .pool_client
             .execute_transaction(pool_id, tx_req)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.fail_chunk_orders(batch_id, &orders, &error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let execute_ms = execute_started.elapsed().as_millis();
         let measurements = tx_result.executed_transaction().measurements();
-        info!(
-            total_cycles = measurements.total_cycles(),
-            auth_cycles = measurements.auth_procedure,
-            "Transaction cycle count",
-        );
         let prove_started = Instant::now();
-        let proven_transaction = self
+        let proven_transaction = match self
             .pool_client
             .prove_transaction_with(&tx_result, self.pool_client.prover())
-            .await?;
-        let prove_elapsed = prove_started.elapsed();
-        let submission_height = self
+            .await
+        {
+            Ok(proven) => proven,
+            Err(error) => {
+                self.fail_chunk_orders(batch_id, &orders, &error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let prove_ms = prove_started.elapsed().as_millis();
+        let submit_started = Instant::now();
+        let submission_height = match self
             .pool_client
             .submit_proven_transaction(proven_transaction, &tx_result)
-            .await?;
+            .await
+        {
+            Ok(height) => height,
+            Err(error) => {
+                self.fail_chunk_orders(batch_id, &orders, &error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let submit_ms = submit_started.elapsed().as_millis();
         let transaction_update = self
             .pool_client
             .get_transaction_store_update(&tx_result, submission_height)
@@ -720,22 +858,48 @@ impl MidenExecution {
         {
             warn!(%tx_hash, %error, "Failed to persist local-apply completion");
         }
-        info!(
-            elapsed = ?submit_started.elapsed(),
-            prove_elapsed = ?prove_elapsed,
-            "Shard transaction proven and submitted"
-        );
 
         if let Err(e) = self.pool_client.sync_state().await {
             warn!(%tx_hash, "Shard transaction submitted but client sync failed: {e:?}");
         }
 
         info!(
+            cycle,
             pool = %pool_id.to_hex(),
-            elapsed = ?instant.elapsed(),
-            "Shard batch executed"
+            trades = orders.len(),
+            tx_hash = %tx_hash,
+            total_cycles = measurements.total_cycles(),
+            auth_cycles = measurements.auth_procedure,
+            execute_ms,
+            prove_ms,
+            submit_ms,
+            total_ms = instant.elapsed().as_millis(),
+            "Trading cycle: shard proven and submitted"
         );
-        Ok(tx_hash)
+        Ok(ShardSubmit { tx_hash, orders })
+    }
+
+    async fn fail_chunk_orders(
+        &self,
+        batch_id: Option<uuid::Uuid>,
+        orders: &[Order<Processed>],
+        reason: &str,
+    ) {
+        let Some(batch_id) = batch_id else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        for order in orders {
+            if let Err(store_error) = self.execution_store.mark_pre_submission_failed(
+                batch_id,
+                &self.worker_id,
+                &[order.id],
+                reason,
+                now,
+            ) {
+                error!(order_id = %order.id, %store_error, "Failed to persist pre-submission failure");
+            }
+        }
     }
 
     pub fn pool_id(&self) -> AccountId {
@@ -764,6 +928,80 @@ impl MidenExecution {
 
     pub fn pool_states(&self) -> HashMap<AccountId, PoolState> {
         self.pool_states.clone()
+    }
+}
+
+/// Pack orders into chunks that stay under vault FPI storage-map key limits.
+fn chunk_orders_for_fpi(orders: Vec<Order<Processed>>) -> Vec<Vec<Order<Processed>>> {
+    if orders.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut pairs = Vec::new();
+    for order in orders {
+        let pair = (order.details().asset_in, order.user_id());
+        let would_add_pair = !pairs.contains(&pair);
+        let over_pair_budget =
+            would_add_pair && pairs.len() >= MAX_FPI_ASSET_USER_PAIRS;
+        let over_order_budget = current.len() >= MAX_ORDERS_PER_SHARD_TX;
+        if !current.is_empty() && (over_pair_budget || over_order_budget) {
+            chunks.push(std::mem::take(&mut current));
+            pairs.clear();
+        }
+        if would_add_pair {
+            pairs.push(pair);
+        }
+        current.push(order);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_ORDERS_PER_SHARD_TX, chunk_orders_for_fpi};
+    use crate::order::{Order, OrderExecutionResult};
+    use miden_client::{account::AccountId, auth::AuthSecretKey};
+    use uuid::Uuid;
+
+    fn processed_order(user: AccountId, asset_in: AccountId) -> Order<crate::order::Processed> {
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let asset_out = AccountId::from_hex("0x1e7e8af77fc5f2f1631d5c5ce35471").unwrap();
+        let intent = crate::intent::Intent::new_swap(
+            user,
+            asset_in,
+            10,
+            asset_out,
+            9,
+            Uuid::new_v4(),
+            4_000_000_000,
+        );
+        let signature = key.sign(intent.message_word());
+        Order::new(
+            signature,
+            user,
+            crate::order::OrderDetails::new(asset_in, 10, asset_out, 9),
+            key.public_key(),
+            intent,
+        )
+        .start_processing()
+        .processed(OrderExecutionResult { amount_out: 9 })
+    }
+
+    #[test]
+    fn chunks_respect_max_orders_per_shard_tx() {
+        let user = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
+        let btc = AccountId::from_hex("0x57a179f33b726c315fcfd5e0ff3309").unwrap();
+        let orders = (0..(MAX_ORDERS_PER_SHARD_TX + 3))
+            .map(|_| processed_order(user, btc))
+            .collect();
+        let chunks = chunk_orders_for_fpi(orders);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), MAX_ORDERS_PER_SHARD_TX);
+        assert_eq!(chunks[1].len(), 3);
     }
 }
 

@@ -225,12 +225,13 @@ impl LpWorker {
             tokio::select! {
                 _ = sync_interval.tick() => {
                     if let Err(error) = self.sync_lp_notes().await {
-                        error!(%error, "LP note sync failed");
+                        // Surface the full chain — bare "RPC error" Display is useless for ops.
+                        error!(error = %format!("{error:#}"), "LP note sync failed");
                     }
                 }
                 _ = checkpoint_interval.tick() => {
                     if let Err(error) = self.checkpoint_entitlements().await {
-                        error!(%error, "LP entitlement checkpoint failed");
+                        error!(error = %format!("{error:#}"), "LP entitlement checkpoint failed");
                     }
                 }
                 event = pool_rx.recv() => match event {

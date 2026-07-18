@@ -10,7 +10,7 @@ use crate::{
     lp_store::LpStore,
     message_broker::message_broker::{
         AmmEvent, AnalyticsEvent, LpChainEvent, LpOperationKind, MessageBroker, MessageBrokerEvent,
-        PoolStateEvent, UserEvent,
+        PoolStateEvent, UserEvent, VaultCashFlowEvent, VaultCashFlowKind,
     },
     oracle_sse::OraclePricing,
     order::{Created, Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders},
@@ -28,6 +28,7 @@ use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
     sync::Arc,
+    time::Instant,
 };
 use tokio::{
     select,
@@ -60,18 +61,21 @@ pub struct Processing {
     asset_ids: HashSet<AccountId>,
     pool_ids: HashSet<AccountId>,
     user_pools: HashMap<AccountId, AccountId>,
-    /// Lazy per-(user, faucet) balance mirror: the opening balance is derived from chain
-    /// on first use, then deltas are applied locally. This is only a pre-flight check —
-    /// the on-chain FPI assert in the swap tx remains the real enforcement.
+    /// Lazy per-(user, faucet) spendable-balance mirror for preflight quoting.
+    /// Opening balance is fetched from chain on first miss; FUND / INIT_REDEEM and
+    /// swap deltas keep it warm. On-chain FPI remains the settlement authority.
     balances: HashMap<(AccountId, AccountId), u64>,
     lp_ledger: LpLedger,
     lp_store: Arc<LpStore>,
     lp_chain_rx: Receiver<LpChainEvent>,
+    vault_cashflow_rx: Receiver<VaultCashFlowEvent>,
     lp_recovery_pending: bool,
     execution_store: Arc<ExecutionStore>,
     fee_store: Arc<FeeStore>,
     pending_swaps: HashMap<Uuid, PendingSwap>,
     execution_finished: bool,
+    /// Set when a reconciling batch fails; cleared after reloading pool states from store.
+    pool_resync_required: bool,
     analytics_store: Arc<AnalyticsStore>,
     worker_id: String,
 }
@@ -112,6 +116,7 @@ impl Processing {
         }
 
         let lp_chain_rx = message_broker.subscribe_lp_chain();
+        let vault_cashflow_rx = message_broker.subscribe_vault_cashflow();
         let mut processing = Self {
             oracle_pricing,
             message_broker,
@@ -126,11 +131,13 @@ impl Processing {
             lp_ledger,
             lp_store,
             lp_chain_rx,
+            vault_cashflow_rx,
             lp_recovery_pending: false,
             execution_store,
             fee_store,
             pending_swaps: HashMap::new(),
             execution_finished: false,
+            pool_resync_required: false,
             analytics_store,
             worker_id: format!("processing-{}", Uuid::new_v4()),
         };
@@ -142,8 +149,8 @@ impl Processing {
         self.pool_states.clone()
     }
 
-    /// Returns the user's balance for `faucet_id`, fetching the opening balance from
-    /// chain on the first request for this (user, faucet) pair.
+    /// Returns the user's spendable balance for `faucet_id`. Uses the local mirror when
+    /// warm; on a cold miss, hydrates once from chain.
     async fn balance_of(&mut self, user_id: AccountId, faucet_id: AccountId) -> Result<u64> {
         if let Some(balance) = self.balances.get(&(user_id, faucet_id)) {
             return Ok(*balance);
@@ -151,6 +158,10 @@ impl Processing {
         let balance = self.fetch_balance_from_chain(user_id, faucet_id).await?;
         self.balances.insert((user_id, faucet_id), balance);
         Ok(balance)
+    }
+
+    fn apply_vault_cashflow_event(&mut self, event: VaultCashFlowEvent) {
+        apply_vault_cashflow_to_balances(&mut self.balances, &event);
     }
 
     async fn fetch_balance_from_chain(
@@ -265,6 +276,20 @@ impl Processing {
                         Err(RecvError::Closed) => break,
                     }
                 }
+                cashflow = self.vault_cashflow_rx.recv() => {
+                    match cashflow {
+                        Ok(ev) => MessageBrokerEvent::VaultCashFlow(ev),
+                        Err(RecvError::Lagged(n)) => {
+                            self.message_broker.record_lag("vault_cashflow", n);
+                            warn!(
+                                "vault cashflow events lagged behind by {n} messages; \
+                                 warm balances may be stale until next cold hydrate"
+                            );
+                            continue;
+                        }
+                        Err(RecvError::Closed) => break,
+                    }
+                }
                 fees = fee_state_rx.recv() => {
                     match fees {
                         Ok(ev) => MessageBrokerEvent::FeeState(ev),
@@ -371,14 +396,33 @@ impl Processing {
                 }
             }
             MessageBrokerEvent::Amm(ev) => match ev {
-                AmmEvent::OrdersExecuted => {
-                    // The in-flight batch has been submitted; release the gate and
-                    // pick up any orders that arrived while we were busy.
-                    info!("Batch executed; engine is idle again");
-                    self.execution_finished = true;
-                    self.persist_final_pool_states_if_ready();
+                AmmEvent::BatchSubmitted => {
+                    // Prove/submit finished; admit gate can overlap with finality.
+                    info!("Batch submitted; releasing admit gate for finality overlap");
                     self.engine_busy = false;
                     self.try_start_batch().await;
+                }
+                AmmEvent::BatchFailed => {
+                    warn!(
+                        "Reconciling batch failed; will reload pool states before next claim"
+                    );
+                    self.pool_resync_required = true;
+                    // Pause further claims until resync runs in try_start_batch.
+                    self.engine_busy = true;
+                    self.reload_pool_states_from_store();
+                    self.pool_resync_required = false;
+                    self.engine_busy = false;
+                    self.try_start_batch().await;
+                }
+                AmmEvent::OrdersExecuted => {
+                    info!("Batch terminal; persistence checkpoint");
+                    self.execution_finished = true;
+                    self.persist_final_pool_states_if_ready();
+                    // Safety net if BatchSubmitted was missed (lag / restart).
+                    if self.engine_busy {
+                        self.engine_busy = false;
+                        self.try_start_batch().await;
+                    }
                 }
                 _ => {}
             },
@@ -393,6 +437,9 @@ impl Processing {
                     error!(note_id = %ev.note_id, %error, "failed to apply LP chain event");
                     self.lp_recovery_pending = true;
                 }
+            }
+            MessageBrokerEvent::VaultCashFlow(ev) => {
+                self.apply_vault_cashflow_event(ev);
             }
             MessageBrokerEvent::FeeState(ev) => {
                 apply_fee_states(&mut self.pool_states, &ev.fee_states);
@@ -608,18 +655,21 @@ impl Processing {
         });
     }
 
-    /// Start processing a batch of new orders if the engine is idle.
-    /// Only one batch is allowed in flight at a time; the gate is released when
-    /// the execution engine reports `AmmEvent::OrdersSettled`.
+    /// Start processing a batch of new orders if prove/submit is idle.
+    /// The admit gate is released on `AmmEvent::BatchSubmitted` (overlap with finality).
     async fn try_start_batch(&mut self) {
         if self.engine_busy {
             return;
+        }
+        if self.pool_resync_required {
+            self.reload_pool_states_from_store();
+            self.pool_resync_required = false;
         }
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let batch =
             match self
                 .execution_store
-                .claim_admitted_orders(&self.worker_id, now, 600_000, 100)
+                .claim_admitted_orders(&self.worker_id, now, 600_000, 32)
             {
                 Ok(batch) => batch,
                 Err(error) => {
@@ -630,12 +680,42 @@ impl Processing {
         if batch.is_empty() {
             return;
         }
-        info!(count = batch.len(), "Starting processing batch");
+        info!(trades = batch.len(), "Trading cycle: quoting admitted orders");
         self.engine_busy = true;
         self.execution_finished = false;
+        let started = Instant::now();
+        let trade_count = batch.len();
         if let Err(e) = self.process_orders(batch).await {
             error!("Failed to process orders: {e:?}");
             self.engine_busy = false;
+        } else {
+            info!(
+                trades = trade_count,
+                process_ms = started.elapsed().as_millis(),
+                "Trading cycle: quotes ready, batch handed to execution"
+            );
+        }
+    }
+
+    fn reload_pool_states_from_store(&mut self) {
+        match self.execution_store.latest_pool_states() {
+            Ok(states) => {
+                let mut reloaded = 0_usize;
+                for (faucet_id, state) in states {
+                    if self.pool_states.contains_key(&faucet_id) {
+                        self.pool_states.insert(faucet_id, state);
+                        reloaded += 1;
+                    }
+                }
+                info!(reloaded, "Reloaded pool states from execution store");
+                let _ = self.message_broker.broadcast_pool_state(PoolStateEvent {
+                    pool_states: self.pool_states.clone(),
+                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                });
+            }
+            Err(error) => {
+                error!(%error, "Failed to reload pool states after batch failure");
+            }
         }
     }
 
@@ -769,13 +849,10 @@ impl Processing {
             }
             let quote = quote.credit_to(U256::from(details.min_amount_out));
 
-            // Always refresh the spendable sell balance. INIT_REDEEM can reduce available
-            // funds without notifying this process, so a cached value is not authoritative.
-            let sell_balance = match self.fetch_balance_from_chain(user_id, sell_faucet).await {
-                Ok(balance) => {
-                    self.balances.insert((user_id, sell_faucet), balance);
-                    balance
-                }
+            // Local mirror is server preflight truth; vault cashflows + swap deltas keep
+            // it warm. Cold miss hydrates once from chain; FPI remains settlement authority.
+            let sell_balance = match self.balance_of(user_id, sell_faucet).await {
+                Ok(balance) => balance,
                 Err(e) => {
                     warn!(order_id = %order.id, "Sell balance fetch failed: {e:?}");
                     let failed = order.failed(OrderFailureReason::ExecutionError);
@@ -788,7 +865,7 @@ impl Processing {
                     order_id = %order.id,
                     available = sell_balance,
                     requested = details.amount_in,
-                    "Insufficient sell balance after chain refresh"
+                    "Insufficient sell balance"
                 );
                 let failed = order.failed(OrderFailureReason::InsufficientBalance);
                 self.publish_order_update(OrderUpdate::Failed(failed))?;
@@ -1148,5 +1225,89 @@ fn revert_u256(current: U256, before: U256, after: U256) -> U256 {
         current.saturating_sub(after - before)
     } else {
         current.saturating_add(before - after)
+    }
+}
+
+/// Apply a vault cashflow to the spendable-balance mirror used for quote preflight.
+fn apply_vault_cashflow_to_balances(
+    balances: &mut HashMap<(AccountId, AccountId), u64>,
+    event: &VaultCashFlowEvent,
+) {
+    let key = (event.user_id, event.faucet_id);
+    match event.kind {
+        VaultCashFlowKind::Fund => {
+            let entry = balances.entry(key).or_insert(0);
+            *entry = entry.saturating_add(event.amount);
+        }
+        VaultCashFlowKind::InitRedeem => {
+            if let Some(balance) = balances.get_mut(&key) {
+                *balance = balance.saturating_sub(event.amount);
+            }
+        }
+        VaultCashFlowKind::Redeem => {
+            // Available was already reduced at INIT_REDEEM; completed redeem is a no-op.
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VaultCashFlowEvent, VaultCashFlowKind, apply_vault_cashflow_to_balances};
+    use miden_client::account::AccountId;
+    use std::collections::HashMap;
+
+    fn user() -> AccountId {
+        AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap()
+    }
+
+    fn faucet() -> AccountId {
+        AccountId::from_hex("0x57a179f33b726c315fcfd5e0ff3309").unwrap()
+    }
+
+    fn event(kind: VaultCashFlowKind, amount: u64) -> VaultCashFlowEvent {
+        VaultCashFlowEvent {
+            user_id: user(),
+            faucet_id: faucet(),
+            amount,
+            kind,
+        }
+    }
+
+    #[test]
+    fn fund_inserts_and_increments_available() {
+        let mut balances = HashMap::new();
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Fund, 1_000));
+        assert_eq!(balances.get(&(user(), faucet())), Some(&1_000));
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Fund, 250));
+        assert_eq!(balances.get(&(user(), faucet())), Some(&1_250));
+    }
+
+    #[test]
+    fn init_redeem_reduces_warm_balance_and_leaves_cold_untouched() {
+        let mut balances = HashMap::new();
+        apply_vault_cashflow_to_balances(
+            &mut balances,
+            &event(VaultCashFlowKind::InitRedeem, 100),
+        );
+        assert!(balances.is_empty());
+
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Fund, 500));
+        apply_vault_cashflow_to_balances(
+            &mut balances,
+            &event(VaultCashFlowKind::InitRedeem, 200),
+        );
+        assert_eq!(balances.get(&(user(), faucet())), Some(&300));
+    }
+
+    #[test]
+    fn redeem_does_not_double_subtract() {
+        let mut balances = HashMap::new();
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Fund, 500));
+        apply_vault_cashflow_to_balances(
+            &mut balances,
+            &event(VaultCashFlowKind::InitRedeem, 200),
+        );
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Redeem, 200));
+        assert_eq!(balances.get(&(user(), faucet())), Some(&300));
     }
 }

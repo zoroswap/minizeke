@@ -50,6 +50,9 @@ impl Metrics {
         if let Some(auth) = measurement.auth {
             trader.auth.push(auth);
         }
+        if let Some(auth_wait) = measurement.auth_wait {
+            trader.auth_wait.push(auth_wait);
+        }
         trader.order.push(measurement.order);
         trader.cycle.push(measurement.cycle);
     }
@@ -94,7 +97,7 @@ impl Metrics {
             }
             println!(
                 "  trader={index} tier={} trades={} ok={} 429={} rejected={} failed={} \
-                 oracle[p50/p95]={}/{}ms auth={}/{}ms order={}/{}ms cycle={}/{}ms",
+                 oracle[p50/p95]={}/{}ms auth={}/{}ms auth_wait={}/{}ms order={}/{}ms cycle={}/{}ms",
                 trader.tier.label(),
                 trader.attempted,
                 trader.accepted,
@@ -105,6 +108,8 @@ impl Metrics {
                 trader.oracle.percentile(95),
                 trader.auth.percentile(50),
                 trader.auth.percentile(95),
+                trader.auth_wait.percentile(50),
+                trader.auth_wait.percentile(95),
                 trader.order.percentile(50),
                 trader.order.percentile(95),
                 trader.cycle.percentile(50),
@@ -138,6 +143,7 @@ pub struct TradeMeasurement {
     pub outcome: OrderOutcome,
     pub oracle: Duration,
     pub auth: Option<Duration>,
+    pub auth_wait: Option<Duration>,
     pub order: Duration,
     pub cycle: Duration,
 }
@@ -156,6 +162,7 @@ struct TraderMetrics {
     failed: u64,
     oracle: Samples,
     auth: Samples,
+    auth_wait: Samples,
     order: Samples,
     cycle: Samples,
     setup_mint: Samples,
@@ -174,6 +181,7 @@ impl TraderMetrics {
             failed: 0,
             oracle: Samples::default(),
             auth: Samples::default(),
+            auth_wait: Samples::default(),
             order: Samples::default(),
             cycle: Samples::default(),
             setup_mint: Samples::default(),

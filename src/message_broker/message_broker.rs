@@ -84,6 +84,10 @@ impl StatsEvent {
 pub enum AmmEvent {
     StartProcessing,
     OrdersProcessed,
+    /// Batch txs were submitted; admit gate may release while finality runs.
+    BatchSubmitted,
+    /// A reconciling batch reached terminal with at least one failed order.
+    BatchFailed,
     OrdersExecuted,
     OrdersSettled,
 }
@@ -93,6 +97,23 @@ pub struct UserEvent {
     pub user_id: AccountId,
     pub faucet_id: AccountId,
     pub amount: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultCashFlowKind {
+    Fund,
+    InitRedeem,
+    Redeem,
+}
+
+/// Vault FUND / INIT_REDEEM / REDEEM observed by analytics. Processing applies these to its
+/// local spendable-balance mirror so quoting does not need per-order chain RPC.
+#[derive(Debug, Clone)]
+pub struct VaultCashFlowEvent {
+    pub user_id: AccountId,
+    pub faucet_id: AccountId,
+    pub amount: u64,
+    pub kind: VaultCashFlowKind,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +143,7 @@ pub enum MessageBrokerEvent {
     User(UserEvent),
     Trade(TradeEvent),
     LpChain(LpChainEvent),
+    VaultCashFlow(VaultCashFlowEvent),
     FeeState(FeeStateEvent),
     Analytics(AnalyticsEvent),
 }
@@ -138,6 +160,7 @@ pub struct MessageBroker {
     pub trades_tx: broadcast::Sender<TradeEvent>,
     pub lp_chain_tx: broadcast::Sender<LpChainEvent>,
     pub lp_applied_tx: broadcast::Sender<LpAppliedEvent>,
+    pub vault_cashflow_tx: broadcast::Sender<VaultCashFlowEvent>,
     pub fee_state_tx: broadcast::Sender<FeeStateEvent>,
     pub analytics_tx: broadcast::Sender<AnalyticsEvent>,
     metrics: Arc<BrokerMetrics>,
@@ -179,6 +202,8 @@ impl MessageBroker {
         let (trades_tx, _) = broadcast::channel(capacity("BROKER_TRADE_CAPACITY", 1000));
         let (lp_chain_tx, _) = broadcast::channel(capacity("BROKER_LP_CAPACITY", 100));
         let (lp_applied_tx, _) = broadcast::channel(capacity("BROKER_LP_APPLIED_CAPACITY", 100));
+        let (vault_cashflow_tx, _) =
+            broadcast::channel(capacity("BROKER_VAULT_CASHFLOW_CAPACITY", 500));
         let (fee_state_tx, _) = broadcast::channel(capacity("BROKER_FEE_STATE_CAPACITY", 20));
         let (analytics_tx, _) = broadcast::channel(capacity("BROKER_ANALYTICS_CAPACITY", 100));
 
@@ -193,6 +218,7 @@ impl MessageBroker {
             trades_tx,
             lp_chain_tx,
             lp_applied_tx,
+            vault_cashflow_tx,
             fee_state_tx,
             analytics_tx,
             metrics: Arc::new(BrokerMetrics::default()),
@@ -201,7 +227,7 @@ impl MessageBroker {
 
     pub fn channel_class(channel: &str) -> Option<ChannelClass> {
         match channel {
-            "order" | "processed_batch" | "lp" | "lp_applied" | "fee_state" => {
+            "order" | "processed_batch" | "lp" | "lp_applied" | "fee_state" | "vault_cashflow" => {
                 Some(ChannelClass::DurableWakeup)
             }
             "oracle" | "stats" | "pool_state" => Some(ChannelClass::BestEffortCoalesced),
@@ -334,6 +360,14 @@ impl MessageBroker {
         Ok(())
     }
 
+    pub fn broadcast_vault_cashflow(&self, event: VaultCashFlowEvent) -> Result<()> {
+        if let Err(error) = self.vault_cashflow_tx.send(event) {
+            self.record_unobserved();
+            warn!("Failed to broadcast vault cashflow event: {error}");
+        }
+        Ok(())
+    }
+
     pub fn broadcast_fee_state(&self, event: FeeStateEvent) -> Result<()> {
         if let Err(error) = self.fee_state_tx.send(event) {
             self.record_unobserved();
@@ -399,6 +433,10 @@ impl MessageBroker {
 
     pub fn subscribe_lp_applied(&self) -> broadcast::Receiver<LpAppliedEvent> {
         self.lp_applied_tx.subscribe()
+    }
+
+    pub fn subscribe_vault_cashflow(&self) -> broadcast::Receiver<VaultCashFlowEvent> {
+        self.vault_cashflow_tx.subscribe()
     }
 
     pub fn subscribe_fee_state(&self) -> broadcast::Receiver<FeeStateEvent> {

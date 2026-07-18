@@ -95,7 +95,15 @@ Optional values:
   expose it through the public reverse proxy.
 - `FAUCET_MINT_AMOUNT`: amount minted per request. Default: `10000000`.
 - `FAUCET_MINT_COOLDOWN_SECS`: cooldown per recipient and faucet. Default: `240`.
+- `FAUCET_BATCH_SIZE`: max concurrent mint requests packed into one faucet
+  transaction per faucet id (standard multi-note `send_notes` mint). Default: `32`.
 - `ASSETS_FILE`: deploy-time asset config. Default: `assets.toml`.
+
+`simulate_traders` setup also accepts `--setup-concurrency` (default `8`) for parallel
+per-trader consume/register/fund workers. Before trading it warms auth sessions with
+`--auth-warmup-gap-ms` (default `3500`) so challenge/login stays under
+`RATE_LIMIT_AUTH_PER_MINUTE` (default `20`). For faster local/staging load tests,
+raise that server env (e.g. `RATE_LIMIT_AUTH_PER_MINUTE=120`).
 
 ## Deploy
 

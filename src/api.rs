@@ -1392,10 +1392,11 @@ async fn order_new(
             "v2 pool intents require AUTH_DOMAIN=minizeke and MIDEN_NETWORK=testnet",
         ));
     }
-    let now = Utc::now().timestamp() as u64;
-    if is_expired_at(payload.expires_at, now) {
+    let now_secs = Utc::now().timestamp() as u64;
+    if is_expired_at(payload.expires_at, now_secs) {
         return Ok(bad_request("signed intent has expired"));
     }
+    let created_at_ms = Utc::now().timestamp_millis() as u64;
     let authenticated = match authenticated_user(&state, &headers).await {
         Ok(user) => user,
         Err(response) => return Ok(response),
@@ -1494,7 +1495,7 @@ async fn order_new(
                 client_order_id,
                 &intent_commitment,
                 &candidate_for_db,
-                now,
+                created_at_ms,
             )?)
         })
         .await
