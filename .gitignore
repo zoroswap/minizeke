@@ -1,6 +1,10 @@
 /target
 /keystore
+/simulate_keystore
 store.sqlite3
 .env
 store.*.sqlite3
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 .DS_Store

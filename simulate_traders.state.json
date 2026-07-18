@@ -1,0 +1,56 @@
+{
+  "network": "testnet",
+  "vault_id": "0x1a381b8e3e5b0a917fe91ce8574230",
+  "traders": [
+    {
+      "index": 0,
+      "user_id": "0xff5ee5719f885b317995ce349f5a85",
+      "public_key_commitment": "0x1904161b35f6b1cbbe1438fe3c1d961e2a1fc0574e5b0f66ef5b79cd5a6f8a96"
+    },
+    {
+      "index": 1,
+      "user_id": "0xe2d8fe660fbde3f1195e1236d0b9d3",
+      "public_key_commitment": "0x5db7300e8eb51f36d176184544adc2331c48a58349e75be7c1c889a50c42e9ad"
+    },
+    {
+      "index": 2,
+      "user_id": "0x429d9c32f16892715fce69db3cf5fe",
+      "public_key_commitment": "0x1b1467cee26a39973c654c28e0a5c51864ee559a9454a1cc7a3f52ab7e7085b4"
+    },
+    {
+      "index": 3,
+      "user_id": "0xd940e424c9d169310135ce5d5334ab",
+      "public_key_commitment": "0x187af6734f8ef7e0e9036e368ae3a15320b3dbc23979b3dfee804510cc36ed6c"
+    },
+    {
+      "index": 4,
+      "user_id": "0xa5b6248b40a095d1695f16c8b5c8b7",
+      "public_key_commitment": "0x38da0fb668273e2abe6d5f1bc9f7c8c480143021c5d69f57490b8180da1ccb05"
+    },
+    {
+      "index": 5,
+      "user_id": "0x144c93b9215321d1383f3760fcfba3",
+      "public_key_commitment": "0x4489313b15b29a13dc116dd536f21b7923fe8c180a122ae921f47d6efdcc368f"
+    },
+    {
+      "index": 6,
+      "user_id": "0x9c640d0b45c1ea51581150899d161a",
+      "public_key_commitment": "0x4354f479e3b830b6a039195a8b75df66e0e39be5a5af31bccb3eee2f79d1197c"
+    },
+    {
+      "index": 7,
+      "user_id": "0xc1669d2ed37803d10e80fea975e68e",
+      "public_key_commitment": "0xadc3a9bef371daaf35866e993d34b7b8fac18989cf2e8179a5a11ec25e2d054b"
+    },
+    {
+      "index": 8,
+      "user_id": "0x3de7b0a5ab5a561121452651e43a1e",
+      "public_key_commitment": "0x996ad58a012ba33d6f220de59d843f76b851fd7824706f176ea53a4d6d567c17"
+    },
+    {
+      "index": 9,
+      "user_id": "0x15ddb8330add45d156d51564d7ba49",
+      "public_key_commitment": "0xd2ec72a2a4fe7feec97fd69c7f2323e2912f5f21bb0035af24fc3f0d0bea6302"
+    }
+  ]
+}

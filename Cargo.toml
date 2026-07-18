@@ -11,6 +11,7 @@ anyhow = "1.0.102"
 axum = { version = "0.8.4", features = ["macros", "tokio", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = "6.2.1"
 dotenv = "0.15.0"
 futures-util = "0.3.31"
@@ -35,6 +36,7 @@ tokio = { version = "1.46", features = [
   "macros",
   "net",
   "rt-multi-thread",
+  "signal",
   "sync",
   "time",
 ] }

@@ -294,6 +294,8 @@ impl Processing {
                 let is_new = matches!(ev, OrderUpdate::New(_));
                 match &ev {
                     OrderUpdate::Confirmed(order) => {
+                        // Production lifecycle: Submitted → Confirmed is chain-observed terminal
+                        // success. Executed/Settled are not emitted by the current backend.
                         let now = chrono::Utc::now().timestamp_millis() as u64;
                         let pending = self.pending_swaps.remove(&order.id).or_else(|| {
                             self.execution_store

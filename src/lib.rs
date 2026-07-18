@@ -29,6 +29,7 @@ pub mod price;
 pub mod processing;
 pub mod serde;
 pub mod service_auth;
+pub mod simulate;
 pub mod store;
 pub mod test_utils;
 pub mod user;
