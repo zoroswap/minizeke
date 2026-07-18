@@ -7,7 +7,7 @@ use crate::{
 };
 
 /// Messages sent from client to server
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
     Authenticate { token: String },

@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::{
     analytics_store::{AnalyticsStore, Pagination},
     auth::AuthStore,
-    execution_store::{ExecutionStore, IntentReservation},
+    execution_store::{AdmitError, ExecutionStore, IntentReservation},
     faucet::{DEFAULT_FAUCET_SERVER_URL, MintRequest},
     fee_store::{FeeBatchRequest, FeeStore, FeeUpdateSource},
     history::HistoryStore,
@@ -1290,8 +1290,15 @@ async fn user_placement(State(state): State<AppState>, Path(id): Path<String>) -
             return service_unavailable("user placement is unavailable");
         }
     };
-    if !state.store.pools().contains(&pool_id) {
-        return service_unavailable("assigned pool shard is not configured");
+    if !state.store.has_pool(&pool_id) {
+        match state.store.ensure_pool_listed(pool_id) {
+            Ok(true) => {}
+            Ok(false) => return service_unavailable("assigned pool shard is not configured"),
+            Err(error) => {
+                warn!(%error, pool = %pool_id.to_hex(), "failed to hot-attach pool from deployment");
+                return service_unavailable("assigned pool shard is not configured");
+            }
+        }
     }
     let pool_storage = match state
         .work_limits
@@ -1501,7 +1508,15 @@ async fn order_new(
         .await
     {
         Ok(reservation) => reservation,
-        Err(error) => return Ok(service_unavailable_retry(error.to_string())),
+        Err(error) => {
+            let root = error.root_cause();
+            if root.downcast_ref::<AdmitError>() == Some(&AdmitError::QueueFull)
+                || error.to_string().contains("execution queue is full")
+            {
+                return Ok(service_unavailable_retry("execution queue is full"));
+            }
+            return Ok(service_unavailable_retry(error.to_string()));
+        }
     };
     let (lifecycle_id, should_publish) = match reservation {
         IntentReservation::New { order_id } => (order_id, true),

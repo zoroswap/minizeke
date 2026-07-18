@@ -22,6 +22,12 @@ use crate::{faucet::MintRequest, intent::INTENT_VERSION, order::OrderDetails};
 /// Caps concurrent challenge+login pairs so we do not stampede the server's
 /// `MIDEN_RPC_MAX_CONCURRENCY` vault lookups (default 8) or auth rate bucket.
 const AUTH_CONCURRENCY: usize = 4;
+/// Faucet proves serially under load; pile-ups just hit the HTTP timeout.
+const FAUCET_MINT_CONCURRENCY: usize = 1;
+/// Per-request wait for a slow faucet prove/submit under staging load.
+const FAUCET_MINT_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+/// Cap how long one (recipient, faucet) mint may retry before failing the onboard.
+const FAUCET_MINT_RETRY_BUDGET: Duration = Duration::from_secs(900);
 
 #[derive(Clone)]
 pub struct SimulationApi {
@@ -30,6 +36,7 @@ pub struct SimulationApi {
     faucet_url: String,
     faucet_token: Option<String>,
     auth_slots: Arc<Semaphore>,
+    mint_slots: Arc<Semaphore>,
 }
 
 impl SimulationApi {
@@ -38,7 +45,7 @@ impl SimulationApi {
         faucet_url: impl Into<String>,
         faucet_token: Option<String>,
     ) -> Result<Self> {
-        // Mint batches can spend a long time proving; concurrent setup waits share that cost.
+        // Default timeout for auth/orders; mint overrides per-request.
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -49,28 +56,59 @@ impl SimulationApi {
             faucet_url: normalize_url(faucet_url.into()),
             faucet_token,
             auth_slots: Arc::new(Semaphore::new(AUTH_CONCURRENCY)),
+            mint_slots: Arc::new(Semaphore::new(FAUCET_MINT_CONCURRENCY)),
         })
     }
 
-    /// Mint once. On faucet cooldown, sleeps the reported wait and retries until success.
+    /// Mint once. Retries faucet cooldown and transient transport/timeouts until success
+    /// or [`FAUCET_MINT_RETRY_BUDGET`] elapses.
     pub async fn mint(&self, user_id: AccountId, faucet_id: AccountId) -> Result<Duration> {
         let started = Instant::now();
+        let deadline = Instant::now() + FAUCET_MINT_RETRY_BUDGET;
+        let mut attempt = 0_u32;
         loop {
+            attempt = attempt.saturating_add(1);
+            let _slot = self
+                .mint_slots
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("faucet mint concurrency closed"))?;
             match self.mint_once(user_id, faucet_id).await {
                 Ok(()) => return Ok(started.elapsed()),
                 Err(error) => {
-                    let message = error.to_string();
+                    drop(_slot);
+                    let message = format!("{error:#}");
                     if let Some(wait_secs) = parse_cooldown_secs(&message) {
                         warn!(
                             recipient = %user_id.to_hex(),
                             faucet = %faucet_id.to_hex(),
                             wait_secs,
+                            attempt,
                             "faucet mint cooldown; waiting"
                         );
                         tokio::time::sleep(Duration::from_secs(wait_secs.max(1))).await;
                         continue;
                     }
-                    return Err(error);
+                    if is_transient_mint_error(&message) && Instant::now() < deadline {
+                        let wait_secs = 2_u64.saturating_pow(attempt.min(5)).min(30);
+                        warn!(
+                            recipient = %user_id.to_hex(),
+                            faucet = %faucet_id.to_hex(),
+                            attempt,
+                            wait_secs,
+                            %error,
+                            "faucet mint transient failure; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "faucet mint failed for recipient {} faucet {} after {attempt} attempt(s)",
+                            user_id.to_hex(),
+                            faucet_id.to_hex()
+                        )
+                    });
                 }
             }
         }
@@ -84,6 +122,7 @@ impl SimulationApi {
         let response = self
             .client
             .post(format!("{}/mint", self.faucet_url))
+            .timeout(FAUCET_MINT_HTTP_TIMEOUT)
             .bearer_auth(token)
             .json(&MintRequest {
                 address: user_id.to_hex(),
@@ -91,7 +130,13 @@ impl SimulationApi {
             })
             .send()
             .await
-            .context("send faucet mint request")?;
+            .with_context(|| {
+                format!(
+                    "send faucet mint request (recipient={} faucet={})",
+                    user_id.to_hex(),
+                    faucet_id.to_hex()
+                )
+            })?;
         ensure_success(response, "faucet mint").await
     }
 
@@ -210,23 +255,45 @@ impl SimulationApi {
             .context("submit order request")?;
         let latency = started.elapsed();
         let status = response.status();
+        let retry_after = retry_after_header(&response);
         let body = response.text().await.context("read order response")?;
-        let outcome = if status.is_success() {
-            OrderOutcome::Accepted
-        } else if status == StatusCode::TOO_MANY_REQUESTS {
-            OrderOutcome::RateLimited
+        let (outcome, order_id) = if status.is_success() {
+            let order_id = parse_admitted_order_id(&body);
+            (OrderOutcome::Accepted, order_id)
+        } else if status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::SERVICE_UNAVAILABLE
+        {
+            // Ingress rate limits and execution-queue backpressure both mean "retry later".
+            (OrderOutcome::RateLimited, None)
         } else if status.is_client_error() {
-            OrderOutcome::Rejected
+            (OrderOutcome::Rejected, None)
         } else {
-            OrderOutcome::Failed
+            (OrderOutcome::Failed, None)
         };
         Ok(OrderResponse {
             outcome,
             status,
             body,
             latency,
+            retry_after,
+            order_id,
         })
     }
+
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdmittedOrderData {
+    id: Uuid,
+}
+
+fn parse_admitted_order_id(body: &str) -> Option<Uuid> {
+    serde_json::from_str::<ApiResponse<AdmittedOrderData>>(body)
+        .ok()
+        .map(|response| response.data.id)
 }
 
 #[derive(Debug, Clone)]
@@ -250,10 +317,18 @@ impl Session {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderOutcome {
+    /// HTTP admit succeeded (pre-WS). Prefer Confirmed after fill wait.
     Accepted,
+    /// WebSocket reported Confirmed.
+    Confirmed,
     RateLimited,
     Rejected,
+    /// Admit failure, execution Failed, or WS timeout.
     Failed,
+    /// Admitted then WebSocket Failed.
+    ExecutionFailed,
+    /// Admitted but no terminal WS update before timeout.
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -262,6 +337,10 @@ pub struct OrderResponse {
     pub status: StatusCode,
     pub body: String,
     pub latency: Duration,
+    /// From `Retry-After` on 429/503; used by the trader loop to back off.
+    pub retry_after: Option<u64>,
+    /// Server lifecycle id from admit response (`data.id`), when accepted.
+    pub order_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,6 +451,21 @@ fn parse_cooldown_secs(message: &str) -> Option<u64> {
         return None;
     }
     digits.parse().ok()
+}
+
+fn is_transient_mint_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection")
+        || lower.contains("connect")
+        || lower.contains("reset")
+        || lower.contains("broken pipe")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("504")
+        || lower.contains("429")
 }
 
 #[cfg(test)]

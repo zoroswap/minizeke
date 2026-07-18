@@ -129,7 +129,8 @@ pub async fn initialize() -> Result<FaucetService> {
                 runtime.block_on(worker.run(receiver));
             }
             Err(error) => {
-                let _ = started_tx.send(Err(error.to_string()));
+                // Prefer alternate formatting — ClientError's Display omits the cause.
+                let _ = started_tx.send(Err(format!("{error:#}")));
             }
         }
     });
@@ -153,7 +154,10 @@ impl FaucetWorker {
     ) -> Result<Self> {
         let mut client = get_faucet_client().await?;
         client.ensure_genesis_in_place().await?;
-        client.sync_state().await?;
+        // Public mint notes only — skip note-transport sync. The faucet store can
+        // accumulate more note tags than NTL allows (max 128), which makes
+        // `sync_state` fail with "Too many tags in fetch_notes request".
+        client.sync_chain().await?;
         let supported_faucets: Vec<_> = deployment
             .assets
             .iter()
@@ -162,7 +166,7 @@ impl FaucetWorker {
         for faucet_id in &supported_faucets {
             client.import_account_by_id(*faucet_id).await?;
         }
-        client.sync_state().await?;
+        client.sync_chain().await?;
         info!(
             assets = supported_faucets.len(),
             mint_amount,

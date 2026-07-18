@@ -2,17 +2,19 @@ use crate::{
     deployment::AssetInfo,
     order::{OrderUpdate, Orders},
     pool::PoolState,
+    pool_registry::PoolRegistry,
 };
+use anyhow::Result;
 use dashmap::DashMap;
 use miden_client::account::AccountId;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 pub struct Store {
     orders: Orders,
     vault_id: AccountId,
     assets: Vec<AssetInfo>,
-    pools: Vec<AccountId>,
+    pool_registry: Arc<PoolRegistry>,
     pool_states: DashMap<AccountId, PoolState>,
     oracle_prices: DashMap<AccountId, u64>,
 }
@@ -21,13 +23,13 @@ impl Store {
     pub fn new(
         vault_id: AccountId,
         assets: Vec<AssetInfo>,
-        pools: Vec<AccountId>,
+        pool_registry: Arc<PoolRegistry>,
         pool_states: HashMap<AccountId, PoolState>,
     ) -> Self {
         let store = Self {
             vault_id,
             assets,
-            pools,
+            pool_registry,
             orders: Orders::default(),
             pool_states: DashMap::new(),
             oracle_prices: DashMap::new(),
@@ -55,15 +57,24 @@ impl Store {
     }
 
     pub fn pool_id(&self) -> AccountId {
-        self.pools[0]
+        self.pool_registry.pools()[0]
     }
 
     pub fn vault_id(&self) -> AccountId {
         self.vault_id
     }
 
-    pub fn pools(&self) -> &[AccountId] {
-        &self.pools
+    pub fn pools(&self) -> Vec<AccountId> {
+        self.pool_registry.pools()
+    }
+
+    pub fn has_pool(&self, pool_id: &AccountId) -> bool {
+        self.pool_registry.contains(pool_id)
+    }
+
+    /// Hot-attach a pool listed in deployment.json but missing at process start.
+    pub fn ensure_pool_listed(&self, pool_id: AccountId) -> Result<bool> {
+        self.pool_registry.ensure_from_deployment(pool_id)
     }
 
     pub fn assets(&self) -> &[AssetInfo] {

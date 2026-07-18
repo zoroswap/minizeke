@@ -45,11 +45,11 @@ pub struct Config {
     /// Base interval for high-frequency traders, in seconds.
     #[arg(long, default_value_t = 20)]
     pub hf_interval: u64,
-    /// Uniform interval jitter as a fraction (0.2 means +/-20%).
-    #[arg(long, default_value_t = 0.2)]
+    /// Uniform interval jitter as a fraction (0.5 means +/-50%).
+    #[arg(long, default_value_t = 0.5)]
     pub jitter: f64,
-    /// Delay between launching each trader at startup (ms). Spreads the initial
-    /// trade stampede after sessions are warmed.
+    /// Unused by trade loops (kept for CLI compatibility). Traders desync with a
+    /// random initial delay in `[0, tier_interval]` instead of index-based stagger.
     #[arg(long, default_value_t = 400)]
     pub start_stagger_ms: u64,
     /// Gap between successive auth warmups (ms). Keeps challenge+login under
@@ -67,8 +67,9 @@ pub struct Config {
     /// Oracle-price cushion applied to min_amount_out.
     #[arg(long, default_value_t = 500)]
     pub slippage_bps: u16,
-    /// Signed intent lifetime in seconds. Must cover queueing under load before
-    /// the execution engine proves the swap (default 30 minutes).
+    /// Signed intent lifetime in seconds. Should stay ≥ server `MAX_ADMITTED_AGE_MS`
+    /// (default 60s); the server fails over-age admitted orders as `stale_queue`
+    /// before quote. Default 30 minutes covers prove/submit after admit.
     #[arg(long, default_value_t = 1_800)]
     pub intent_ttl_secs: u64,
 
@@ -110,6 +111,10 @@ pub struct Config {
     /// Max concurrent per-trader setup workers (consume/register/fund). Default: 8.
     #[arg(long, default_value_t = 8)]
     pub setup_concurrency: usize,
+    /// Max traders bound to one pool shard at registration. Extra pools are spawned
+    /// and activated in waves so load can execute across shards in parallel.
+    #[arg(long, env = "MAX_USERS_PER_POOL", default_value_t = 16)]
+    pub max_users_per_pool: usize,
 
     /// Create, register, and fund traders, then exit.
     #[arg(long, conflicts_with = "skip_setup")]
@@ -123,6 +128,28 @@ pub struct Config {
     /// Interval between aggregate metric summaries, in seconds.
     #[arg(long, default_value_t = 30)]
     pub summary_interval: u64,
+
+    /// Wait this long for a WebSocket Confirmed/Failed after admit (seconds).
+    #[arg(long, default_value_t = 120)]
+    pub order_timeout_secs: u64,
+
+    /// Keep onboarding new traders until --max-traders while the sim runs.
+    #[arg(long)]
+    pub keep_increasing: bool,
+    /// Cap for --keep-increasing (default 100).
+    #[arg(long, default_value_t = 100)]
+    pub max_traders: usize,
+    /// Seconds between starting live onboardings when --keep-increasing is set.
+    #[arg(long, default_value_t = 5)]
+    pub grow_interval_secs: u64,
+
+    /// Seconds between vault fund/init_redeem/redeem cycles (`0` disables).
+    #[arg(long, default_value_t = 180)]
+    pub vault_cycle_interval_secs: u64,
+    /// Base units for each vault fund/redeem round-trip.
+    #[arg(long, default_value_t = 10_000)]
+    pub vault_cycle_amount: u64,
+
     /// Increase logging verbosity (-v or -vv).
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -135,6 +162,24 @@ impl Config {
         }
         if self.setup_concurrency == 0 {
             bail!("--setup-concurrency must be at least 1");
+        }
+        if self.max_users_per_pool == 0 {
+            bail!("--max-users-per-pool must be at least 1");
+        }
+        if self.keep_increasing && self.max_traders < self.num_traders {
+            bail!("--max-traders must be >= NUM_TRADERS when --keep-increasing is set");
+        }
+        if self.keep_increasing && self.grow_interval_secs == 0 {
+            bail!("--grow-interval-secs must be non-zero when --keep-increasing is set");
+        }
+        if self.order_timeout_secs == 0 {
+            bail!("--order-timeout-secs must be non-zero");
+        }
+        if self.vault_cycle_amount == 0 {
+            bail!("--vault-cycle-amount must be non-zero");
+        }
+        if self.vault_cycle_amount > self.fund_amount {
+            bail!("--vault-cycle-amount cannot exceed --fund-amount");
         }
         let ratios = [self.low_ratio, self.avg_ratio, self.hf_ratio];
         if ratios

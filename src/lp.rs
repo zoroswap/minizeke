@@ -30,7 +30,7 @@ use crate::{
 };
 
 pub const DEFAULT_LP_CHECKPOINT_INTERVAL_SECS: u64 = 600;
-pub const DEFAULT_LP_SYNC_INTERVAL_SECS: u64 = 2;
+pub const DEFAULT_LP_SYNC_INTERVAL_SECS: u64 = 15;
 pub const DEFAULT_LP_MIN_DEPOSIT_AMOUNT: u64 = 1;
 
 #[derive(Clone)]
@@ -208,8 +208,8 @@ impl LpWorker {
     }
 
     async fn run(mut self) {
-        let sync_secs =
-            env_u64("LP_SYNC_INTERVAL_SECS", DEFAULT_LP_SYNC_INTERVAL_SECS).unwrap_or(2);
+        let sync_secs = env_u64("LP_SYNC_INTERVAL_SECS", DEFAULT_LP_SYNC_INTERVAL_SECS)
+            .unwrap_or(DEFAULT_LP_SYNC_INTERVAL_SECS);
         let checkpoint_secs = env_u64(
             "LP_CHECKPOINT_INTERVAL_SECS",
             DEFAULT_LP_CHECKPOINT_INTERVAL_SECS,

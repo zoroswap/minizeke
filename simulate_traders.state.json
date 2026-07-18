@@ -1,106 +1,116 @@
 {
   "network": "testnet",
-  "vault_id": "0x1a381b8e3e5b0a917fe91ce8574230",
+  "vault_id": "0xccb4a1f2500748d1493be316d788b3",
   "traders": [
     {
       "index": 0,
-      "user_id": "0xa66087b9c6a80d516bbc1777476ebe",
-      "public_key_commitment": "0x66aa29415d593b704b8c16e8d0d5a9f671d82d0a6596632c987b1be3ae4e6658"
+      "user_id": "0x63139d12868df4310e8b705a69818b",
+      "public_key_commitment": "0xdb06f6fa9029c8b60f322b6cf1adddcbceab1e0a21b085f688ff7d3d6b26761a"
     },
     {
       "index": 1,
-      "user_id": "0x57c373b62c2ee5f15bb40559037612",
-      "public_key_commitment": "0xeaa01eacc7388706a1448821d6d877e7a8c5630ec91ba994e6d48a06f014c0ef"
+      "user_id": "0x4ed1f86807f803516a525b22c424a2",
+      "public_key_commitment": "0xda5c3da6500c06333484ceb55d8e7e6b5f8e62a6138722a2e322700f1f4901fe"
     },
     {
       "index": 2,
-      "user_id": "0x52ce574badba62b17cfeb46ac1d307",
-      "public_key_commitment": "0xb169c7b1f686ec107c5f30804f553c624875c95e6b3c2ba2b26a5c74db2814cb"
+      "user_id": "0xc9750116d213fd7112f6fc59029556",
+      "public_key_commitment": "0xc116e66ad135f01535de00e0aa875c57e35d27050e14b9443c8ba1151fa321b1"
     },
     {
       "index": 3,
-      "user_id": "0x3e289bb4a5ecb2111f0b522227f794",
-      "public_key_commitment": "0x453293539e4ac4cb6839a036633245cfd700c4e0d60f09254d02a746de1e2a29"
+      "user_id": "0xa26cd1ec3783e2511647360f2838b9",
+      "public_key_commitment": "0xb1a16824a5ad301acc28188bbd9a234bdeb5d4133ad6f2fff0253953f1d7cb69"
     },
     {
       "index": 4,
-      "user_id": "0x0d01a832ff2edcf106b194c5fa385c",
-      "public_key_commitment": "0xca1c8e12cc06511fa57be1cfdb0dda7a80b724e6a688e93134f78974f138bceb"
+      "user_id": "0x16717b95aee1a3314ab5beff4c8f92",
+      "public_key_commitment": "0x187f8e18316519099f257a62ddff94a5e48f6a13fb63192b07e08f716336b850"
     },
     {
       "index": 5,
-      "user_id": "0xd64e9db2f1fea791261d70195eb72f",
-      "public_key_commitment": "0x2c1c984849af371ccae5c3f3c98b398d830e561e4c2ed5d5960a75308aef3964"
+      "user_id": "0xf1e644494d7a48912e3a6f1bfeef15",
+      "public_key_commitment": "0xa9def7b0e3b0ad3a654de1f2100aca1cd93894d2333a4502696bb6a8fa40f36b"
     },
     {
       "index": 6,
-      "user_id": "0x5cf4e15fd5662b917b1608a3d026c4",
-      "public_key_commitment": "0x92572bcfaaba1c2ed8e1762d5deebdbb3178033b7085f3d9a073201875156f86"
+      "user_id": "0xfa61b03b5f984bd15d55a45736603a",
+      "public_key_commitment": "0xc2f8c6af77d3b11509c0d237eabc00cf7fd207affd1be3725684dc3127aac704"
     },
     {
       "index": 7,
-      "user_id": "0x0097d057efe56a313a075e72a56854",
-      "public_key_commitment": "0xa13b8aaf6bd87a06a74365cc3f708e3e168d78d591ea3d23e62e41d54125d787"
+      "user_id": "0xc79e2ba5d3aca8315a007648a1d8c2",
+      "public_key_commitment": "0x0ef3ab8d601c6791843f6d78139a2fe83f337b7c83e596ce7948bb42f6aec4d2"
     },
     {
       "index": 8,
-      "user_id": "0x6e1e522edd29ce912cf99e2333a8fd",
-      "public_key_commitment": "0xa093e4fa900c33d1e574adc7b96d55b64010ab0a4c708284aa01ce28fd41670d"
+      "user_id": "0xb5b6c93536befab16381280c630b59",
+      "public_key_commitment": "0x5495556bc5ffaf0d52d24ec8168457c73a35e27911903925895813a2a3d93345"
     },
     {
       "index": 9,
-      "user_id": "0x41d4cc4bd4a3b6112fe04ed92d3c72",
-      "public_key_commitment": "0x89ec58458d7dd2faa385deeb235f966c85d916417fe10428aa1eafa5683e49b8"
+      "user_id": "0x63a890bb5fff37f141ee20d2fc2a35",
+      "public_key_commitment": "0x43b446668de6c2a6073577a0e9e4683493d375e06c9ad041075705d701d0a0a8"
     },
     {
       "index": 10,
-      "user_id": "0x74897b20c033a8511a08db24e2ba6a",
-      "public_key_commitment": "0x55509a2124e76c1fdc026e64460e9aa1cf2b835d21eedc68d8688281b6aba749"
+      "user_id": "0x5f74139f5f7b5b916a2ac57253ed43",
+      "public_key_commitment": "0xd074f37243178b05589f3e907c382984c9b9905405f94b84d8c7b48d55d8bd75"
     },
     {
       "index": 11,
-      "user_id": "0xfceaac052cf60d3152d2d6749c193f",
-      "public_key_commitment": "0xdb0c4c9f6f520aa807ee5a8d9e9e7d52ecb17d6267042201baffb960998b324f"
+      "user_id": "0x235a1f2c98bbb6d135ca3bac84f696",
+      "public_key_commitment": "0xc170b50c10d7614a8236eb1d389fcdba21e3c689d4a3daeeba3bb01c913e5561"
     },
     {
       "index": 12,
-      "user_id": "0x631e3eb064564ff10621bdeb06407a",
-      "public_key_commitment": "0xe84f71b7b75d0063bbcd3f6e86e3536739d409e1b7eaffa9cc588fe02c1eb292"
+      "user_id": "0xa3d55dfde4ad9cf178ba6092464dcf",
+      "public_key_commitment": "0x89cdb7df2855d07f212ef254bc77a9434e3268ad366e48a114740d7c278a92c3"
     },
     {
       "index": 13,
-      "user_id": "0xc42dc330ee635eb13ece11824a1b4b",
-      "public_key_commitment": "0xe0c05b79218b29f81c27ac7eb7d0796a1e7cbac6413442a69e2b07228d5a83ca"
+      "user_id": "0x9e1b6282fc96ea11082598ee4202cd",
+      "public_key_commitment": "0x294fc4ef653d2f587447fb021396ce3559ce08ad242e786565c6ccda5810fa9e"
     },
     {
       "index": 14,
-      "user_id": "0xcda23349a9be30717c4bffec8ba7d9",
-      "public_key_commitment": "0x7aabeebd797b1e918462358513663e6838ed055ccd606dde0977484caabf8b87"
+      "user_id": "0x77694a4ce9025ab10d7f8f47c6381c",
+      "public_key_commitment": "0xc423efc7324c11f043e513038d31a04f0319c988c124b36d5a7ed9f79a959e39"
     },
     {
       "index": 15,
-      "user_id": "0xc6c3e4bdb49f6b7145badacbcb7b8e",
-      "public_key_commitment": "0x21a368d073ac1010c6a8f3bed0f5610fba89c14a8da9cfed422275a3ce7da980"
+      "user_id": "0xbfcfaa871af1d6315d91c9e31f15a7",
+      "public_key_commitment": "0x0ba17371c9b9f49dfafa85bb1ff73be6ae1ed74bba5d006846b6b93dbdc6c603"
     },
     {
       "index": 16,
-      "user_id": "0x10c31550deba77d14bff3c20d19a30",
-      "public_key_commitment": "0x31aad925c7babf90f47f64843306e04a23d6cc6cb16b9bebe6cf2e0ee609c164"
+      "user_id": "0xbb550e7cea5d7411588ae1fa9dd921",
+      "public_key_commitment": "0xd6351b8c8f82474fb98176e9a0a38c1c11b22f2ab9637df95192867eaf24a356"
     },
     {
       "index": 17,
-      "user_id": "0xff8b7364b28ee7f1254e4351245a87",
-      "public_key_commitment": "0x4f05c5a7c85cbfab9263ba0e316285a0120f9647962495ac4b317cf562ccc16f"
+      "user_id": "0xba5256d9076b259132f7be2dcb60d0",
+      "public_key_commitment": "0xb0a4a47d91ddd4a50550d139aad1d7eadcba7f4bf6d5f89fbec54dc5ba5ea3d9"
     },
     {
       "index": 18,
-      "user_id": "0x8e94d045ac5f03911d87a01ef0a83b",
-      "public_key_commitment": "0x90a4d1f6dad82770a5717eac4bc85d545ca7319bd0443747a272631478a67cbc"
+      "user_id": "0x47bd778b39775b3142d0d7ce9d3a76",
+      "public_key_commitment": "0x3690389a523b51cd1f4de0f5cc9524537ad06879e90c74c61fb109de4f405d30"
     },
     {
       "index": 19,
-      "user_id": "0x3f40251ff905c7f10cb29f6b4c6f74",
-      "public_key_commitment": "0x80711210cb81dbbf62d80f55a4f358af1373ded1f8489210b8d0e9bfc3e9526e"
+      "user_id": "0xc93c6dc66aea42714b16f8dfa25ae7",
+      "public_key_commitment": "0xbd8f5588c6599762b3e0faae7abac8b93deee9b12b586bb1d3bfcfc670dcb08b"
+    },
+    {
+      "index": 23,
+      "user_id": "0xb2a2c8d60bc164b113e40677c69451",
+      "public_key_commitment": "0x91ee51ca0a066cbf33d85ac9ed6cdd0eb0e1d7408b001e19ca6f433343316461"
+    },
+    {
+      "index": 24,
+      "user_id": "0xafd1b3f387143b712f75073fe5c0cf",
+      "public_key_commitment": "0x41fbd95a37e7a1ff3eaadcbcc098f9ff070dabe4a4ed1dc037f0fd1c7044771c"
     }
   ]
 }

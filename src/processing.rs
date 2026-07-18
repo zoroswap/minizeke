@@ -18,6 +18,7 @@ use crate::{
         LpLedger, PoolBalances, PoolState, fetch_account_storage_from_rpc,
         get_user_available_balance_from_pool,
     },
+    pool_registry::PoolRegistry,
     vault::user_pool_from_storage,
 };
 
@@ -59,7 +60,7 @@ pub struct Processing {
     engine_busy: bool,
     vault_id: AccountId,
     asset_ids: HashSet<AccountId>,
-    pool_ids: HashSet<AccountId>,
+    pool_registry: Arc<PoolRegistry>,
     user_pools: HashMap<AccountId, AccountId>,
     /// Lazy per-(user, faucet) spendable-balance mirror for preflight quoting.
     /// Opening balance is fetched from chain on first miss; FUND / INIT_REDEEM and
@@ -86,7 +87,7 @@ impl Processing {
         pool_states: HashMap<AccountId, PoolState>,
         vault_id: AccountId,
         assets: Vec<AssetInfo>,
-        pools: Vec<AccountId>,
+        pool_registry: Arc<PoolRegistry>,
         lp_store: Arc<LpStore>,
         execution_store: Arc<ExecutionStore>,
         fee_store: Arc<FeeStore>,
@@ -125,7 +126,7 @@ impl Processing {
             engine_busy: false,
             vault_id,
             asset_ids: assets.into_iter().map(|asset| asset.faucet_id).collect(),
-            pool_ids: pools.into_iter().collect(),
+            pool_registry,
             user_pools: HashMap::new(),
             balances: HashMap::new(),
             lp_ledger,
@@ -183,7 +184,9 @@ impl Processing {
         let storage = fetch_account_storage_from_rpc(self.vault_id).await?;
         let pool_id = user_pool_from_storage(&storage, user_id)?
             .ok_or_else(|| anyhow!("user {} has no assigned pool", user_id.to_hex()))?;
-        if !self.pool_ids.contains(&pool_id) {
+        if !self.pool_registry.contains(&pool_id)
+            && !self.pool_registry.ensure_from_deployment(pool_id)?
+        {
             return Err(anyhow!(
                 "user {} is assigned to unlisted pool {}",
                 user_id.to_hex(),
@@ -655,8 +658,8 @@ impl Processing {
         });
     }
 
-    /// Start processing a batch of new orders if prove/submit is idle.
-    /// The admit gate is released on `AmmEvent::BatchSubmitted` (overlap with finality).
+    /// Start processing a batch when quoting is idle. Durable store blocks only on a
+    /// `pending` batch; a `claimed` (proving) batch may overlap with the next quote.
     async fn try_start_batch(&mut self) {
         if self.engine_busy {
             return;
@@ -666,10 +669,11 @@ impl Processing {
             self.pool_resync_required = false;
         }
         let now = chrono::Utc::now().timestamp_millis() as u64;
+        let claim_limit = crate::miden_execution::max_orders_per_shard_tx().saturating_mul(2);
         let batch =
             match self
                 .execution_store
-                .claim_admitted_orders(&self.worker_id, now, 600_000, 32)
+                .claim_admitted_orders(&self.worker_id, now, 600_000, claim_limit)
             {
                 Ok(batch) => batch,
                 Err(error) => {
@@ -773,14 +777,15 @@ impl Processing {
     fn publish_order_update(&self, update: OrderUpdate) -> Result<()> {
         if let OrderUpdate::Failed(order) = &update {
             let snapshot = update.snapshot();
-            let reason = snapshot
-                .failure_reason
-                .map(|reason| format!("{reason:?}"))
-                .unwrap_or_else(|| "ExecutionError".to_owned());
+            let durable_reason = match snapshot.failure_reason {
+                Some(OrderFailureReason::StaleQueue) => "stale_queue".to_owned(),
+                Some(reason) => format!("{reason:?}"),
+                None => "ExecutionError".to_owned(),
+            };
             self.execution_store.fail_claimed_order(
                 order.id,
                 &self.worker_id,
-                &reason,
+                &durable_reason,
                 chrono::Utc::now().timestamp_millis() as u64,
             )?;
         }
@@ -795,6 +800,8 @@ impl Processing {
             self.publish_order_update(OrderUpdate::StartedProcessing(order.clone()))?;
         }
 
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let max_admitted_age_ms = crate::execution_store::max_admitted_age_ms();
         let mut processed_batch = Vec::with_capacity(orders.len());
         let mut proposed_swaps = Vec::with_capacity(orders.len());
         let mut pool_states_changed = false;
@@ -803,6 +810,19 @@ impl Processing {
             let buy_faucet = details.asset_out;
             let sell_faucet = details.asset_in;
             let user_id = order.user_id();
+
+            let admitted_age_ms = now_ms.saturating_sub(order.admitted_at_ms());
+            if admitted_age_ms > max_admitted_age_ms {
+                warn!(
+                    order_id = %order.id,
+                    admitted_age_ms,
+                    max_admitted_age_ms,
+                    "Admitted order exceeded max age before quote"
+                );
+                let failed = order.failed(OrderFailureReason::StaleQueue);
+                self.publish_order_update(OrderUpdate::Failed(failed))?;
+                continue;
+            }
 
             if is_expired_at(order.expires_at(), chrono::Utc::now().timestamp() as u64) {
                 warn!(order_id = %order.id, "Signed intent expired before processing");
@@ -1062,9 +1082,10 @@ impl Processing {
             // Notification-only fast path. Miden execution claims the committed batch.
             self.message_broker
                 .broadcast_processed_batch(processed_batch)?;
-        } else {
-            self.engine_busy = false;
         }
+        // Release quoting gate at handoff so the next claim can overlap prove/submit
+        // once the durable batch moves from pending → claimed.
+        self.engine_busy = false;
 
         Ok(())
     }

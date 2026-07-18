@@ -77,6 +77,9 @@ Optional values:
 - `LP_SYNC_INTERVAL_SECS`: interval for discovering consumed LP notes. Default: `2`.
 - `LP_MIN_DEPOSIT_AMOUNT`: minimum permissionless deposit in base units. Default: `1`.
 - `EXECUTION_DB_PATH`: finalized swap and pool-state journal. Default: `execution.<network>.sqlite3`.
+- `MAX_ADMITTED_ORDERS`: max pre-execution backlog (`admitted` + `processing_claimed`); excess admits get `503 execution queue is full`. Default: `64`.
+- `MAX_ADMITTED_AGE_MS`: max age of an admitted order before quote fails it as `stale_queue`. Default: `60000`.
+- `MAX_ORDERS_PER_SHARD_TX`: soft cap on swaps packed into one pool transaction. Default: `16`.
 - `FINALITY_TIMEOUT_SECS`: terminal timeout for a submitted transaction that remains unconfirmed. Default: `1800`.
 - `FINALITY_RETRY_SECS`: minimum interval between reconciliation attempts. Default: `2`.
 - `FINALITY_MAX_ATTEMPTS`: terminal reconciliation-attempt limit. Default: `900`.
@@ -104,6 +107,12 @@ per-trader consume/register/fund workers. Before trading it warms auth sessions 
 `--auth-warmup-gap-ms` (default `3500`) so challenge/login stays under
 `RATE_LIMIT_AUTH_PER_MINUTE` (default `20`). For faster local/staging load tests,
 raise that server env (e.g. `RATE_LIMIT_AUTH_PER_MINUTE=120`).
+
+After admit, each trade waits on the API WebSocket for `Confirmed`/`Failed`
+(`--order-timeout-secs`, default `120`). Optional live growth:
+`--keep-increasing --max-traders 100 --grow-interval-secs 60`. Mid-run vault
+fund/init_redeem/redeem cycles run every `--vault-cycle-interval-secs` (default
+`180`; `0` disables) for `--vault-cycle-amount` base units.
 
 ## Deploy
 

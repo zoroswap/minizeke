@@ -36,8 +36,8 @@ use crate::{
     miden_env::MidenNetwork,
     miden_execution::MidenExecution,
     note::{
-        DepositInstructions, FundInstructions, RegisterInstructions, WithdrawInstructions,
-        ZekeNote, ZekeNoteInstructions,
+        DepositInstructions, FundInstructions, InitRedeemInstructions, RedeemInstructions,
+        RegisterInstructions, WithdrawInstructions, ZekeNote, ZekeNoteInstructions,
     },
     vault::{
         USER_ASSET_TOTAL_FUNDING_SLOT, USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT,
@@ -60,9 +60,40 @@ pub async fn get_client() -> Result<Client<FilesystemKeyStore>> {
 /// soon as the vault holds assets. Keeping the vault untracked in the swap-submitting
 /// client forces `VaultFetch::Always`, so the full asset list is fetched. This also
 /// mirrors the production topology where the pool operator does not custody the vault.
+///
+/// Legacy single-pool path (`pool.{network_store}`). Prefer [`get_pool_client_for`] when
+/// multiple pools need isolated stores.
 pub async fn get_pool_client() -> Result<Client<FilesystemKeyStore>> {
     let network = MidenNetwork::from_env();
     build_client(format!("pool.{}", network.store_path())).await
+}
+
+/// Pool client with a per-pool SQLite store: `pool.{pool_hex}.{network_store}`.
+pub async fn get_pool_client_for(pool_id: AccountId) -> Result<Client<FilesystemKeyStore>> {
+    let network = MidenNetwork::from_env();
+    let pool_hex = sanitize_store_hex(&pool_id.to_hex());
+    build_client(format!("pool.{}.{}", pool_hex, network.store_path())).await
+}
+
+/// Finality observer client — separate store so sync/confirm never contends with
+/// the execute/prove client's SQLite file for the same pool.
+pub async fn get_pool_finality_client_for(pool_id: AccountId) -> Result<Client<FilesystemKeyStore>> {
+    let network = MidenNetwork::from_env();
+    let pool_hex = sanitize_store_hex(&pool_id.to_hex());
+    build_client(format!(
+        "pool.finality.{}.{}",
+        pool_hex,
+        network.store_path()
+    ))
+    .await
+}
+
+/// Keep only hex digits so account hex is safe as a store path segment.
+fn sanitize_store_hex(hex: &str) -> String {
+    hex.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// Client with an independent store for the standalone faucet service. It shares the
@@ -154,7 +185,7 @@ pub async fn submit_tx_resilient(
                 account = %account_id.to_hex(),
                 "local store update failed after submit ({source}); syncing and re-applying"
             );
-            client.sync_state().await?;
+            sync_after_submit(client).await?;
             if let Err(retry_err) = client.apply_transaction_update(*pending_update).await {
                 tracing::warn!(
                     %tx_id,
@@ -166,6 +197,22 @@ pub async fn submit_tx_resilient(
             Ok(tx_id)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Prefer full `sync_state`; if note transport fails (e.g. tag cap), fall back to chain sync.
+async fn sync_after_submit(client: &mut Client<FilesystemKeyStore>) -> Result<()> {
+    match client.sync_state().await {
+        Ok(_) => Ok(()),
+        Err(ClientError::NoteTransportError(error)) => {
+            tracing::warn!(
+                %error,
+                "note transport sync failed after submit; falling back to chain sync"
+            );
+            client.sync_chain().await?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -532,6 +579,43 @@ pub async fn fund_user_on_vault(
             user_id,
             vault_id,
             note_assets: vec![asset],
+        }),
+        client.code_builder(),
+    )?;
+    send_note_to_network(client, &note, user_id).await
+}
+
+/// Initiates a vault redeem for `asset` (moves funding into pending redeem).
+pub async fn init_redeem_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    user_id: AccountId,
+    asset: FungibleAsset,
+) -> Result<()> {
+    let note = ZekeNote::new(
+        ZekeNoteInstructions::InitRedeem(InitRedeemInstructions {
+            user_id,
+            vault_id,
+            min_expected_asset: asset,
+        }),
+        client.code_builder(),
+    )?;
+    send_note_to_network(client, &note, user_id).await
+}
+
+/// Completes a vault redeem for `asset` (vault pays the user via P2ID).
+/// Does NOT consume the payout note; use [`consume_all_notes_for`] afterward.
+pub async fn redeem_on_vault(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    user_id: AccountId,
+    asset: FungibleAsset,
+) -> Result<()> {
+    let note = ZekeNote::new(
+        ZekeNoteInstructions::Redeem(RedeemInstructions {
+            user_id,
+            vault_id,
+            min_expected_asset: asset,
         }),
         client.code_builder(),
     )?;

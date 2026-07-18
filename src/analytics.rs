@@ -97,7 +97,7 @@ impl AnalyticsWorker {
         let seconds = env::var("ANALYTICS_SYNC_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(5_u64)
+            .unwrap_or(15_u64)
             .max(1);
         let mut interval = tokio::time::interval(Duration::from_secs(seconds));
         info!("analytics cash-flow worker started");

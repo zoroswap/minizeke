@@ -25,6 +25,40 @@ pub enum IntentReservation {
     Conflict,
 }
 
+/// Soft cap on pre-execution backlog (`admitted` + `processing_claimed`).
+pub fn max_admitted_orders() -> usize {
+    env::var("MAX_ADMITTED_ORDERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+        .max(1)
+}
+
+/// Max age of an admitted order before quote fails it as `stale_queue`.
+pub fn max_admitted_age_ms() -> u64 {
+    env::var("MAX_ADMITTED_AGE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(60_000)
+        .max(1)
+}
+
+/// Typed admit rejection (mapped to HTTP 503 by the API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitError {
+    QueueFull,
+}
+
+impl std::fmt::Display for AdmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "execution queue is full"),
+        }
+    }
+}
+
+impl std::error::Error for AdmitError {}
+
 #[derive(Debug, Clone)]
 pub struct ProposedSwap {
     pub order_id: String,
@@ -206,11 +240,15 @@ impl ExecutionStore {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
-            -- At most one prove/submit batch. Reconciling batches no longer block a
-            -- successor so Processing can overlap Created→Processing with finality.
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_execution_batch
+            -- At most one pending and one claimed batch (separate single-flight per
+            -- state). Reconciling does not take either slot, so a successor pending
+            -- batch can exist while a prior claimed batch is still proving/submitting.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_single_pending_execution_batch
                 ON execution_batches((1))
-                WHERE state IN ('pending', 'claimed');
+                WHERE state = 'pending';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_single_claimed_execution_batch
+                ON execution_batches((1))
+                WHERE state = 'claimed';
             CREATE TABLE IF NOT EXISTS execution_submissions (
                 tx_hash TEXT PRIMARY KEY,
                 tx_id BLOB NOT NULL,
@@ -248,12 +286,18 @@ impl ExecutionStore {
                 [],
             )?;
         }
-        // Upgrade: allow a new pending/claimed batch while a prior one reconciles.
+        // Upgrade: split the combined active-batch unique index so pending and claimed
+        // each allow at most one row (a claimed batch no longer blocks a new pending).
         connection.execute_batch(
             "DROP INDEX IF EXISTS idx_single_active_execution_batch;
-             CREATE UNIQUE INDEX idx_single_active_execution_batch
+             DROP INDEX IF EXISTS idx_single_pending_execution_batch;
+             DROP INDEX IF EXISTS idx_single_claimed_execution_batch;
+             CREATE UNIQUE INDEX idx_single_pending_execution_batch
                 ON execution_batches((1))
-                WHERE state IN ('pending', 'claimed');",
+                WHERE state = 'pending';
+             CREATE UNIQUE INDEX idx_single_claimed_execution_batch
+                ON execution_batches((1))
+                WHERE state = 'claimed';",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -333,6 +377,23 @@ impl ExecutionStore {
         order: &Order<crate::order::Created>,
         created_at: u64,
     ) -> Result<IntentReservation> {
+        self.admit_order_with_limit(
+            client_order_id,
+            intent_commitment,
+            order,
+            created_at,
+            max_admitted_orders(),
+        )
+    }
+
+    fn admit_order_with_limit(
+        &self,
+        client_order_id: uuid::Uuid,
+        intent_commitment: &str,
+        order: &Order<crate::order::Created>,
+        created_at: u64,
+        queue_limit: usize,
+    ) -> Result<IntentReservation> {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -383,6 +444,17 @@ impl ExecutionStore {
             });
         }
 
+        let queued: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM durable_orders
+             WHERE state IN ('admitted', 'processing_claimed')",
+            [],
+            |row| row.get(0),
+        )?;
+        if queued >= i64::try_from(queue_limit)? {
+            tx.commit()?;
+            return Err(AdmitError::QueueFull.into());
+        }
+
         let order_id = order.id;
         tx.execute(
             "INSERT INTO intent_reservations
@@ -419,10 +491,11 @@ impl ExecutionStore {
         Ok(IntentReservation::New { order_id })
     }
 
-    /// Claims admitted work when no prove/submit batch is active. A batch that is only
-    /// `reconciling` (submitted, awaiting finality) does not block the next claim so
-    /// Created→Processing can overlap with chain confirmation. Expired processing claims
-    /// are eligible, allowing crash-after-admit and crash-after-claim recovery.
+    /// Claims admitted work when no `pending` execution batch exists. A batch that is
+    /// `claimed` (prove/submit) or `reconciling` (awaiting finality) does not block the
+    /// next claim so Created→Processing can overlap with submission and confirmation.
+    /// Expired processing claims are eligible, allowing crash-after-admit and
+    /// crash-after-claim recovery.
     pub fn claim_admitted_orders(
         &self,
         worker: &str,
@@ -432,16 +505,22 @@ impl ExecutionStore {
     ) -> Result<Vec<Order<crate::order::Created>>> {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let active: bool = tx.query_row(
+        let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM execution_batches
-             WHERE state IN ('pending', 'claimed'))",
+             WHERE state = 'pending')",
             [],
             |row| row.get(0),
         )?;
-        if active {
+        if pending {
             tx.commit()?;
             return Ok(Vec::new());
         }
+        let claimed_inflight: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM execution_batches
+             WHERE state = 'claimed')",
+            [],
+            |row| row.get(0),
+        )?;
         let mut statement = tx.prepare(
             "SELECT order_id, payload, created_at FROM durable_orders
              WHERE state = 'admitted'
@@ -478,7 +557,11 @@ impl ExecutionStore {
                 &format!("order:{id}:processing-claim:{worker}:{now}"),
                 now,
             )?;
-            orders.push(serde_json::from_str::<DurableOrder>(&payload)?.into_created()?);
+            orders.push(
+                serde_json::from_str::<DurableOrder>(&payload)?
+                    .into_created()?
+                    .with_admitted_at_ms(created_at),
+            );
             tx.execute(
                 "UPDATE execution_outbox SET delivered_at = ?2
                  WHERE topic = 'order_admitted' AND aggregate_id = ?1
@@ -488,11 +571,19 @@ impl ExecutionStore {
         }
         tx.commit()?;
         if !orders.is_empty() {
-            tracing::info!(
-                count = orders.len(),
-                claim_wait_ms = now.saturating_sub(oldest_created_at),
-                "Claimed admitted orders"
-            );
+            if claimed_inflight {
+                tracing::info!(
+                    count = orders.len(),
+                    claim_wait_ms = now.saturating_sub(oldest_created_at),
+                    "Claimed admitted orders while prior batch is claimed (quote/execute overlap)"
+                );
+            } else {
+                tracing::info!(
+                    count = orders.len(),
+                    claim_wait_ms = now.saturating_sub(oldest_created_at),
+                    "Claimed admitted orders"
+                );
+            }
         }
         Ok(orders)
     }
@@ -524,6 +615,76 @@ impl ExecutionStore {
         }
         tx.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Fails admitted / processing_claimed orders that are incompatible with the
+    /// current deployment (wrong assets, unlisted pool, or unregistered user).
+    pub fn fail_stale_prebatch_orders<F>(
+        &self,
+        mut is_stale: F,
+        reason: &str,
+        now: u64,
+    ) -> Result<usize>
+    where
+        F: FnMut(&DurableOrder) -> bool,
+    {
+        let mut connection = self.connection()?;
+        let rows = {
+            let mut stmt = connection.prepare(
+                "SELECT order_id, payload FROM durable_orders
+                 WHERE state IN ('admitted', 'processing_claimed')",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        let mut stale_ids = Vec::new();
+        for (order_id, payload) in rows {
+            let order: DurableOrder = match serde_json::from_str(&payload) {
+                Ok(order) => order,
+                Err(_) => {
+                    // Unreadable payloads from a prior schema cannot be settled; drop them.
+                    if let Ok(id) = uuid::Uuid::parse_str(&order_id) {
+                        stale_ids.push(id);
+                    }
+                    continue;
+                }
+            };
+            if is_stale(&order) {
+                stale_ids.push(order.id);
+            }
+        }
+        if stale_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut failed = 0usize;
+        for order_id in stale_ids {
+            let changed = tx.execute(
+                "UPDATE durable_orders SET state = 'failed', terminal_error = ?2,
+                    claim_owner = NULL, claim_until = NULL, updated_at = ?3
+                 WHERE order_id = ?1 AND state IN ('admitted', 'processing_claimed')",
+                params![order_id.to_string(), reason, to_i64(now)?],
+            )?;
+            if changed == 1 {
+                append_event(
+                    &tx,
+                    order_id,
+                    "failed",
+                    Some(reason),
+                    &format!("order:{order_id}:terminal"),
+                    now,
+                )?;
+                failed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(failed)
     }
 
     /// Commits all proposed accounting rows and the executable batch in one transaction.
@@ -611,11 +772,23 @@ impl ExecutionStore {
     ) -> Result<Option<ClaimedExecutionBatch>> {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Prefer reclaiming an expired claimed lease. Promote pending only when the
+        // claimed slot is free — `idx_single_claimed_execution_batch` allows one
+        // claimed row, while pending may coexist with an in-flight claimed batch.
         let row = tx
             .query_row(
                 "SELECT batch_id, payload FROM execution_batches
-                 WHERE state = 'pending' OR (state = 'claimed' AND claim_until < ?1)
-                 ORDER BY created_at LIMIT 1",
+                 WHERE (state = 'claimed' AND claim_until < ?1)
+                    OR (
+                        state = 'pending'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM execution_batches AS claimed
+                            WHERE claimed.state = 'claimed'
+                              AND (claimed.claim_until IS NULL OR claimed.claim_until >= ?1)
+                        )
+                    )
+                 ORDER BY CASE WHEN state = 'claimed' THEN 0 ELSE 1 END, created_at
+                 LIMIT 1",
                 [to_i64(now)?],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -880,9 +1053,10 @@ impl ExecutionStore {
         Ok(())
     }
 
-    /// Ends transaction submission and moves the batch to `reconciling`. Prove/submit stays
-    /// single-flight (`pending`/`claimed`); the admit gate may release so Processing can
-    /// claim new orders while finality runs.
+    /// Ends transaction submission and moves the batch to `reconciling`. Each of
+    /// `pending` and `claimed` remains single-flight; the admit gate only holds while a
+    /// batch is `pending`, so Processing can claim new orders during prove/submit and
+    /// finality.
     pub fn begin_reconciliation(
         &self,
         batch_id: uuid::Uuid,
@@ -1835,6 +2009,57 @@ mod tests {
     }
 
     #[test]
+    fn admit_rejects_when_pre_execution_queue_is_full() {
+        let store = ExecutionStore::open(":memory:").unwrap();
+        let first = test_order(uuid::Uuid::new_v4());
+        let second = test_order(uuid::Uuid::new_v4());
+        let third = test_order(uuid::Uuid::new_v4());
+        assert!(matches!(
+            store
+                .admit_order_with_limit(first.client_order_id(), "c1", &first, 1, 2)
+                .unwrap(),
+            IntentReservation::New { .. }
+        ));
+        assert!(matches!(
+            store
+                .admit_order_with_limit(second.client_order_id(), "c2", &second, 2, 2)
+                .unwrap(),
+            IntentReservation::New { .. }
+        ));
+        let err = store
+            .admit_order_with_limit(third.client_order_id(), "c3", &third, 3, 2)
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<AdmitError>() == Some(&AdmitError::QueueFull),
+            "expected QueueFull, got {err:#}"
+        );
+        // Idempotent re-admit of an existing order still succeeds.
+        assert!(matches!(
+            store
+                .admit_order_with_limit(first.client_order_id(), "c1", &first, 4, 2)
+                .unwrap(),
+            IntentReservation::Existing { .. }
+        ));
+        // Free a slot by claiming then failing one order.
+        let claimed = store
+            .claim_admitted_orders("processing", 5, 100, 10)
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert!(
+            store
+                .fail_claimed_order(claimed[0].id, "processing", "stale_queue", 6)
+                .unwrap()
+        );
+        let fourth = test_order(uuid::Uuid::new_v4());
+        assert!(matches!(
+            store
+                .admit_order_with_limit(fourth.client_order_id(), "c4", &fourth, 7, 2)
+                .unwrap(),
+            IntentReservation::New { .. }
+        ));
+    }
+
+    #[test]
     fn admission_is_idempotent_and_enqueues_one_wakeup() {
         let store = ExecutionStore::open(":memory:").unwrap();
         let client_id = uuid::Uuid::new_v4();
@@ -1977,11 +2202,13 @@ mod tests {
                 .complete_batch(batch_id, "executor-b", &[], 22)
                 .is_err()
         );
-        assert!(
+        // Claimed no longer blocks admit; only pending does.
+        assert_eq!(
             store
                 .claim_admitted_orders("processing", 22, 100, 10)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
         assert!(
             store
@@ -2006,13 +2233,6 @@ mod tests {
             store.order_state(processed.id).unwrap().as_deref(),
             Some("executed")
         );
-        assert_eq!(
-            store
-                .claim_admitted_orders("processing", 24, 100, 10)
-                .unwrap()
-                .len(),
-            1
-        );
         let topics: Vec<_> = store
             .pending_outbox(10)
             .unwrap()
@@ -2021,6 +2241,73 @@ mod tests {
             .collect();
         assert!(!topics.contains(&"batch_pending".to_owned()));
         assert!(topics.contains(&"batch_terminal".to_owned()));
+    }
+
+    #[test]
+    fn claim_waits_for_claimed_slot_when_pending_successor_exists() {
+        let store = ExecutionStore::open(":memory:").unwrap();
+        let (batch_a, processed_a) = create_claimed_test_batch(&store, "processing");
+
+        // While A is still claimed, Processing may create a successor pending batch.
+        let second_client = uuid::Uuid::new_v4();
+        let second = test_order(second_client);
+        store
+            .admit_order(second_client, "second", &second, 10)
+            .unwrap();
+        let claimed = store
+            .claim_admitted_orders("processing", 11, 100, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let processed_b = claimed
+            .start_processing()
+            .processed(crate::order::OrderExecutionResult { amount_out: 9 });
+        let batch_b = store
+            .create_execution_batch(
+                "processing",
+                std::slice::from_ref(&processed_b),
+                &[proposed(&processed_b)],
+                12,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(batch_a, batch_b);
+
+        // Must return None (not UNIQUE constraint error) while A's claimed lease is live.
+        assert!(
+            store
+                .claim_pending_batch("executor", 13, 100)
+                .unwrap()
+                .is_none()
+        );
+
+        // Free the claimed slot by submitting A's orders and reconciling.
+        let pool_id = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
+        assert!(
+            store
+                .record_submission(
+                    batch_a,
+                    "executor",
+                    "tx-a",
+                    &[1; 32],
+                    pool_id,
+                    &[processed_a.id],
+                    &[2, 3],
+                    &[4],
+                    &[5],
+                    10,
+                    20,
+                    14,
+                )
+                .unwrap()
+        );
+        assert!(store.begin_reconciliation(batch_a, "executor", 15).unwrap());
+
+        let claimed_b = store
+            .claim_pending_batch("executor", 16, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed_b.id, batch_b);
     }
 
     fn create_claimed_test_batch(
@@ -2084,22 +2371,26 @@ mod tests {
             store.order_state(processed.id).unwrap().as_deref(),
             Some("submitted")
         );
-        // Still claimed (prove/submit): admit gate holds.
+        // Claimed (prove/submit): admit gate does not block — only pending does.
         let next_client = uuid::Uuid::new_v4();
         let next = test_order(next_client);
         store.admit_order(next_client, "next", &next, 7).unwrap();
-        assert!(
-            store
-                .claim_admitted_orders("processing", 8, 100, 10)
-                .unwrap()
-                .is_empty()
-        );
-
-        assert!(store.begin_reconciliation(batch_id, "executor", 6).unwrap());
-        // Reconciling only: next admitted order may be claimed (overlap with finality).
         assert_eq!(
             store
                 .claim_admitted_orders("processing", 8, 100, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(store.begin_reconciliation(batch_id, "executor", 6).unwrap());
+        // Reconciling: further admitted orders may still be claimed (overlap with finality).
+        let third_client = uuid::Uuid::new_v4();
+        let third = test_order(third_client);
+        store.admit_order(third_client, "third", &third, 9).unwrap();
+        assert_eq!(
+            store
+                .claim_admitted_orders("processing", 10, 100, 10)
                 .unwrap()
                 .len(),
             1

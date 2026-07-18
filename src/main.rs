@@ -1,11 +1,16 @@
-use std::{collections::HashMap, env, fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use dotenv::dotenv;
 use miden_client::account::AccountId;
 use tokio::runtime::Builder;
 use tokio::sync::broadcast::error::RecvError;
-use tracing::warn;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use minizeke::*;
@@ -16,14 +21,17 @@ use crate::{
     deployment::AssetInfo,
     execution_store::ExecutionStore,
     fee_store::{FeeStore, apply_fee_states},
+    finality_observer::FinalityObserver,
     history::{HistoryStore, start_history_service},
     lp::LpService,
     message_broker::message_broker::{FeeStateEvent, MessageBroker, StatsEvent},
     miden_execution::MidenExecution,
     oracle_sse::OracleSSEClient,
-    pool::PoolState,
+    pool::{PoolState, fetch_account_storage_from_rpc},
+    pool_registry::PoolRegistry,
     processing::Processing,
     store::Store,
+    vault::user_pool_from_storage,
     websocket::connection_manager::ConnectionManager,
 };
 
@@ -33,6 +41,7 @@ struct InitData {
     vault_id: AccountId,
     assets: Vec<AssetInfo>,
     pools: Vec<AccountId>,
+    pool_registry: Arc<PoolRegistry>,
 }
 
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
@@ -97,6 +106,7 @@ fn main() {
                         vault_id: miden_execution.vault_id(),
                         assets: miden_execution.assets(),
                         pools: miden_execution.pools(),
+                        pool_registry: miden_execution.pool_registry(),
                     })
                     .unwrap();
 
@@ -181,7 +191,7 @@ async fn main_tokio(
     let store = Arc::new(Store::new(
         init_data.vault_id,
         init_data.assets.clone(),
-        init_data.pools.clone(),
+        init_data.pool_registry.clone(),
         init_data.pool_states.clone(),
     ));
 
@@ -190,6 +200,51 @@ async fn main_tokio(
     start_history_service(history.clone(), message_broker.clone());
     println!("[INIT] Initializing execution database");
     let execution_store = Arc::new(ExecutionStore::open_from_env()?);
+    {
+        let allowed_assets: HashSet<AccountId> = init_data
+            .assets
+            .iter()
+            .map(|asset| asset.faucet_id)
+            .collect();
+        let allowed_pools: HashSet<AccountId> = init_data.pools.iter().copied().collect();
+        let vault_storage = match fetch_account_storage_from_rpc(init_data.vault_id).await {
+            Ok(storage) => Some(storage),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "vault storage unavailable; stale-order purge will only check assets"
+                );
+                None
+            }
+        };
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let purged = execution_store.fail_stale_prebatch_orders(
+            |order| {
+                if order.details.asset_in == order.details.asset_out
+                    || !allowed_assets.contains(&order.details.asset_in)
+                    || !allowed_assets.contains(&order.details.asset_out)
+                {
+                    return true;
+                }
+                let Some(storage) = vault_storage.as_ref() else {
+                    return false;
+                };
+                match user_pool_from_storage(storage, order.user_id) {
+                    Ok(Some(pool_id)) => !allowed_pools.contains(&pool_id),
+                    Ok(None) => true,
+                    Err(_) => true,
+                }
+            },
+            "stale_after_redeploy",
+            now,
+        )?;
+        if purged > 0 {
+            info!(
+                purged,
+                "failed stale admitted/processing_claimed orders after redeploy"
+            );
+        }
+    }
 
     {
         let store = store.clone();
@@ -223,12 +278,13 @@ async fn main_tokio(
     println!("[INIT] Initializing LP worker");
     let lp_service: LpService =
         lp::initialize(message_broker.clone(), init_data.pool_states.clone()).await?;
+    let pool_registry = init_data.pool_registry.clone();
     let mut processing = Processing::new(
         message_broker.clone(),
         init_data.pool_states.clone(),
         init_data.vault_id,
         init_data.assets,
-        init_data.pools,
+        init_data.pool_registry,
         lp_service.store(),
         execution_store.clone(),
         fee_store.clone(),
@@ -249,6 +305,38 @@ async fn main_tokio(
             });
         })
         .expect("spawn processing worker");
+
+    println!("[RUN] Starting Finality observer");
+    {
+        let message_broker = message_broker.clone();
+        let execution_store = execution_store.clone();
+        std::thread::Builder::new()
+            .name("finality-observer".to_owned())
+            .spawn(move || {
+                let runtime = Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("finality observer runtime");
+                runtime.block_on(async move {
+                    let mut observer = FinalityObserver::initialize(
+                        message_broker,
+                        execution_store,
+                        pool_registry,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!("Critical error initializing finality observer: {error}");
+                        std::process::exit(1);
+                    });
+                    if let Err(error) = observer.start().await {
+                        eprintln!("Critical error on finality observer: {error}. Exiting with status 1.");
+                        std::process::exit(1);
+                    }
+                });
+            })
+            .expect("spawn finality observer");
+    }
+
     miden_start_tx
         .send(())
         .expect("Miden execution thread stopped during startup");

@@ -147,7 +147,7 @@ pub enum OrderUpdate {
     Failed(Order<Failed>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     Created,
     Processing,
@@ -314,6 +314,8 @@ pub enum OrderFailureReason {
     MinOutNotMet,
     InsufficientBalance,
     ExecutionError,
+    /// Admitted too long before quote; client `min_amount_out` is stale.
+    StaleQueue,
 }
 
 impl From<Order<Created>> for OrderUpdate {
@@ -477,6 +479,15 @@ impl Order<Created> {
             intent: self.intent,
         }
     }
+
+    /// Restore durable `created_at` after claim (runtime timing is otherwise reconstructed).
+    pub fn with_admitted_at_ms(mut self, admitted_at_ms: u64) -> Self {
+        if let Some(dt) = DateTime::from_timestamp_millis(admitted_at_ms as i64) {
+            self.timing.created_at = dt;
+            self.timing.last_updated_at = dt;
+        }
+        self
+    }
 }
 
 impl Order<Processing> {
@@ -521,6 +532,13 @@ impl Order<Processing> {
 
     pub fn expires_at(&self) -> u64 {
         self.intent.expires_at
+    }
+}
+
+impl<State> Order<State> {
+    /// Wall-clock millis when the order was durably admitted (restored on claim).
+    pub fn admitted_at_ms(&self) -> u64 {
+        self.timing.created_at.timestamp_millis().max(0) as u64
     }
 }
 

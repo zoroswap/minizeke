@@ -10,12 +10,16 @@ use minizeke::{
         metrics::Metrics,
         oracle::OracleClient,
         trader::{
-            build_simulation_client, load_traders, reset_setup_artifacts, run_trader, setup_traders,
-            validate_deployment, warm_auth_sessions,
+            TraderRegistry, build_simulation_client, load_traders, reset_setup_artifacts,
+            run_growth_loop, run_trader, run_vault_cycle_loop, setup_traders, validate_deployment,
+            warm_auth_sessions,
         },
     },
 };
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::{Mutex, Semaphore, watch},
+    task::JoinSet,
+};
 use tracing::info;
 
 #[tokio::main]
@@ -25,7 +29,7 @@ async fn main() -> Result<()> {
     config.validate()?;
     init_tracing(config.verbose);
 
-    let deployment = Deployment::load()?;
+    let mut deployment = Deployment::load()?;
     validate_deployment(&deployment)?;
     let api = SimulationApi::new(
         &config.api_url,
@@ -46,7 +50,7 @@ async fn main() -> Result<()> {
     } else {
         setup_traders(
             &config,
-            &deployment,
+            &mut deployment,
             &api,
             &metrics,
             &mut miden_client,
@@ -85,6 +89,8 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(config);
     let deployment = Arc::new(deployment);
+    let registry: TraderRegistry = Arc::new(Mutex::new(traders.clone()));
+    let prove_slots = Arc::new(Semaphore::new(config.setup_concurrency));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
     for (trader, session) in traders.into_iter().zip(sessions) {
@@ -96,6 +102,39 @@ async fn main() -> Result<()> {
             oracle.clone(),
             metrics.clone(),
             Some(session),
+            shutdown_rx.clone(),
+        ));
+    }
+
+    if config.keep_increasing {
+        info!(
+            max_traders = config.max_traders,
+            grow_interval_secs = config.grow_interval_secs,
+            "starting live trader growth"
+        );
+        tasks.spawn(run_growth_loop(
+            config.clone(),
+            api.clone(),
+            oracle.clone(),
+            metrics.clone(),
+            registry.clone(),
+            prove_slots.clone(),
+            shutdown_rx.clone(),
+        ));
+    }
+
+    if config.vault_cycle_interval_secs > 0 {
+        info!(
+            interval_secs = config.vault_cycle_interval_secs,
+            amount = config.vault_cycle_amount,
+            "starting vault fund/redeem cycles"
+        );
+        tasks.spawn(run_vault_cycle_loop(
+            config.clone(),
+            api.clone(),
+            metrics.clone(),
+            registry,
+            prove_slots,
             shutdown_rx.clone(),
         ));
     }
@@ -114,9 +153,10 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = summary.tick() => metrics.print_summary(false),
             result = tokio::signal::ctrl_c() => {
-                result?;
-                info!("Ctrl+C received; stopping traders");
-                break;
+                let _ = result;
+                // Immediate hard kill — do not drain traders / onboarding.
+                eprintln!("Ctrl+C");
+                std::process::exit(130);
             }
             _ = &mut duration => {
                 info!("configured simulation duration elapsed");

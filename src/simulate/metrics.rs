@@ -42,9 +42,12 @@ impl Metrics {
         trader.attempted += 1;
         match measurement.outcome {
             OrderOutcome::Accepted => trader.accepted += 1,
+            OrderOutcome::Confirmed => trader.confirmed += 1,
             OrderOutcome::RateLimited => trader.rate_limited += 1,
             OrderOutcome::Rejected => trader.rejected += 1,
             OrderOutcome::Failed => trader.failed += 1,
+            OrderOutcome::ExecutionFailed => trader.execution_failed += 1,
+            OrderOutcome::TimedOut => trader.timed_out += 1,
         }
         trader.oracle.push(measurement.oracle);
         if let Some(auth) = measurement.auth {
@@ -54,6 +57,9 @@ impl Metrics {
             trader.auth_wait.push(auth_wait);
         }
         trader.order.push(measurement.order);
+        if let Some(settle) = measurement.settle {
+            trader.settle.push(settle);
+        }
         trader.cycle.push(measurement.cycle);
     }
 
@@ -68,6 +74,15 @@ impl Metrics {
         trader.cycle.push(cycle);
     }
 
+    pub fn record_vault_cycle(&self, ok: bool) {
+        let mut inner = self.inner.lock().expect("metrics mutex poisoned");
+        if ok {
+            inner.vault_cycle_ok += 1;
+        } else {
+            inner.vault_cycle_failed += 1;
+        }
+    }
+
     pub fn print_summary(&self, final_summary: bool) {
         let inner = self.inner.lock().expect("metrics mutex poisoned");
         let label = if final_summary { "FINAL" } else { "ROLLING" };
@@ -77,41 +92,53 @@ impl Metrics {
             .fold(OutcomeCounts::default(), |mut total, trader| {
                 total.attempted += trader.attempted;
                 total.accepted += trader.accepted;
+                total.confirmed += trader.confirmed;
                 total.rate_limited += trader.rate_limited;
                 total.rejected += trader.rejected;
                 total.failed += trader.failed;
+                total.execution_failed += trader.execution_failed;
+                total.timed_out += trader.timed_out;
                 total
             });
         println!(
-            "[{label}] traders={} attempted={} accepted={} rate_limited={} rejected={} failed={}",
+            "[{label}] traders={} attempted={} confirmed={} admitted_only={} rate_limited={} \
+             rejected={} exec_failed={} timed_out={} failed={} vault_ok={} vault_fail={}",
             inner.traders.len(),
             totals.attempted,
+            totals.confirmed,
             totals.accepted,
             totals.rate_limited,
             totals.rejected,
+            totals.execution_failed,
+            totals.timed_out,
             totals.failed,
+            inner.vault_cycle_ok,
+            inner.vault_cycle_failed,
         );
         for (index, trader) in &inner.traders {
             if trader.attempted == 0 && !final_summary {
                 continue;
             }
             println!(
-                "  trader={index} tier={} trades={} ok={} 429={} rejected={} failed={} \
-                 oracle[p50/p95]={}/{}ms auth={}/{}ms auth_wait={}/{}ms order={}/{}ms cycle={}/{}ms",
+                "  trader={index} tier={} trades={} confirmed={} 429={} rejected={} \
+                 exec_failed={} timed_out={} failed={} \
+                 oracle[p50/p95]={}/{}ms auth={}/{}ms order={}/{}ms settle={}/{}ms cycle={}/{}ms",
                 trader.tier.label(),
                 trader.attempted,
-                trader.accepted,
+                trader.confirmed,
                 trader.rate_limited,
                 trader.rejected,
+                trader.execution_failed,
+                trader.timed_out,
                 trader.failed,
                 trader.oracle.percentile(50),
                 trader.oracle.percentile(95),
                 trader.auth.percentile(50),
                 trader.auth.percentile(95),
-                trader.auth_wait.percentile(50),
-                trader.auth_wait.percentile(95),
                 trader.order.percentile(50),
                 trader.order.percentile(95),
+                trader.settle.percentile(50),
+                trader.settle.percentile(95),
                 trader.cycle.percentile(50),
                 trader.cycle.percentile(95),
             );
@@ -145,25 +172,33 @@ pub struct TradeMeasurement {
     pub auth: Option<Duration>,
     pub auth_wait: Option<Duration>,
     pub order: Duration,
+    /// Admit → WS terminal latency when applicable.
+    pub settle: Option<Duration>,
     pub cycle: Duration,
 }
 
 #[derive(Default)]
 struct MetricsInner {
     traders: BTreeMap<usize, TraderMetrics>,
+    vault_cycle_ok: u64,
+    vault_cycle_failed: u64,
 }
 
 struct TraderMetrics {
     tier: TraderTier,
     attempted: u64,
     accepted: u64,
+    confirmed: u64,
     rate_limited: u64,
     rejected: u64,
     failed: u64,
+    execution_failed: u64,
+    timed_out: u64,
     oracle: Samples,
     auth: Samples,
     auth_wait: Samples,
     order: Samples,
+    settle: Samples,
     cycle: Samples,
     setup_mint: Samples,
     setup_register: Samples,
@@ -176,13 +211,17 @@ impl TraderMetrics {
             tier,
             attempted: 0,
             accepted: 0,
+            confirmed: 0,
             rate_limited: 0,
             rejected: 0,
             failed: 0,
+            execution_failed: 0,
+            timed_out: 0,
             oracle: Samples::default(),
             auth: Samples::default(),
             auth_wait: Samples::default(),
             order: Samples::default(),
+            settle: Samples::default(),
             cycle: Samples::default(),
             setup_mint: Samples::default(),
             setup_register: Samples::default(),
@@ -218,9 +257,12 @@ impl Samples {
 struct OutcomeCounts {
     attempted: u64,
     accepted: u64,
+    confirmed: u64,
     rate_limited: u64,
     rejected: u64,
     failed: u64,
+    execution_failed: u64,
+    timed_out: u64,
 }
 
 pub fn jittered_interval(base: Duration, jitter: f64) -> Duration {
