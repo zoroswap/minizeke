@@ -1,0 +1,35 @@
+use miden::core::sys
+use miden::protocol::active_note
+
+use zoro_miden::vault
+use zoro_miden::lib::asset_utils
+use zoro_miden::note::common
+use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
+
+# Operator-only note that raises an LP's cumulative entitlement.
+#
+# Note storage layout:
+# word 0: [asset_id_suffix, asset_id_prefix, 0, new_entitlement]
+# word 1: [lp_id_suffix, lp_id_prefix, 0, 0]
+# word 2: BENEFICIARY [operator_id_suffix, operator_id_prefix, 0, 0]
+proc execute_CHECKPOINT
+    exec.active_note::get_sender
+    # => [sender_suffix, sender_prefix]
+
+    padw exec.common::get_metadata exec.vault::address_from_asset
+    # => [lp_suffix, lp_prefix, sender_suffix, sender_prefix]
+
+    padw exec.common::get_expected_asset exec.vault::address_from_asset
+    # => [asset_suffix, asset_prefix, lp_suffix, lp_prefix, sender...]
+    padw exec.common::get_expected_asset exec.asset_utils::get_amount_c
+    # => [new_entitlement, asset_suffix, asset_prefix, lp_suffix, lp_prefix, sender...]
+
+    call.vault::checkpoint_lp_entitlement
+end
+
+@note_script
+pub proc main
+    push.DEFAULT_NUMBER_OF_STORAGE_ITEMS exec.common::store_storage_to_memory drop
+    exec.execute_CHECKPOINT
+    exec.sys::truncate_stack
+end

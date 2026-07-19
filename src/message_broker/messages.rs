@@ -7,9 +7,10 @@ use crate::{
 };
 
 /// Messages sent from client to server
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    Authenticate { token: String },
     Subscribe { channels: Vec<SubscriptionChannel> },
     Unsubscribe { channels: Vec<SubscriptionChannel> },
     Ping,
@@ -25,6 +26,10 @@ pub enum ServerMessage {
     },
     Unsubscribed {
         channel: SubscriptionChannel,
+    },
+    Authenticated {
+        user_id: String,
+        expires_at: u64,
     },
 
     // Data updates
@@ -55,6 +60,20 @@ pub enum ServerMessage {
         user_id: String,
         faucet_id: String,
         amount: u64,
+    },
+    AnalyticsUpdate {
+        user_id: String,
+        timestamp: u64,
+    },
+    Trade {
+        order_id: String,
+        pair: String,
+        asset_in: String,
+        asset_out: String,
+        amount_in: u64,
+        amount_out: u64,
+        price: u64,
+        timestamp: u64,
     },
     AmmUpdate {
         status: AmmEvent,
@@ -91,10 +110,17 @@ pub enum SubscriptionChannel {
         #[serde(default)]
         user_id: Option<String>,
     },
+    #[serde(rename = "analytics")]
+    Analytics {
+        #[serde(default)]
+        user_id: Option<String>,
+    },
     #[serde(rename = "amm")]
     AmmEvent {},
     #[serde(rename = "stats")]
     Stats,
+    #[serde(rename = "trades")]
+    Trades,
 }
 
 impl SubscriptionChannel {
@@ -138,18 +164,23 @@ impl SubscriptionChannel {
                 SubscriptionChannel::OraclePrices { .. },
             ) => true,
             (SubscriptionChannel::Stats, SubscriptionChannel::Stats) => true,
+            (SubscriptionChannel::Trades, SubscriptionChannel::Trades) => true,
             (SubscriptionChannel::AmmEvent {}, SubscriptionChannel::AmmEvent {}) => true,
             (
-                SubscriptionChannel::UserEvent {
-                    user_id: Some(id1),
-                },
-                SubscriptionChannel::UserEvent {
-                    user_id: Some(id2),
-                },
+                SubscriptionChannel::UserEvent { user_id: Some(id1) },
+                SubscriptionChannel::UserEvent { user_id: Some(id2) },
             ) => id1 == id2,
             (
                 SubscriptionChannel::UserEvent { user_id: None },
                 SubscriptionChannel::UserEvent { .. },
+            ) => true,
+            (
+                SubscriptionChannel::Analytics { user_id: Some(id1) },
+                SubscriptionChannel::Analytics { user_id: Some(id2) },
+            ) => id1 == id2,
+            (
+                SubscriptionChannel::Analytics { user_id: None },
+                SubscriptionChannel::Analytics { .. },
             ) => true,
             _ => false,
         }
@@ -200,7 +231,7 @@ mod tests {
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("OrderUpdate"));
-        assert!(json.contains("executed"));
+        assert!(json.contains("\"status\":\"Executed\""));
         assert!(json.contains("order_id"));
     }
 
@@ -216,6 +247,8 @@ mod tests {
                 created: 1,
                 processing: 1,
                 processed: 0,
+                submitted: 0,
+                confirmed: 0,
                 executed: 1,
                 settled: 0,
                 failed: 0,

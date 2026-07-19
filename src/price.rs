@@ -1,3 +1,4 @@
+use alloy_primitives::U256;
 use chrono::Utc;
 
 #[derive(Clone, Debug, Copy)]
@@ -18,8 +19,10 @@ impl PriceData {
         }
     }
 
-    pub fn quote_with(&self, other_price: u64) -> u64 {
+    /// Pair price of this asset quoted in `other_price`'s asset, scaled by 1e12
+    /// (the curve's `PRICE_SCALING_FACTOR`).
+    pub fn quote_with(&self, other_price: u64) -> U256 {
         let price = self.price as f64 / other_price as f64;
-        price as u64
+        U256::from(price * 1e12)
     }
 }

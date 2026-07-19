@@ -1,7 +1,4 @@
-use miden_client::{
-    account::{AccountId, StorageSlotId},
-    auth::PublicKeyCommitment,
-};
+use miden_client::account::{AccountId, StorageSlotId};
 
 use crate::intent::Intent;
 
@@ -9,8 +6,6 @@ pub struct Trade {
     pub user: StorageSlotId,
     pub sell_asset: AccountId,
     pub buy_asset: AccountId,
-    pub sell_asset_index: u64,
-    pub buy_asset_index: u64,
     pub sell_amount: u64,
     pub buy_amount: u64,
     pub intent: Intent,
@@ -40,19 +35,25 @@ pub fn make_exec_script(intents: Vec<Intent>) -> String {
 
     for intent in intents {
         let Intent {
+            purpose,
+            domain,
+            network,
             user_suffix,
             user_prefix,
-            user_key_prefix,
-            user_key_suffix,
-            sell_idx,
+            sell_asset_suffix,
+            sell_asset_prefix,
             sell_amount,
-            buy_idx,
+            buy_asset_suffix,
+            buy_asset_prefix,
             buy_amount,
+            client_order_id,
+            expires_at,
         } = intent;
+        let [uuid0, uuid1, uuid2, uuid3] = client_order_id;
 
         let trade_string = format!(
             r#"
-       push.{buy_amount}.{buy_idx}.{user_key_prefix}.{user_key_suffix}.{sell_amount}.{sell_idx}.{user_prefix}.{user_suffix}   
+       push.{expires_at}.{uuid3}.{uuid2}.{uuid1}.{uuid0}.{buy_amount}.{buy_asset_prefix}.{buy_asset_suffix}.{sell_amount}.{sell_asset_prefix}.{sell_asset_suffix}.{user_prefix}.{user_suffix}.{network}.{domain}.{purpose}
        call.execute_swap"#,
         );
 

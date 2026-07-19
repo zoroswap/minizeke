@@ -1,0 +1,27 @@
+use miden::core::sys
+use miden::protocol::active_note
+
+use zoro_miden::vault
+use zoro_miden::note::common
+use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
+
+# Operator-only note that authorizes a pool on the vault and makes it active.
+#
+# Note storage layout:
+# word 0: POOL_ID [pool_id_suffix, pool_id_prefix, 0, 0]
+# word 1: METADATA [0, 0, 0, 0]
+# word 2: BENEFICIARY [operator_id_suffix, operator_id_prefix, 0, 0]
+proc execute_ADD_POOL
+    exec.active_note::get_sender
+    # => [sender_suffix, sender_prefix]
+    padw exec.common::get_expected_asset exec.vault::address_from_asset
+    # => [pool_id_suffix, pool_id_prefix, sender_suffix, sender_prefix]
+    call.vault::add_authorized_pool
+end
+
+@note_script
+pub proc main
+    push.DEFAULT_NUMBER_OF_STORAGE_ITEMS exec.common::store_storage_to_memory drop
+    exec.execute_ADD_POOL
+    exec.sys::truncate_stack
+end

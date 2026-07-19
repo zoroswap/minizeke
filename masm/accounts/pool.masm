@@ -1,266 +1,555 @@
 use miden::protocol::active_account
 use miden::protocol::native_account
+use miden::protocol::tx
+use miden::core::sys
 
 use zoro_miden::operator
-# ZORO POOL (barebones standalone POC)
+use zoro_miden::lib::math
+
+# ZORO POOL (trading / accounting layer)
 #
-# Holds NO custody. Tracks virtual per-user balances, total asset balances and
-# per-asset pool balances. Executes swaps from off-chain messages (tx scripts).
+# The pool stores one generic accounting cell per (asset, user):
 #
-# KEY CONVENTION:
-#   user-asset KEY = [asset_suffix, asset_prefix, user_suffix, user_prefix]
-#   asset-only KEY = [asset_suffix, asset_prefix, 0, 0]
+#   [bought, sold, 0, 0]
+#
+# Cells are allocated lazily. CELL_INDEX maps the full key
+# [asset_suffix, asset_prefix, user_suffix, user_prefix] to a hashed value-slot id.
+# CELL_SLOT_IDS maps a dense allocation index to that slot id because hashed slot names cannot
+# be derived in MASM. A missing CELL_INDEX entry is a read-only zero balance.
+
+# The pool component owns 247 cell slots plus these six metadata slots. AuthSingleSig owns two
+# more and BasicWallet owns none, exactly fitting the account limit of 255 storage slots.
+const MAX_POOL_CELLS = 247
 
 # STORAGE SLOTS
+const CELL_SLOT_IDS_SLOT = word("zoropool::cell_slot_ids")
+const CELL_INDEX_SLOT = word("zoropool::cell_index")
+const NEXT_CELL_SLOT = word("zoropool::next_cell")
+const VAULT_ACCOUNT_ID_SLOT = word("zoropool::vault_account_id")
+const USER_TRADING_DETAILS_PROC_ROOT_SLOT = word("zoropool::user_trading_details_proc_root")
+const USER_NONCE_WINDOWS_SLOT = word("zoropool::user_nonce_windows")
+
+# Signed intent v3 constants. These must match src/intent.rs.
+const SWAP_PURPOSE_TAG = 6506385721141900032
+const INTENT_DOMAIN_TAG = 7883954021992852325
+const TESTNET_NETWORK_TAG = 8387236824952960000
+const NONCE_WINDOW_SIZE = 96
 
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "POOL: insufficient available balance for swap"
-const ERR_INVALID_POOL_STATE_TRYING_TO_SUB_AND_ADD = "POOL: invalid pool state trying to sub AND add"
-
-
-const ERR_UNDERFLOW = "Underflow"
-const ERR_OVERFLOW = "Overflow"
-
+const ERR_MAX_POOL_CELLS_REACHED = "POOL: maximum asset-user cells reached"
+const ERR_INVALID_INTENT_DOMAIN = "POOL: invalid v3 intent domain"
+const ERR_INTENT_EXPIRED = "POOL: signed intent expired"
+const ERR_ORDER_ALREADY_CONSUMED = "POOL: order nonce already consumed in user window"
+const ERR_STALE_NONCE = "POOL: order nonce is below the user's sliding window"
 
 # ----------------------------------------------------------------------------------------------
-# USER ASSET BALANCE
+# ID HELPERS
 # ----------------------------------------------------------------------------------------------
 
-    
-#! USER_ASSET_BALANCES(assetId, userId) += amount
-#! Inputs:  [ slot_prefix, slot_suffix, idx, amount]
-#! Outputs: []
-pub proc add_to_user_balance
-    exec.add_to_storage_item_at_idx
-    # => []
+#! Inputs:  []
+#! Outputs: [vault_id_suffix, vault_id_prefix]
+pub proc get_vault_account_id
+    push.VAULT_ACCOUNT_ID_SLOT[0..2]
+    exec.active_account::get_item
+    movup.2 drop movup.2 drop
 end
 
-#! USER_ASSET_BALANCES(assetId, userId) -= amount
-#! Inputs:  [slot_prefix, slot_suffix, idx, amount]
+#! Inputs:  [vault_id_suffix, vault_id_prefix]
 #! Outputs: []
-pub proc sub_from_user_balance
-    exec.sub_from_storage_item_at_idx
-    # => []
+pub proc set_vault_account_id
+    push.0.0 movup.3 movup.3
+    push.VAULT_ACCOUNT_ID_SLOT[0..2]
+    exec.native_account::set_item dropw
+    exec.sys::truncate_stack
 end
 
-#! Raw local map value.
-#! Inputs:  [index]
-#! Outputs: [slot_prefix, slot_suffix, idx]
-pub proc get_user_asset_balance
-    exec.get_storage_item_at_idx
-    # => [amount]
+#! Inputs:  [WORD]
+#! Outputs: [is_zero_word]
+proc is_zero_word
+    eq.0 swap eq.0 and swap eq.0 and swap eq.0 and
 end
 
-
 # ----------------------------------------------------------------------------------------------
-# POOL BALANCE  (POOL_BALANCES value word = [poolBalance, 0, 0, 0])
+# ASSET-USER CELL ACCESS
 # ----------------------------------------------------------------------------------------------
 
-#! Inputs:  [amount]
+#! Returns the cell slot id for KEY, or [0, 0, 0, 0] if no cell has been allocated.
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: [SLOT_ID] = [slot_suffix, slot_prefix, 0, 0]
+pub proc get_cell_slot_id
+    push.CELL_INDEX_SLOT[0..2]
+    exec.active_account::get_map_item
+end
+
+#! Read-only lookup. A missing cell is represented by the zero word.
+#! Inputs:  [KEY]
+#! Outputs: [CELL] = [bought, sold, 0, 0]
+pub proc get_cell_word
+    exec.get_cell_slot_id
+    dupw exec.is_zero_word
+    if.true
+        dropw padw
+    else
+        movup.2 drop movup.2 drop
+        exec.active_account::get_item
+    end
+end
+
+#! Resolves KEY to a cell slot, allocating the next generic cell when absent.
+#! Inputs:  [KEY]
+#! Outputs: [slot_suffix, slot_prefix]
+const GOC_KEY_LOCAL = 0
+const GOC_SLOT_ID_LOCAL = 4
+const GOC_INDEX_LOCAL = 8
+@locals(9)
+proc get_or_create_cell_slot_id
+    loc_storew_be.GOC_KEY_LOCAL dropw
+
+    padw loc_loadw_be.GOC_KEY_LOCAL
+    exec.get_cell_slot_id
+    dupw exec.is_zero_word
+    if.true
+        dropw
+
+        # index = NEXT_CELL; assert capacity remains.
+        push.NEXT_CELL_SLOT[0..2]
+        exec.active_account::get_item
+        movdn.3 drop drop drop
+        dup loc_store.GOC_INDEX_LOCAL
+        push.MAX_POOL_CELLS lt assert.err=ERR_MAX_POOL_CELLS_REACHED
+
+        # SLOT_ID = CELL_SLOT_IDS[index].
+        push.0.0.0 loc_load.GOC_INDEX_LOCAL
+        push.CELL_SLOT_IDS_SLOT[0..2]
+        exec.active_account::get_map_item
+        loc_storew_be.GOC_SLOT_ID_LOCAL dropw
+
+        # CELL_INDEX[KEY] = SLOT_ID.
+        padw loc_loadw_be.GOC_SLOT_ID_LOCAL
+        padw loc_loadw_be.GOC_KEY_LOCAL
+        push.CELL_INDEX_SLOT[0..2]
+        exec.native_account::set_map_item dropw
+
+        # NEXT_CELL = index + 1.
+        push.0.0.0 loc_load.GOC_INDEX_LOCAL add.1
+        push.NEXT_CELL_SLOT[0..2]
+        exec.native_account::set_item dropw
+
+        padw loc_loadw_be.GOC_SLOT_ID_LOCAL
+    end
+
+    movup.2 drop movup.2 drop
+end
+
+#! Inputs:  [slot_suffix, slot_prefix, amount]
 #! Outputs: []
+const ATS_SLOT_SUFFIX_LOCAL = 0
+const ATS_SLOT_PREFIX_LOCAL = 1
+@locals(2)
+proc add_to_sold
+    dup loc_store.ATS_SLOT_SUFFIX_LOCAL dup.1 loc_store.ATS_SLOT_PREFIX_LOCAL
+    exec.active_account::get_item
+    # => [bought, sold, 0, 0, amount]
+    movup.4 movup.2 exec.math::safe_add swap
+    # => [bought, sold + amount, 0, 0]
+    loc_load.ATS_SLOT_PREFIX_LOCAL loc_load.ATS_SLOT_SUFFIX_LOCAL
+    exec.native_account::set_item dropw
+end
 
+#! Inputs:  [slot_suffix, slot_prefix, amount]
+#! Outputs: []
+const ATB_SLOT_SUFFIX_LOCAL = 0
+const ATB_SLOT_PREFIX_LOCAL = 1
+@locals(2)
+proc add_to_bought
+    dup loc_store.ATB_SLOT_SUFFIX_LOCAL dup.1 loc_store.ATB_SLOT_PREFIX_LOCAL
+    exec.active_account::get_item
+    # => [bought, sold, 0, 0, amount]
+    movup.4 exec.math::safe_add
+    # => [bought + amount, sold, 0, 0]
+    loc_load.ATB_SLOT_PREFIX_LOCAL loc_load.ATB_SLOT_SUFFIX_LOCAL
+    exec.native_account::set_item dropw
+end
 
-#pub proc add_to_pool_0_balance
-#    push.POOL_0_BALANCE_SLOT[0..2] exec.add_to_storage_item
-#end
+# ----------------------------------------------------------------------------------------------
+# BALANCE DERIVATION
+# ----------------------------------------------------------------------------------------------
+
+#! Inputs:  [bought, sold, total_funding, total_redeemed, pending_redeem]
+#! Outputs: [balance, available_balance]
+const CBD_BALANCE_LOCAL = 0
+@locals(1)
+proc compute_balance_details
+    movup.2 exec.math::safe_add
+    swap exec.math::safe_sub
+    swap exec.math::safe_sub
+    dup loc_store.CBD_BALANCE_LOCAL
+    swap exec.math::safe_sub
+    loc_load.CBD_BALANCE_LOCAL
+end
+
+#! FPI export for vault redeem flows. Missing cells contribute bought=0 and sold=0.
+#! Inputs:  [user_suffix, user_prefix, asset_suffix, asset_prefix,
+#!           total_funding, total_redeemed, pending_redeem]
+#! Outputs: [balance, available_balance]
+const GBD_USER_SUFFIX_LOCAL = 0
+const GBD_USER_PREFIX_LOCAL = 1
+const GBD_ASSET_SUFFIX_LOCAL = 2
+const GBD_ASSET_PREFIX_LOCAL = 3
+@locals(4)
+pub proc get_user_asset_balance_details_with_vault_values
+    loc_store.GBD_USER_SUFFIX_LOCAL
+    loc_store.GBD_USER_PREFIX_LOCAL
+    loc_store.GBD_ASSET_SUFFIX_LOCAL
+    loc_store.GBD_ASSET_PREFIX_LOCAL
+    # => [total_funding, total_redeemed, pending_redeem]
+
+    loc_load.GBD_USER_PREFIX_LOCAL
+    loc_load.GBD_USER_SUFFIX_LOCAL
+    loc_load.GBD_ASSET_PREFIX_LOCAL
+    loc_load.GBD_ASSET_SUFFIX_LOCAL
+    exec.get_cell_word
+    # => [bought, sold, 0, 0, totals(3)]
+    movup.2 drop movup.2 drop
+    exec.compute_balance_details
+    exec.sys::truncate_stack
+end
+
+# ----------------------------------------------------------------------------------------------
+# FPI CALLS
+# ----------------------------------------------------------------------------------------------
+
+#! Inputs:  [KEY] = [asset_suffix, asset_prefix, user_suffix, user_prefix]
+#! Outputs: [total_funding, total_redeemed, pending_redeem, PK_COMM, pad(9)]
+pub proc fetch_user_trading_details
+    padw padw padw movupw.3
+    push.USER_TRADING_DETAILS_PROC_ROOT_SLOT[0..2]
+    exec.active_account::get_item
+    exec.get_vault_account_id
+    exec.tx::execute_foreign_procedure
+end
+
+# ----------------------------------------------------------------------------------------------
+# PER-USER SLIDING NONCE WINDOW
+# ----------------------------------------------------------------------------------------------
 #
-#pub proc sub_from_pool_0_balance
-#    push.POOL_0_BALANCE_SLOT[0..2] exec.sub_from_storage_item
-#end
-#
-#pub proc set_pool_0_balance(amount: felt)
-#    push.0.0.0 movup.3
-#    push.POOL_0_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
-#end
-#
-#pub proc set_pool_1_balance(amount: felt)
-#    push.0.0.0 movup.3
-#    push.POOL_1_BALANCE_SLOT[0..2] exec.native_account::set_item dropw
-#end
-#
-#pub proc add_to_pool_1_balance
-#    push.POOL_1_BALANCE_SLOT[0..2] exec.add_to_storage_item
-#end
-#
-#pub proc sub_from_pool_1_balance
-#    push.POOL_1_BALANCE_SLOT[0..2] exec.sub_from_storage_item
-#end
-#
-#
-#
-#pub proc get_pool_0_balance
-#    push.POOL_0_BALANCE_SLOT[0..2]
-#    exec.active_account::get_item
-#    movdn.3 drop drop drop
-#    # => [poolBalance]
-#end
-#
-#
-#pub proc get_pool_1_balance
-#    push.POOL_1_BALANCE_SLOT[0..2]
-#    exec.active_account::get_item
-#    movdn.3 drop drop drop
-#    # => [poolBalance]
-#end
+# Storage: user_nonce_windows[user_key] = [base_nonce, bitmap0, bitmap1, bitmap2]
+# Bit i of the concatenated 96-bit bitmap marks nonce (base_nonce + i) as consumed.
+
+const NW_BASE_LOCAL = 0
+const NW_BM0_LOCAL = 1
+const NW_BM1_LOCAL = 2
+const NW_BM2_LOCAL = 3
+const NW_NONCE_LOCAL = 4
+const NW_SHIFT_LOCAL = 5
+const NW_TMP_LOCAL = 6
+
+#! Loads the user's window, slides if needed, and marks `nonce` consumed.
+#! Inputs:  [nonce, user_suffix, user_prefix]
+#! Outputs: [base, bm0, bm1, bm2]  (updated window word elements, base on top)
+#! Invocation: exec
+@locals(7)
+proc prepare_user_nonce_window
+    loc_store.NW_NONCE_LOCAL
+    # => [user_suffix, user_prefix]
+    push.0.0 movup.3 movup.3
+    # => [user_suffix, user_prefix, 0, 0]
+    push.USER_NONCE_WINDOWS_SLOT[0..2]
+    exec.active_account::get_map_item
+    # => [base, bm0, bm1, bm2] with base on top
+    loc_store.NW_BASE_LOCAL
+    loc_store.NW_BM0_LOCAL
+    loc_store.NW_BM1_LOCAL
+    loc_store.NW_BM2_LOCAL
+
+    # reject stale: nonce >= base.
+    # `gte` compares next with top, so load nonce then base (threshold on top).
+    loc_load.NW_NONCE_LOCAL
+    loc_load.NW_BASE_LOCAL
+    gte assert.err=ERR_STALE_NONCE
+
+    # offset = nonce - base (`sub` = next - top).
+    loc_load.NW_NONCE_LOCAL
+    loc_load.NW_BASE_LOCAL
+    sub
+    dup push.NONCE_WINDOW_SIZE lt
+    if.true
+        # offset remains on stack for the bit update below
+    else
+        # slide so nonce sits at the high end of the window
+        drop
+        loc_load.NW_NONCE_LOCAL
+        push.95 sub
+        # => [new_base]
+        dup
+        loc_load.NW_BASE_LOCAL
+        swap sub
+        # => [shift, new_base]
+        swap loc_store.NW_BASE_LOCAL
+        loc_store.NW_SHIFT_LOCAL
+
+        # Right-shift the 96-bit bitmap by `shift` bits.
+        loc_load.NW_SHIFT_LOCAL push.0 eq
+        if.true
+            # no-op
+        else
+            loc_load.NW_SHIFT_LOCAL push.NONCE_WINDOW_SIZE gte
+            if.true
+                push.0 loc_store.NW_BM0_LOCAL
+                push.0 loc_store.NW_BM1_LOCAL
+                push.0 loc_store.NW_BM2_LOCAL
+            else
+                loc_load.NW_SHIFT_LOCAL push.64 gte
+                if.true
+                    loc_load.NW_SHIFT_LOCAL push.64 sub
+                    loc_load.NW_BM2_LOCAL swap u32shr
+                    loc_store.NW_BM0_LOCAL
+                    push.0 loc_store.NW_BM1_LOCAL
+                    push.0 loc_store.NW_BM2_LOCAL
+                else
+                    loc_load.NW_SHIFT_LOCAL push.32 gte
+                    if.true
+                        loc_load.NW_SHIFT_LOCAL push.32 sub
+                        loc_store.NW_SHIFT_LOCAL
+                        push.32 loc_load.NW_SHIFT_LOCAL sub
+                        loc_store.NW_TMP_LOCAL
+                        # n0 = (b1 >> s2) | (b2 << (32-s2))
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM1_LOCAL swap u32shr
+                        loc_load.NW_TMP_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shl
+                        u32or loc_store.NW_BM0_LOCAL
+                        # n1 = b2 >> s2
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shr
+                        loc_store.NW_BM1_LOCAL
+                        push.0 loc_store.NW_BM2_LOCAL
+                    else
+                        # 0 < shift < 32
+                        push.32 loc_load.NW_SHIFT_LOCAL sub
+                        loc_store.NW_TMP_LOCAL
+                        # n0 = (b0 >> s) | (b1 << (32-s))
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM0_LOCAL swap u32shr
+                        loc_load.NW_TMP_LOCAL
+                        loc_load.NW_BM1_LOCAL swap u32shl
+                        u32or
+                        # n1 = (b1 >> s) | (b2 << (32-s))
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM1_LOCAL swap u32shr
+                        loc_load.NW_TMP_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shl
+                        u32or
+                        # n2 = b2 >> s
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shr
+                        # => [n2, n1, n0]
+                        loc_store.NW_BM2_LOCAL
+                        loc_store.NW_BM1_LOCAL
+                        loc_store.NW_BM0_LOCAL
+                    end
+                end
+            end
+        end
+        push.95
+    end
+
+    # Assert the selected bit is clear, then set it.
+    dup push.32 lt
+    if.true
+        push.1 swap u32shl
+        loc_load.NW_BM0_LOCAL
+        dup.1 u32and eq.0 assert.err=ERR_ORDER_ALREADY_CONSUMED
+        loc_load.NW_BM0_LOCAL u32or
+        loc_store.NW_BM0_LOCAL
+    else
+        dup push.64 lt
+        if.true
+            push.32 sub
+            push.1 swap u32shl
+            loc_load.NW_BM1_LOCAL
+            dup.1 u32and eq.0 assert.err=ERR_ORDER_ALREADY_CONSUMED
+            loc_load.NW_BM1_LOCAL u32or
+            loc_store.NW_BM1_LOCAL
+        else
+            push.64 sub
+            push.1 swap u32shl
+            loc_load.NW_BM2_LOCAL
+            dup.1 u32and eq.0 assert.err=ERR_ORDER_ALREADY_CONSUMED
+            loc_load.NW_BM2_LOCAL u32or
+            loc_store.NW_BM2_LOCAL
+        end
+    end
+
+    loc_load.NW_BM2_LOCAL
+    loc_load.NW_BM1_LOCAL
+    loc_load.NW_BM0_LOCAL
+    loc_load.NW_BASE_LOCAL
+end
 
 # ----------------------------------------------------------------------------------------------
 # SWAP
 # ----------------------------------------------------------------------------------------------
 
-pub proc execute_swap
-    # exec.operator::populate_adv_stack
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]
-    exec.operator::verify_signature
-    # => [user_key_suffix, user_key_prefix, sell_idx, sell_amount, user_suffix, user_prefix, buy_idx, buy_amount]
-    drop drop dup.3 dup.3
-    # => [user_suffix, user_prefix, sell_idx, sell_amount,  user_suffix, user_prefix, buy_idx, buy_amount]
-    exec.sub_from_user_balance
-    # => [BUY_KEY]
-    exec.add_to_user_balance
-    # => []
-end
-
-# ----------------------------------------------------------------------------------------------
-# POOL BALANCE ACCOUNTING
-# ----------------------------------------------------------------------------------------------
-
-
-
-
-#! Atomically increments a storage map entry: map[KEY] += VALUE.
-#! Reads the current value via get_map_item, adds VALUE, writes back via set_map_item.
-#!
-#! Inputs: [slot_id_prefix, slot_id_suffix, KEY, VALUE]
+#! Executes a signed, asset-agnostic swap.
+#! Inputs:  [purpose, domain, network, user_suffix, user_prefix, sell_asset_suffix,
+#!           sell_asset_prefix, sell_amount, buy_asset_suffix, buy_asset_prefix,
+#!           buy_amount, nonce, uuid1, uuid2, uuid3, expires_at]
+#! Advice:  [PK[9], SIG[17], ...]
 #! Outputs: []
-#pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word, sub_by: felt)
-#    # duplicate the map accessor inputs
-#    dup.5 dup.5 dup.5 dup.5 dup.5 dup.5
-#    # => [slot_id_prefix, slot_id_suffix, KEY, slot_id_prefix, slot_id_suffix, KEY,sub_by, ]
-#    exec.active_account::get_map_item
-#    movup.10
-#    # => [sub_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-#    sub
-#    # => [new_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-#    movdn.9 movdn.9 movdn.9 movdn.9
-#    ## set
-#    exec.native_account::set_map_item dropw
-#end
+#! Invocation: call
+const SW_INTENT0_LOCAL = 0
+const SW_INTENT1_LOCAL = 4
+const SW_INTENT2_LOCAL = 8
+const SW_INTENT3_LOCAL = 12
+const SW_FUNDING_LOCAL = 16
+const SW_REDEEMED_LOCAL = 17
+const SW_PENDING_LOCAL = 18
+const SW_PK_LOCAL = 20
+const SW_SELL_SLOT_LOCAL = 24
+const SW_SELL_SLOT_PREFIX_LOCAL = 25
+const SW_BUY_SLOT_LOCAL = 28
+const SW_BUY_SLOT_PREFIX_LOCAL = 29
+const SW_SELL_AMOUNT_LOCAL = 30
+const SW_BUY_AMOUNT_LOCAL = 31
+const SW_USER_SUFFIX_LOCAL = 32
+const SW_USER_PREFIX_LOCAL = 33
+const SW_BUY_ASSET_SUFFIX_LOCAL = 34
+const SW_BUY_ASSET_PREFIX_LOCAL = 35
+const SW_NONCE_LOCAL = 36
+const SW_UUID1_LOCAL = 37
+const SW_UUID2_LOCAL = 38
+const SW_UUID3_LOCAL = 39
+const SW_EXPIRES_AT_LOCAL = 40
+const SW_SELL_ASSET_SUFFIX_LOCAL = 41
+const SW_SELL_ASSET_PREFIX_LOCAL = 42
+const SW_WIN_BASE_LOCAL = 43
+const SW_WIN_BM0_LOCAL = 44
+const SW_WIN_BM1_LOCAL = 45
+const SW_WIN_BM2_LOCAL = 46
+@locals(47)
+pub proc execute_swap
+    loc_storew_be.SW_INTENT0_LOCAL dropw
+    loc_storew_be.SW_INTENT1_LOCAL dropw
+    loc_storew_be.SW_INTENT2_LOCAL dropw
+    loc_storew_be.SW_INTENT3_LOCAL dropw
 
+    # Assert the purpose/domain/network fixed by this freshly deployed v3 pool.
+    loc_loadw_be.SW_INTENT0_LOCAL
+    push.SWAP_PURPOSE_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
+    push.INTENT_DOMAIN_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
+    push.TESTNET_NETWORK_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
+    loc_store.SW_USER_SUFFIX_LOCAL
 
-#pub proc add_to_map_item #(increment_by: felt, slot_id_prefix: felt, slot_id_suffix: felt, key: Word)
-#    # duplicate the map accessor inputs
-#    dup.6 dup.6 dup.6 dup.6 dup.6 dup.6
-#    exec.active_account::get_map_item
-#    # => [old_value, 0, 0, 0, increment_by, slot_id_prefix, slot_id_suffix, KEY]
-#    #movdn.4 drop drop drop
-#    movup.4
-#    # => [increment_by, old_value, 0, 0, 0, slot_id_prefix, slot_id_suffix, KEY]
-#    add
-#    ## set
-#    # => [new_value, 0,0,0,lot_id_prefix, slot_id_suffix, KEY]
-#    #movdn.7 push.0 movdn.8 push.0 movdn.8 push.0 movdn.8
-#    movdn.9 movdn.9 movdn.9 movdn.9
-#    # => [new_value, 0, 0, 0, lot_id_prefix, slot_id_suffix, KEY, new_value, 0, 0, 0]
-#    
-#    exec.native_account::set_map_item  dropw
-#end
+    # Cache all business fields and the client UUID (limb0 = order nonce).
+    loc_loadw_be.SW_INTENT1_LOCAL
+    loc_store.SW_USER_PREFIX_LOCAL
+    loc_store.SW_SELL_ASSET_SUFFIX_LOCAL
+    loc_store.SW_SELL_ASSET_PREFIX_LOCAL
+    loc_store.SW_SELL_AMOUNT_LOCAL
+    loc_loadw_be.SW_INTENT2_LOCAL
+    loc_store.SW_BUY_ASSET_SUFFIX_LOCAL
+    loc_store.SW_BUY_ASSET_PREFIX_LOCAL
+    loc_store.SW_BUY_AMOUNT_LOCAL
+    loc_store.SW_NONCE_LOCAL
+    loc_loadw_be.SW_INTENT3_LOCAL
+    loc_store.SW_UUID1_LOCAL
+    loc_store.SW_UUID2_LOCAL
+    loc_store.SW_UUID3_LOCAL
+    loc_store.SW_EXPIRES_AT_LOCAL
 
+    # The chain timestamp independently enforces the signed expiry.
+    loc_load.SW_EXPIRES_AT_LOCAL
+    exec.tx::get_block_timestamp
+    # => [block_timestamp_unix_seconds, expires_at_unix_seconds]
+    # `lt` compares the next stack item with the top item, so swap to assert
+    # block_timestamp < expires_at. Equality is expired, matching API/Processing.
+    swap lt assert.err=ERR_INTENT_EXPIRED
 
-# @todo: inline
-#pub proc set_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, value: felt) -> felt
-#    ### fill out value with 0 to full word
-#    push.0 movdn.7 push.0 movdn.7 push.0 movdn.7
-#    ### load slot id and key
-#    exec.native_account::set_map_item 
-#    dropw
-#end
+    # Prepare the per-user sliding nonce window. The updated word is cached in locals
+    # and written only after every fallible swap check/update below.
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    loc_load.SW_NONCE_LOCAL
+    exec.prepare_user_nonce_window
+    loc_store.SW_WIN_BASE_LOCAL
+    loc_store.SW_WIN_BM0_LOCAL
+    loc_store.SW_WIN_BM1_LOCAL
+    loc_store.SW_WIN_BM2_LOCAL
 
+    # Fetch fresh vault values for the full sell asset + user key.
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    loc_load.SW_SELL_ASSET_PREFIX_LOCAL
+    loc_load.SW_SELL_ASSET_SUFFIX_LOCAL
+    # => [sell_asset_suffix, sell_asset_prefix, user_suffix, user_prefix, pad(8)]
+    exec.fetch_user_trading_details
+    loc_store.SW_FUNDING_LOCAL
+    loc_store.SW_REDEEMED_LOCAL
+    loc_store.SW_PENDING_LOCAL
+    loc_storew_be.SW_PK_LOCAL dropw
 
-pub proc add_to_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, increment_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item
-    # => [current_value, 0,0,0, prefix, suffix, increment_by]
-    movup.6 add
-    # => [new_value, 0,0,0, prefix, suffix]
-    movdn.5 movdn.5 movdn.5 movdn.5
-    # => [ prefix, suffix, new_value, 0,0,0]
-    exec.native_account::set_item dropw
-    ### get current value
+    # Verify the canonical sixteen-felt v3 intent against the vault-registered key.
+    padw loc_loadw_be.SW_PK_LOCAL
+    padw loc_loadw_be.SW_INTENT3_LOCAL
+    padw loc_loadw_be.SW_INTENT2_LOCAL
+    padw loc_loadw_be.SW_INTENT1_LOCAL
+    padw loc_loadw_be.SW_INTENT0_LOCAL
+    exec.operator::verify_intent_signature
+
+    # Lazily allocate both (asset, user) cells.
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    loc_load.SW_SELL_ASSET_PREFIX_LOCAL
+    loc_load.SW_SELL_ASSET_SUFFIX_LOCAL
+    exec.get_or_create_cell_slot_id
+    loc_store.SW_SELL_SLOT_LOCAL
+    loc_store.SW_SELL_SLOT_PREFIX_LOCAL
+
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    loc_load.SW_BUY_ASSET_PREFIX_LOCAL
+    loc_load.SW_BUY_ASSET_SUFFIX_LOCAL
+    # => [buy_asset_suffix, buy_asset_prefix, user_suffix, user_prefix, pad(8)]
+    exec.get_or_create_cell_slot_id
+    loc_store.SW_BUY_SLOT_LOCAL
+    loc_store.SW_BUY_SLOT_PREFIX_LOCAL
+
+    # available = funding + bought - sold - redeemed - pending.
+    loc_load.SW_SELL_SLOT_PREFIX_LOCAL
+    loc_load.SW_SELL_SLOT_LOCAL
+    exec.active_account::get_item
+    movup.2 drop movup.2 drop
+    loc_load.SW_FUNDING_LOCAL exec.math::safe_add
+    swap exec.math::safe_sub
+    loc_load.SW_REDEEMED_LOCAL exec.math::safe_sub
+    loc_load.SW_PENDING_LOCAL exec.math::safe_sub
+    loc_load.SW_SELL_AMOUNT_LOCAL
+    gte assert.err=ERR_INSUFFICIENT_AVAILABLE_BALANCE
+
+    # sold(sell cell) += sell_amount.
+    loc_load.SW_SELL_AMOUNT_LOCAL
+    loc_load.SW_SELL_SLOT_PREFIX_LOCAL
+    loc_load.SW_SELL_SLOT_LOCAL
+    exec.add_to_sold
+
+    # bought(buy cell) += buy_amount.
+    loc_load.SW_BUY_AMOUNT_LOCAL
+    loc_load.SW_BUY_SLOT_PREFIX_LOCAL
+    loc_load.SW_BUY_SLOT_LOCAL
+    exec.add_to_bought
+
+    # Persist the prepared nonce window only after every fallible swap check/update.
+    loc_load.SW_WIN_BM2_LOCAL
+    loc_load.SW_WIN_BM1_LOCAL
+    loc_load.SW_WIN_BM0_LOCAL
+    loc_load.SW_WIN_BASE_LOCAL
+    push.0.0
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    push.USER_NONCE_WINDOWS_SLOT[0..2]
+    exec.native_account::set_map_item dropw
+
+    exec.sys::truncate_stack
 end
-
-
-pub proc sub_from_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, decrement_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item
-    # => [current_value, 0,0,0, prefix, suffix, decrement_by]
-    movup.6 sub
-    # => [new_value, 0,0,0, prefix, suffix]
-    movdn.5 movdn.5 movdn.5 movdn.5
-    # => [ prefix, suffix, new_value, 0,0,0]
-    exec.native_account::set_item dropw
-end
-
-const BALANCES_TEMP_VALUE = 0
-#const BAL_1 = 0;
-#const BAL_2 = 1;
-#const BAL_3 = 2;
-#const BAL_4 = 3;
-
-pub proc sub_from_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt, decrement_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE dropw
-    # => [ prefix, suffix, idx, decrement_by]
-    movup.2 dup
-    # => [idx, idx, prefix, suffix, decrement_by]
-    mem_load
-    # => [value_at_idx, idx, prefix, suffix, decrement_by]
-    movup.4 sub
-    # => [new_val_at_idx, idx, prefix, suffix, ]
-    swap mem_store
-    # => [ prefix, suffix]
-    padw mem_loadw_le.BALANCES_TEMP_VALUE
-    # => [UPDATED_VALUE, prefix, suffix, ]
-    movup.5 movup.5
-     # => [prefix, suffix, UPDATED_VALUE]
-    exec.native_account::set_item dropw
-end
-
-pub proc add_to_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt, increment_by: felt) -> felt
-    dup.1 dup.1 exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE dropw
-    # => [ prefix, suffix, idx, increment_by]
-    movup.2 dup
-    # => [idx, idx, prefix, suffix, increment_by]
-    mem_load
-    # => [value_at_idx, idx, prefix, suffix, increment_by]
-    movup.4 add
-    # => [new_val_at_idx, idx, prefix, suffix, ]
-    swap mem_store
-    # => [ prefix, suffix]
-    padw mem_loadw_le.BALANCES_TEMP_VALUE
-    # => [UPDATED_VALUE, prefix, suffix, ]
-    movup.5 movup.5
-     # => [prefix, suffix, UPDATED_VALUE]
-    exec.native_account::set_item dropw
-end
-
-pub proc get_storage_item_at_idx(slot_id_prefix: felt, slot_id_suffix: felt, idx: felt,) -> felt
-    exec.active_account::get_item mem_storew_le.BALANCES_TEMP_VALUE
-    # => [idx]
-    mem_load
-end
-
-
-# ----------------------------------------------------------------------------------------------
-# GETTERS
-# ----------------------------------------------------------------------------------------------
-
-
-
-#pub proc get_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: word) -> felt
-#    exec.active_account::get_map_item
-#    
-#    movdn.3 drop drop drop
-#    # => [value]
-#end
-
-
-
-
-

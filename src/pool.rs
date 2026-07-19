@@ -1,32 +1,65 @@
 use std::{
-    fs::read_to_string,
-    path::PathBuf,
+    collections::HashMap,
+    str::FromStr,
     sync::{Arc, OnceLock},
 };
 
+use alloy_primitives::{I256, U256};
 use anyhow::{Result, anyhow};
 use miden_client::{
     Client,
     account::{
         Account, AccountBuilder, AccountComponent, AccountId, AccountStorage, AccountType,
-        StorageMap, StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
+        StorageMap, StorageMapKey, StorageSlot, StorageSlotName, StorageSlotType,
+        component::BasicWallet,
     },
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
-    rpc::{GrpcClient, NodeRpcClient},
+    rpc::{
+        GrpcClient, NodeRpcClient,
+        domain::account::{
+            AccountStorageRequirements, GetAccountRequest, StorageMapEntries, StorageMapFetch,
+            VaultFetch,
+        },
+    },
 };
-use miden_core::{Felt, Word, ZERO};
+use miden_core::{Felt, Word};
 use miden_protocol::account::AccountComponentMetadata;
 use rand::RngCore;
 use serde::Serialize;
-use tracing::info;
 
-use crate::{miden_env::MidenNetwork, miden_execution::user_id_word, user::User};
+use crate::{
+    assembly_utils::{compile_pool_code, storage_slot_name, vault_trading_details_proc_root},
+    curve::ZoroCurve,
+    miden_env::MidenNetwork,
+    test_utils::touch_account,
+    vault::{
+        AUTHORIZED_POOLS_SLOT, USER_ASSET_TOTAL_FUNDING_SLOT,
+        USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT, USER_ASSET_TOTAL_REDEEMS_SLOT, USER_POOL_SLOT,
+        USER_PUBKEYS_SLOT, VaultUserAssetInfo, vault_user_asset_info_from_storage,
+        vault_user_asset_key, vault_user_key,
+    },
+};
 
+/// Maximum number of lazily allocated `(asset, user)` accounting cells.
+///
+/// The pool component uses six additional slots (including the per-user nonce window map),
+/// `AuthSingleSig` uses two, and `BasicWallet` uses none: `247 + 6 + 2 = 255`.
+pub const MAX_POOL_CELLS: usize = 247;
+
+/// Amount of each asset a user funds into the vault before trading (service flow).
 pub const USER_INITIAL_ON_CHAIN_BALANCE: u64 = 1_000;
 
+pub const CELL_SLOT_IDS_SLOT: &str = "zoropool::cell_slot_ids";
+pub const CELL_INDEX_SLOT: &str = "zoropool::cell_index";
+pub const NEXT_CELL_SLOT: &str = "zoropool::next_cell";
+pub const VAULT_ACCOUNT_ID_SLOT: &str = "zoropool::vault_account_id";
+pub const USER_TRADING_DETAILS_PROC_ROOT_SLOT: &str = "zoropool::user_trading_details_proc_root";
+pub const USER_NONCE_WINDOWS_SLOT: &str = "zoropool::user_nonce_windows";
+
 static FETCH_RPC: OnceLock<Arc<GrpcClient>> = OnceLock::new();
+static FETCH_RPC_LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 fn get_fetch_rpc() -> &'static Arc<GrpcClient> {
     FETCH_RPC.get_or_init(|| {
@@ -35,72 +68,724 @@ fn get_fetch_rpc() -> &'static Arc<GrpcClient> {
     })
 }
 
-pub async fn fetch_account_storage_from_rpc(account_id: AccountId) -> Result<AccountStorage> {
-    let account = get_fetch_rpc()
-        .get_account_details(account_id)
-        .await
-        .map_err(|e| anyhow!("failed to fetch account from RPC: {e:?}"))?
-        .ok_or_else(|| anyhow!("account {} not found or is private", account_id.to_hex()))?;
-
-    Ok(account.storage().clone())
+async fn with_fetch_rpc_permit<T, F, Fut>(f: F) -> Result<T>
+where
+    F: FnOnce(Arc<GrpcClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let concurrency = std::env::var("MIDEN_RPC_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8_usize)
+        .max(1);
+    let _permit = FETCH_RPC_LIMIT
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(concurrency)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("Miden RPC concurrency is saturated; retry later"))?;
+    f(get_fetch_rpc().clone()).await
 }
 
-pub async fn get_user_balance_from_pool(
+/// Full-account hydration. Prefer [`fetch_targeted_account_storage`] for request paths that
+/// only need a few map keys; oversized maps (or future growth) make this fail.
+pub async fn fetch_account_storage_from_rpc(account_id: AccountId) -> Result<AccountStorage> {
+    with_fetch_rpc_permit(|rpc| async move {
+        let account = rpc
+            .get_account_details(account_id)
+            .await
+            .map_err(|e| anyhow!("failed to fetch account from RPC: {e:?}"))?
+            .ok_or_else(|| anyhow!("account {} not found or is private", account_id.to_hex()))?;
+        Ok(account.storage().clone())
+    })
+    .await
+}
+
+/// Fetches value slots plus only the explicitly requested map keys.
+///
+/// Unrequested map slots are reconstructed as empty maps. Callers must only read keys they
+/// requested; missing keys read as the zero word.
+pub async fn fetch_targeted_account_storage(
+    account_id: AccountId,
+    requirements: AccountStorageRequirements,
+) -> Result<AccountStorage> {
+    with_fetch_rpc_permit(|rpc| {
+        let requirements = requirements.clone();
+        async move {
+            let (_block, proof) = rpc
+                .get_account(
+                    account_id,
+                    GetAccountRequest::new()
+                        .with_storage(StorageMapFetch::Slots(requirements.clone()))
+                        .with_vault(VaultFetch::Skip),
+                )
+                .await
+                .map_err(|e| anyhow!("failed to fetch targeted account storage: {e:?}"))?;
+            let details = proof.into_details().ok_or_else(|| {
+                anyhow!(
+                    "account {} returned without details for targeted storage fetch",
+                    account_id.to_hex()
+                )
+            })?;
+
+            let mut slots = Vec::new();
+            for slot_header in details.storage_details.header.slots() {
+                match slot_header.slot_type() {
+                    StorageSlotType::Value => {
+                        slots.push(StorageSlot::with_value(
+                            slot_header.name().clone(),
+                            slot_header.value(),
+                        ));
+                    }
+                    StorageSlotType::Map => {
+                        let map = match details.storage_details.find_map_details(slot_header.name())
+                        {
+                            Some(map_details) => match &map_details.entries {
+                                StorageMapEntries::AllEntries(entries) => StorageMap::with_entries(
+                                    entries.iter().map(|entry| (entry.key, entry.value)),
+                                )
+                                .map_err(|e| anyhow!("invalid storage map entries: {e:?}"))?,
+                                StorageMapEntries::EntriesWithProofs(proofs) => {
+                                    let keys = requirements.keys_for_slot(slot_header.name());
+                                    if proofs.len() != keys.len() {
+                                        return Err(anyhow!(
+                                            "slot '{}' returned {} proofs for {} keys",
+                                            slot_header.name(),
+                                            proofs.len(),
+                                            keys.len()
+                                        ));
+                                    }
+                                    let entries = keys
+                                        .iter()
+                                        .zip(proofs.iter())
+                                        .map(|(key, proof)| {
+                                            let hashed = key.hash().as_word();
+                                            let value = proof
+                                                .get(&hashed)
+                                                .unwrap_or_else(|| Word::new([Felt::ZERO; 4]));
+                                            (*key, value)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    StorageMap::with_entries(entries).map_err(|e| {
+                                        anyhow!("invalid partial storage map entries: {e:?}")
+                                    })?
+                                }
+                            },
+                            None => StorageMap::new(),
+                        };
+                        slots.push(StorageSlot::with_map(slot_header.name().clone(), map));
+                    }
+                }
+            }
+            AccountStorage::new(slots)
+                .map_err(|e| anyhow!("failed to build targeted AccountStorage: {e:?}"))
+        }
+    })
+    .await
+}
+
+/// Vault registration + placement maps for a single user.
+pub async fn fetch_vault_user_placement_storage(
+    vault_id: AccountId,
+    user_id: AccountId,
+) -> Result<AccountStorage> {
+    let user_key = StorageMapKey::new(vault_user_key(user_id));
+    // First fetch pubkey + pool assignment; then re-fetch with the authorized-pool key once
+    // known. Two small targeted reads stay O(1) in vault size.
+    let initial = fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([
+            (
+                storage_slot_name(USER_PUBKEYS_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+            (
+                storage_slot_name(USER_POOL_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+        ]),
+    )
+    .await?;
+    let pool_word = initial
+        .get_map_item(&storage_slot_name(USER_POOL_SLOT), vault_user_key(user_id))
+        .map_err(|e| anyhow!("failed to read {USER_POOL_SLOT}: {e:?}"))?;
+    if pool_word == Word::new([Felt::ZERO; 4]) {
+        return Ok(initial);
+    }
+    let pool_key = StorageMapKey::new(pool_word);
+    fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([
+            (
+                storage_slot_name(USER_PUBKEYS_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+            (
+                storage_slot_name(USER_POOL_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+            (
+                storage_slot_name(AUTHORIZED_POOLS_SLOT),
+                std::slice::from_ref(&pool_key),
+            ),
+        ]),
+    )
+    .await
+}
+
+/// Vault pubkey registration for a single user.
+pub async fn fetch_vault_user_registration_storage(
+    vault_id: AccountId,
+    user_id: AccountId,
+) -> Result<AccountStorage> {
+    let user_key = StorageMapKey::new(vault_user_key(user_id));
+    fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([(
+            storage_slot_name(USER_PUBKEYS_SLOT),
+            std::slice::from_ref(&user_key),
+        )]),
+    )
+    .await
+}
+
+/// Vault funding/redeem totals + pool cell index/value for one (asset, user).
+pub async fn fetch_user_balance_storage(
     pool_id: AccountId,
-    user_index: u16,
-    asset_index: u8,
-) -> Result<u64> {
-    if asset_index > 1 {
-        return Err(anyhow!("asset_index must be 0 or 1, got {asset_index}"));
+    vault_id: AccountId,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<(AccountStorage, AccountStorage)> {
+    let asset_user = StorageMapKey::new(vault_user_asset_key(asset_id, user_id));
+    let vault_storage = fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([
+            (
+                storage_slot_name(USER_ASSET_TOTAL_FUNDING_SLOT),
+                std::slice::from_ref(&asset_user),
+            ),
+            (
+                storage_slot_name(USER_ASSET_TOTAL_REDEEMS_SLOT),
+                std::slice::from_ref(&asset_user),
+            ),
+            (
+                storage_slot_name(USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT),
+                std::slice::from_ref(&asset_user),
+            ),
+        ]),
+    )
+    .await?;
+    let pool_key = StorageMapKey::new(asset_user_key(asset_id, user_id));
+    let pool_storage = fetch_targeted_account_storage(
+        pool_id,
+        AccountStorageRequirements::new([(
+            storage_slot_name(CELL_INDEX_SLOT),
+            std::slice::from_ref(&pool_key),
+        )]),
+    )
+    .await?;
+    Ok((vault_storage, pool_storage))
+}
+
+/// Pool cell index entries for every asset of one user (value cells come from the header).
+pub async fn fetch_pool_user_cells_storage(
+    pool_id: AccountId,
+    user_id: AccountId,
+    asset_ids: &[AccountId],
+) -> Result<AccountStorage> {
+    let keys: Vec<StorageMapKey> = asset_ids
+        .iter()
+        .map(|asset_id| StorageMapKey::new(asset_user_key(*asset_id, user_id)))
+        .collect();
+    fetch_targeted_account_storage(
+        pool_id,
+        AccountStorageRequirements::new([(
+            storage_slot_name(CELL_INDEX_SLOT),
+            keys.iter().collect::<Vec<_>>(),
+        )]),
+    )
+    .await
+}
+
+fn serialize_u256<S>(value: &U256, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+fn serialize_i256<S>(value: &I256, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+#[derive(Clone, Debug, Copy, Serialize, Eq, PartialEq, Default)]
+pub struct PoolBalances {
+    #[serde(serialize_with = "serialize_u256")]
+    pub reserve: U256,
+    #[serde(serialize_with = "serialize_u256")]
+    pub reserve_with_slippage: U256,
+    #[serde(serialize_with = "serialize_u256")]
+    pub total_liabilities: U256,
+}
+
+#[derive(Clone, Debug, Copy, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeSource {
+    None,
+    Automatic,
+    Manual,
+}
+
+#[derive(Clone, Debug, Copy, Serialize)]
+pub struct PoolSettings {
+    #[serde(serialize_with = "serialize_i256")]
+    pub beta: I256,
+    #[serde(serialize_with = "serialize_i256")]
+    pub c: I256,
+    #[serde(serialize_with = "serialize_u256")]
+    pub swap_fee: U256,
+    #[serde(serialize_with = "serialize_u256")]
+    pub backstop_fee: U256,
+    #[serde(serialize_with = "serialize_u256")]
+    pub protocol_fee: U256,
+    /// Dynamic volatility surcharge when this asset is the swap input/sold asset.
+    #[serde(serialize_with = "serialize_u256")]
+    pub volatility_fee_in: U256,
+    /// Dynamic volatility surcharge when this asset is the swap output/bought asset.
+    #[serde(serialize_with = "serialize_u256")]
+    pub volatility_fee_out: U256,
+    pub volatility_fee_valid_until: u64,
+    pub volatility_fee_version: u64,
+    pub volatility_fee_source: FeeSource,
+}
+
+impl Default for PoolSettings {
+    fn default() -> Self {
+        Self {
+            beta: I256::from_str("10000000000000000").unwrap(),
+            c: I256::from_str("16000000000000000000").unwrap(),
+            swap_fee: U256::from(200),
+            backstop_fee: U256::from(300),
+            protocol_fee: U256::from(0),
+            volatility_fee_in: U256::ZERO,
+            volatility_fee_out: U256::ZERO,
+            volatility_fee_valid_until: 0,
+            volatility_fee_version: 0,
+            volatility_fee_source: FeeSource::None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Copy, Serialize)]
+pub struct PoolMetadata {
+    pub name: &'static str,
+    pub asset_decimals: u8,
+}
+
+impl Default for PoolMetadata {
+    fn default() -> Self {
+        PoolMetadata {
+            name: "Default pool",
+            asset_decimals: POOL_ASSET_DECIMALS,
+        }
+    }
+}
+
+/// Decimals of the pool faucets deployed by the server (see `get_faucet`).
+pub const POOL_ASSET_DECIMALS: u8 = 8;
+
+/// Server-side liquidity pool state for one asset. Custody stays in the vault; this
+/// struct only holds the curve accounting (reserves, liabilities, LP supply).
+#[derive(Clone, Debug, Copy, Serialize, Default)]
+pub struct PoolState {
+    settings: PoolSettings,
+    balances: PoolBalances,
+    lp_total_supply: u64,
+    metadata: PoolMetadata,
+}
+
+impl PoolState {
+    pub fn default_with_settings(settings: PoolSettings) -> Self {
+        Self {
+            settings,
+            balances: PoolBalances::default(),
+            lp_total_supply: 0,
+            metadata: PoolMetadata::default(),
+        }
     }
 
-    let storage = fetch_account_storage_from_rpc(pool_id).await?;
-    let slot_name = get_user_balance_storage_slot_name(user_index);
+    pub fn new(
+        settings: PoolSettings,
+        balances: PoolBalances,
+        lp_total_supply: u64,
+        metadata: PoolMetadata,
+    ) -> Self {
+        Self {
+            settings,
+            balances,
+            lp_total_supply,
+            metadata,
+        }
+    }
 
-    let word = storage
-        .get_item(&slot_name)
-        .map_err(|e| anyhow!("failed to read storage slot {}: {e:?}", slot_name.as_str()))?;
+    pub fn update_state(&mut self, balances: PoolBalances, lp_total_supply: u64) {
+        self.balances = balances;
+        self.lp_total_supply = lp_total_supply;
+    }
 
-    Ok(word.as_elements()[asset_index as usize].as_canonical_u64())
+    pub fn update_balances(&mut self, balances: PoolBalances) {
+        self.balances = balances;
+    }
+
+    pub fn balances(&self) -> &PoolBalances {
+        &self.balances
+    }
+
+    pub fn settings(&self) -> &PoolSettings {
+        &self.settings
+    }
+
+    pub fn metadata(&self) -> &PoolMetadata {
+        &self.metadata
+    }
+
+    pub fn update_settings(&mut self, settings: PoolSettings) {
+        self.settings = settings;
+    }
+
+    pub fn lp_total_supply(&self) -> u64 {
+        self.lp_total_supply
+    }
+
+    /// # Returns
+    ///
+    /// new_lp_amount, new_lp_total_supply, new_pool_balances
+    pub fn get_deposit_lp_amount_out(
+        &self,
+        deposit_amount: U256,
+    ) -> Result<(U256, u64, PoolBalances)> {
+        let lp_total_supply = U256::from(self.lp_total_supply);
+        let old_total_liabilities = self.balances.total_liabilities;
+        let old_reserve = self.balances.reserve;
+        let old_reserve_with_slippage = self.balances.reserve_with_slippage;
+
+        let curve = ZoroCurve::new(self.settings.beta.into_raw(), self.settings.c.into_raw());
+
+        let new_reserve_with_slippage = old_reserve_with_slippage + deposit_amount;
+        let mut reserve_increment = curve.inverse_diagonal(
+            old_reserve,
+            old_total_liabilities,
+            new_reserve_with_slippage,
+            U256::from(self.metadata.asset_decimals),
+        );
+
+        // fix potential numerical imprecission
+        if reserve_increment < deposit_amount {
+            reserve_increment = deposit_amount;
+        }
+        let new_lp_amount = if old_total_liabilities > U256::ZERO {
+            reserve_increment * lp_total_supply / old_total_liabilities
+        } else {
+            reserve_increment
+        };
+
+        let new_pool_balances = PoolBalances {
+            reserve: old_reserve + reserve_increment,
+            reserve_with_slippage: new_reserve_with_slippage,
+            total_liabilities: old_total_liabilities + reserve_increment,
+        };
+
+        let new_lp_total_supply = lp_total_supply
+            .saturating_add(new_lp_amount)
+            .saturating_to::<u64>();
+
+        Ok((new_lp_amount, new_lp_total_supply, new_pool_balances))
+    }
+
+    /// # Returns
+    ///
+    /// payout_amount, new_lp_total_supply, new_pool_balances
+    pub fn get_withdraw_asset_amount_out(
+        &self,
+        withdraw_amount: U256,
+    ) -> Result<(U256, u64, PoolBalances)> {
+        let lp_total_supply = U256::from(self.lp_total_supply);
+        let old_total_liabilities = self.balances.total_liabilities;
+        let old_reserve = self.balances.reserve;
+        let old_reserve_with_slippage = self.balances.reserve_with_slippage;
+
+        let reserve_decrement = if lp_total_supply == U256::ZERO {
+            U256::ZERO
+        } else {
+            (withdraw_amount * old_total_liabilities) / lp_total_supply
+        };
+
+        let curve = ZoroCurve::new(self.settings.beta.into_raw(), self.settings.c.into_raw());
+
+        let mut new_reserve_with_slippage = curve.psi(
+            old_reserve - reserve_decrement,
+            old_total_liabilities - reserve_decrement,
+            U256::from(self.metadata.asset_decimals),
+        );
+
+        if new_reserve_with_slippage > old_reserve_with_slippage {
+            new_reserve_with_slippage = old_reserve_with_slippage;
+        }
+
+        let mut payout_amount = old_reserve_with_slippage - new_reserve_with_slippage;
+
+        // fix potential numerical imprecission
+        if payout_amount > reserve_decrement {
+            payout_amount = reserve_decrement;
+        }
+
+        let new_total_liabilities = old_total_liabilities - reserve_decrement;
+        let new_reserve = old_reserve - reserve_decrement;
+        let new_reserve_with_slippage = old_reserve_with_slippage - payout_amount;
+
+        let new_pool_balances = PoolBalances {
+            reserve: new_reserve,
+            reserve_with_slippage: new_reserve_with_slippage,
+            total_liabilities: new_total_liabilities,
+        };
+
+        // `withdraw_amount` is the LP tokens being redeemed
+        let new_lp_total_supply = lp_total_supply
+            .saturating_sub(withdraw_amount)
+            .saturating_to::<u64>();
+
+        Ok((payout_amount, new_lp_total_supply, new_pool_balances))
+    }
 }
 
-#[derive(Debug, Copy, Clone, Serialize)]
-pub struct PoolState {
-    pub balance: u64,
+/// Per-depositor LP share ledger, kept on the server only. Outer key is the pool's
+/// faucet id, inner key is the depositor's account id.
+#[derive(Clone, Debug, Default)]
+pub struct LpLedger {
+    shares: HashMap<AccountId, HashMap<AccountId, u64>>,
+}
+
+impl LpLedger {
+    pub fn mint(&mut self, faucet_id: AccountId, depositor: AccountId, lp_amount: u64) {
+        let entry = self
+            .shares
+            .entry(faucet_id)
+            .or_default()
+            .entry(depositor)
+            .or_insert(0);
+        *entry = entry.saturating_add(lp_amount);
+    }
+
+    /// Burns up to `lp_amount` shares; errors if the depositor doesn't own enough.
+    pub fn burn(
+        &mut self,
+        faucet_id: AccountId,
+        depositor: AccountId,
+        lp_amount: u64,
+    ) -> Result<()> {
+        let entry = self
+            .shares
+            .get_mut(&faucet_id)
+            .and_then(|m| m.get_mut(&depositor))
+            .ok_or_else(|| anyhow!("no LP position for {} in pool {}", depositor, faucet_id))?;
+        if *entry < lp_amount {
+            return Err(anyhow!(
+                "insufficient LP shares: has {}, burning {}",
+                entry,
+                lp_amount
+            ));
+        }
+        *entry -= lp_amount;
+        Ok(())
+    }
+
+    pub fn shares_of(&self, faucet_id: AccountId, depositor: AccountId) -> u64 {
+        self.shares
+            .get(&faucet_id)
+            .and_then(|m| m.get(&depositor))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn depositors(&self, faucet_id: AccountId) -> Vec<(AccountId, u64)> {
+        self.shares
+            .get(&faucet_id)
+            .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// One asset-user shard: `[bought, sold, 0, 0]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolCell {
+    pub bought: u64,
+    pub sold: u64,
+}
+
+/// An allocated `(asset, user)` cell and its concrete account-storage slot id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PoolCellAllocation {
+    pub slot_id: String,
+    pub bought: u64,
+    pub sold: u64,
+}
+
+impl PoolCell {
+    pub fn from_word(word: Word) -> Self {
+        let e = word.as_elements();
+        Self {
+            bought: e[0].as_canonical_u64(),
+            sold: e[1].as_canonical_u64(),
+        }
+    }
+}
+
+/// Derives (balance, available) for one asset from the vault's totals and the pool's
+/// trade counters — the same formula the MASM uses:
+///
+///   balance   = total_funding - total_redeems + bought - sold
+///   available = balance - pending_redeems
+pub fn derive_balance_details(
+    vault_info: &VaultUserAssetInfo,
+    bought: u64,
+    sold: u64,
+) -> (u64, u64) {
+    let balance = vault_info.total_funding + bought - vault_info.total_redeems - sold;
+    let available = balance.saturating_sub(vault_info.pending_redeem());
+    (balance, available)
+}
+
+pub fn get_pool_cell_slot_name(index: u16) -> StorageSlotName {
+    storage_slot_name(format!("zoropool::cell_{index}").as_str())
+}
+
+fn asset_user_key(asset_id: AccountId, user_id: AccountId) -> Word {
+    Word::new([
+        asset_id.suffix(),
+        asset_id.prefix().as_felt(),
+        user_id.suffix(),
+        user_id.prefix().as_felt(),
+    ])
+}
+
+/// Reads one `(asset, user)` allocation from fetched pool storage.
+///
+/// `None` means no cell has been allocated. An allocated zero-valued cell is returned as
+/// `Some` with both counters set to zero.
+pub fn pool_cell_allocation_from_storage(
+    storage: &AccountStorage,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<Option<PoolCellAllocation>> {
+    let slot_id_word = storage
+        .get_map_item(
+            &storage_slot_name(CELL_INDEX_SLOT),
+            asset_user_key(asset_id, user_id),
+        )
+        .map_err(|e| anyhow!("failed to read pool cell index: {e:?}"))?;
+
+    if slot_id_word == Word::new([Felt::ZERO; 4]) {
+        return Ok(None);
+    }
+
+    let id = slot_id_word.as_elements();
+    let slot = storage
+        .slots()
+        .iter()
+        .find(|slot| {
+            let candidate = slot.name().id();
+            candidate.suffix() == id[0] && candidate.prefix() == id[1]
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "pool cell index for asset {} and user {} references an unknown slot",
+                asset_id.to_hex(),
+                user_id.to_hex()
+            )
+        })?;
+
+    let cell = PoolCell::from_word(slot.content().value());
+    Ok(Some(PoolCellAllocation {
+        slot_id: slot.name().id().to_string(),
+        bought: cell.bought,
+        sold: cell.sold,
+    }))
+}
+
+/// Reads one `(asset, user)` cell, treating an unallocated key as an empty cell.
+pub fn pool_cell_from_storage(
+    storage: &AccountStorage,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<PoolCell> {
+    Ok(
+        match pool_cell_allocation_from_storage(storage, asset_id, user_id)? {
+            Some(allocation) => PoolCell {
+                bought: allocation.bought,
+                sold: allocation.sold,
+            },
+            None => PoolCell::default(),
+        },
+    )
+}
+
+/// Fetches a user's derived pool balance for one asset over RPC: reads the vault totals and
+/// the pool trade counters and combines them.
+pub async fn get_user_balance_from_pool(
+    pool_id: AccountId,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<u64> {
+    Ok(
+        get_user_balance_details_from_pool(pool_id, vault_id, asset_id, user_id)
+            .await?
+            .0,
+    )
+}
+
+/// Fetches the amount the user can spend after pending redeems are reserved.
+pub async fn get_user_available_balance_from_pool(
+    pool_id: AccountId,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<u64> {
+    Ok(
+        get_user_balance_details_from_pool(pool_id, vault_id, asset_id, user_id)
+            .await?
+            .1,
+    )
+}
+
+async fn get_user_balance_details_from_pool(
+    pool_id: AccountId,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<(u64, u64)> {
+    let (vault_storage, pool_storage) =
+        fetch_user_balance_storage(pool_id, vault_id, asset_id, user_id).await?;
+    let vault_info = vault_user_asset_info_from_storage(&vault_storage, asset_id, user_id)?;
+    let cell = pool_cell_from_storage(&pool_storage, asset_id, user_id)?;
+    Ok(derive_balance_details(&vault_info, cell.bought, cell.sold))
 }
 
 pub async fn deploy_pool(
     client: &mut Client<FilesystemKeyStore>,
-    users: Vec<User>,
-    pool_0_balance: u64,
-    pool_1_balance: u64,
-) -> Result<(Account, AccountComponent)> {
+    vault_id: AccountId,
+) -> Result<Account> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
     let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
-    let user_ids: Vec<AccountId> = users.iter().map(|u| u.id()).collect();
-    let users_keys: Vec<(Word, Word)> = users
-        .iter()
-        .map(|user| {
-            let pubkey: Word = user.pubkey().to_commitment().into();
-            let user = user_id_word(user.id());
-            (user, pubkey)
-        })
-        .collect();
-
-    let operator_component = build_operator_component(client.code_builder(), &users_keys)?;
-    let pool_component = build_pool_component(
-        pool_0_balance,
-        pool_1_balance,
-        user_ids,
-        client.code_builder(),
-    )?;
+    let pool_component = build_pool_component(client.code_builder(), vault_id)?;
 
     let pool_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_component(operator_component.clone())
-        .with_component(pool_component.clone())
+        .with_component(pool_component)
         .with_auth_component(AuthSingleSig::new(
             key_pair.public_key().to_commitment(),
             AuthScheme::EcdsaK256Keccak,
@@ -119,180 +804,137 @@ pub async fn deploy_pool(
         pool_contract.to_commitment().to_hex()
     );
     println!(
-        "contract id: {:?}",
+        "pool contract id: {:?}",
         pool_contract
             .id()
             .to_bech32(MidenNetwork::from_env().endpoint().to_network_id())
     );
 
-    Ok((pool_contract, pool_component))
+    client.add_account(&pool_contract, true).await?;
+    client.sync_state().await?;
+    touch_account(client, &pool_contract.id()).await?;
+    let pool_contract = client.try_get_account(pool_contract.id()).await?;
+
+    Ok(pool_contract)
 }
 
-pub fn get_user_balance_storage_slot_names(n_users: usize) -> Vec<StorageSlotName> {
-    let mut slot_names: Vec<StorageSlotName> = Vec::with_capacity(100);
-    for i in 0..n_users {
-        slot_names.push(n(format!("pool::user_{i}_balance").as_str()));
+pub fn build_pool_component(cb: CodeBuilder, vault_id: AccountId) -> Result<AccountComponent> {
+    let vault_proc_root = vault_trading_details_proc_root(cb.clone())?;
+    let lib = compile_pool_code(cb)?;
+
+    let zero_word = Word::new([Felt::ZERO; 4]);
+
+    let mut slots: Vec<StorageSlot> = Vec::with_capacity(MAX_POOL_CELLS + 6);
+
+    // Generic cells are assigned lazily to full (asset, user) keys.
+    for i in 0..MAX_POOL_CELLS {
+        slots.push(StorageSlot::with_value(
+            get_pool_cell_slot_name(i as u16),
+            zero_word,
+        ));
     }
-    slot_names
-}
 
-pub fn get_user_balance_storage_slot_name(index: u16) -> StorageSlotName {
-    n(format!("pool::user_{index}_balance").as_str())
-}
+    // Dense index -> hashed cell-slot id (slot ids are underivable in MASM).
+    let slot_ids_map = StorageMap::with_entries((0..MAX_POOL_CELLS).map(|i| {
+        let slot_id = get_pool_cell_slot_name(i as u16).id();
+        (
+            StorageMapKey::new(Word::new([
+                Felt::new(i as u64).unwrap(),
+                Felt::ZERO,
+                Felt::ZERO,
+                Felt::ZERO,
+            ])),
+            Word::new([slot_id.suffix(), slot_id.prefix(), Felt::ZERO, Felt::ZERO]),
+        )
+    }))
+    .map_err(|e| anyhow!("failed to build pool cell slot ids map: {e:?}"))?;
+    slots.push(StorageSlot::with_map(
+        storage_slot_name(CELL_SLOT_IDS_SLOT),
+        slot_ids_map,
+    ));
 
-pub fn build_pool_component(
-    pool_0_balance: u64,
-    pool_1_balance: u64,
-    users: Vec<AccountId>,
-    cb: CodeBuilder,
-) -> Result<AccountComponent> {
-    let code = read_masm_file(&["accounts", "pool.masm"])?;
-    let cb = link_storage_utils(cb)?;
-    let cb = link_operator(cb)?;
-    let lib = cb.compile_component_code("zoro_miden::pool", &code)?;
+    slots.push(StorageSlot::with_map(
+        storage_slot_name(CELL_INDEX_SLOT),
+        StorageMap::new(),
+    ));
 
-    let user_amount = USER_INITIAL_ON_CHAIN_BALANCE;
+    slots.push(StorageSlot::with_map(
+        storage_slot_name(USER_NONCE_WINDOWS_SLOT),
+        StorageMap::new(),
+    ));
 
-    let pool_balance_0: Word = [
-        Felt::new(pool_0_balance).unwrap(),
-        Felt::ZERO,
-        Felt::ZERO,
-        Felt::ZERO,
-    ]
-    .into();
+    slots.push(StorageSlot::with_value(
+        storage_slot_name(NEXT_CELL_SLOT),
+        zero_word,
+    ));
 
-    let pool_balance_1: Word = [
-        Felt::new(pool_1_balance).unwrap(),
-        Felt::ZERO,
-        Felt::ZERO,
-        Felt::ZERO,
-    ]
-    .into();
+    slots.push(StorageSlot::with_value(
+        storage_slot_name(VAULT_ACCOUNT_ID_SLOT),
+        Word::new([
+            vault_id.suffix(),
+            vault_id.prefix().as_felt(),
+            Felt::ZERO,
+            Felt::ZERO,
+        ]),
+    ));
 
-    let user_balance: Word = [
-        Felt::new(user_amount).unwrap(),
-        Felt::new(user_amount).unwrap(),
-        Felt::ZERO,
-        Felt::ZERO,
-    ]
-    .into();
-
-    let slot_names = get_user_balance_storage_slot_names(users.len());
+    slots.push(StorageSlot::with_value(
+        storage_slot_name(USER_TRADING_DETAILS_PROC_ROOT_SLOT),
+        vault_proc_root,
+    ));
 
     let component = AccountComponent::new(
         lib,
-        slot_names[..users.len()]
-            .iter()
-            .map(|name| StorageSlot::with_value(name.clone(), user_balance))
-            .collect(),
+        slots,
         AccountComponentMetadata::new("zoro_miden::pool"),
     )?;
 
     Ok(component)
 }
 
-pub fn build_operator_component(
-    code_builder: CodeBuilder,
-    depositors: &[(Word, Word)],
-) -> Result<AccountComponent> {
-    let code = read_masm_file(&["accounts", "operator.masm"])?;
-    let library = code_builder
-        .compile_component_code("zoro_miden::operator", code)
-        .expect("operator.masm must assemble");
+#[cfg(test)]
+mod tests {
+    use miden_client::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
 
-    let keys_slot = StorageSlotName::new("operator::depositor_keys").expect("slot name must parse");
-    // let nonce_slot = StorageSlotName::new(LAST_NONCE_SLOT).expect("slot name must parse");
-    // let auth_slot = StorageSlotName::new(LAST_AUTH_SLOT).expect("slot name must parse");
+    use super::*;
+    use crate::assembly_utils::pool_balance_details_proc_root;
 
-    let map = StorageMap::with_entries(depositors.iter().map(|(uid, comm)| {
-        info!("depositor {uid:?}, commitment {comm:?}");
-        (StorageMapKey::new(*uid), *comm)
-    }))
-    .expect("depositor map must build");
+    /// Compiles both components + extracts both FPI proc roots: validates all the MASM and
+    /// the storage layout without needing a running node.
+    #[test]
+    fn test_build_components_and_roots() -> Result<()> {
+        let vault_id = AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE)?;
+        let cb = CodeBuilder::new();
+        let pool = build_pool_component(cb.clone(), vault_id)?;
+        assert_eq!(pool.storage_size(), 253);
+        assert!(
+            pool.storage_slots()
+                .iter()
+                .any(|slot| slot.name().id() == storage_slot_name(USER_NONCE_WINDOWS_SLOT).id())
+        );
+        crate::vault::build_vault_component(
+            cb.clone(),
+            vault_id,
+            crate::vault::DEFAULT_POOL_USER_CAPACITY,
+        )?;
 
-    let component = AccountComponent::new(
-        library,
-        vec![
-            StorageSlot::with_map(keys_slot, map),
-            // StorageSlot::with_value(nonce_slot, Word::from([0u32, 0, 0, 0])),
-            // StorageSlot::with_value(auth_slot, Word::from([0u32, 0, 0, 0])),
-        ],
-        AccountComponentMetadata::mock("zoro_miden::operator"),
-    )
-    .expect("operator component must build");
-
-    Ok(component)
-}
-
-pub fn read_masm_file(path_steps: &[&str]) -> Result<String> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let path = PathBuf::from_iter(
-        [manifest_dir, "masm"]
-            .into_iter()
-            .chain(path_steps.iter().copied()),
-    );
-    read_to_string(&path).map_err(|e| anyhow!("Error reading MASM file at path {path:?}: {e:?}"))
-}
-
-fn n(name: &str) -> StorageSlotName {
-    let name = StorageSlotName::new(name).expect("valid slot name");
-    // println!("Slot name: {:?}, id: {:?}", name, name.id());
-    name
-}
-
-pub fn link_pool(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    //let mut code_builder = link_storage_utils(code_builder)?;
-    let pool_code = read_masm_file(&["accounts", "pool.masm"])?;
-    code_builder.link_module("zoro_miden::pool", &pool_code)?;
-    Ok(code_builder)
-}
-
-pub fn link_storage_utils(code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let mut code_builder = link_math(code_builder)?;
-    let storage_utils_code = read_masm_file(&["lib", "storage_utils.masm"])?;
-    code_builder.link_module("zoro_miden::lib::storage_utils", &storage_utils_code)?;
-    Ok(code_builder)
-}
-
-pub fn link_math(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let math_code = read_masm_file(&["lib", "math.masm"])?;
-    code_builder.link_module("zoro_miden::lib::math", &math_code)?;
-    Ok(code_builder)
-}
-
-pub fn link_operator(mut code_builder: CodeBuilder) -> Result<CodeBuilder> {
-    let math_code = read_masm_file(&["accounts", "operator.masm"])?;
-    code_builder.link_module("zoro_miden::operator", &math_code)?;
-    Ok(code_builder)
-}
-
-fn map_from(entries: &[(Word, u64)]) -> StorageMap {
-    let mut map = StorageMap::new();
-    for (k, v) in entries {
-        map.insert(
-            StorageMapKey::new(*k),
-            [Felt::new(*v).unwrap(), ZERO, ZERO, ZERO].into(),
-        )
-        .expect("insert into map");
+        let vault_root = vault_trading_details_proc_root(cb.clone())?;
+        let pool_root = pool_balance_details_proc_root(cb)?;
+        assert_ne!(vault_root, Word::new([Felt::ZERO; 4]));
+        assert_ne!(pool_root, Word::new([Felt::ZERO; 4]));
+        Ok(())
     }
-    map
-}
 
-pub fn print_contract_procedures(pool_contract: &Account) {
-    println!("+++++Pool contract procedures");
-    pool_contract.code().procedures().iter().for_each(|proc| {
-        println!("Proc root: {:?} ", proc.mast_root().to_hex());
-    });
-}
+    #[test]
+    fn pending_redeems_reduce_available_but_not_gross_balance() {
+        let vault_info = VaultUserAssetInfo {
+            total_funding: 1_000,
+            total_initiated_redeems: 400,
+            total_redeems: 100,
+        };
 
-pub fn print_library_exports(masm_lib: &miden_assembly::Library) {
-    println!("+++++Masm lib exports:");
-    masm_lib.exports().for_each(|export| {
-        let path = export.path();
-        if let Some(root) = masm_lib.get_procedure_root_by_path(&path) {
-            println!("Export: {:?} {:?} {:?}", path, root, root.to_hex());
-        } else {
-            println!("Export: {:?} (no procedure root)", path);
-        }
-    });
+        let (balance, available) = derive_balance_details(&vault_info, 200, 50);
+        assert_eq!(balance, 1_050);
+        assert_eq!(available, 750);
+    }
 }

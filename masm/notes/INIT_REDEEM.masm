@@ -1,0 +1,30 @@
+use miden::core::sys
+use miden::protocol::active_note
+
+use zoro_miden::vault
+use zoro_miden::lib::asset_utils
+use zoro_miden::note::common
+use common::DEFAULT_NUMBER_OF_STORAGE_ITEMS
+
+# Note storage layout:
+# word 0: [EXPECTED_ASSET]
+# word 1: METADATA [0, 0, 0, 0]
+# word 2: BENEFICIARY [0, 0, 0, 0]
+proc execute_INIT_REDEEM
+    exec.active_note::get_sender
+    # => [sender_suffix, sender_prefix]
+    padw exec.common::get_expected_asset
+    # => [EXPECTED_ASSET, sender_suffix, sender_prefix]
+    exec.vault::address_from_asset
+    # => [asset_suffix, asset_prefix, sender_suffix, sender_prefix]
+    padw exec.common::get_expected_asset exec.asset_utils::get_amount_c
+    # => [amount, asset_suffix, asset_prefix, sender_suffix, sender_prefix]
+    call.vault::initiate_redeem
+end
+
+@note_script
+pub proc main
+    push.DEFAULT_NUMBER_OF_STORAGE_ITEMS exec.common::store_storage_to_memory drop
+    exec.execute_INIT_REDEEM
+    exec.sys::truncate_stack
+end

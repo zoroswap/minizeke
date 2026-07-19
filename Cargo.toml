@@ -2,12 +2,16 @@
 name = "minizeke"
 version = "0.1.0"
 edition = "2024"
+# `cargo run` starts the server; deployment scripts are `--bin spawn` / `--bin deposit_pools`
+default-run = "minizeke"
 
 [dependencies]
+alloy-primitives = { version = "1.5.7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
 axum = { version = "0.8.4", features = ["macros", "tokio", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = "6.2.1"
 dotenv = "0.15.0"
 futures-util = "0.3.31"
@@ -23,33 +27,36 @@ miden-tx = "0.15.3"
 rand = { version = "0.9" }
 reqwest = { version = "0.12", features = ["json"] }
 reqwest-eventsource = "0.6.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = "1.0.228"
 serde_json = "1.0.150"
+subtle = "2.6"
 tokio = { version = "1.46", features = [
   "fs",
   "macros",
   "net",
   "rt-multi-thread",
+  "signal",
   "sync",
+  "time",
 ] }
 tokio-stream = "0.1"
-tower-http = { version = "0.6.6", features = ["cors", "fs"] }
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+toml = "1.1.2"
+tower-http = { version = "0.6.6", features = ["cors", "fs", "limit", "timeout"] }
 tracing = "0.1"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.0", features = ["serde", "v4"] }
 
+[dev-dependencies]
+miden-core-lib = "0.23"
+miden-processor = "0.23"
+
 [profile.dev]
 incremental = true
 codegen-units = 256
-
-[profile.dev.package.miden-agglayer]
-opt-level = 3
-debug-assertions = false
-
-[profile.dev.package.miden-block-prover]
-opt-level = 3
-debug-assertions = false
 
 [profile.dev.package.miden-client]
 opt-level = 3
@@ -59,19 +66,7 @@ debug-assertions = false
 opt-level = 3
 debug-assertions = false
 
-[profile.dev.package.miden-debug]
-opt-level = 3
-debug-assertions = false
-
-[profile.dev.package.miden-remote-prover-client]
-opt-level = 3
-debug-assertions = false
-
 [profile.dev.package.miden-standards]
-opt-level = 3
-debug-assertions = false
-
-[profile.dev.package.miden-testing]
 opt-level = 3
 debug-assertions = false
 
@@ -79,7 +74,20 @@ debug-assertions = false
 opt-level = 3
 debug-assertions = false
 
-[profile.dev.package.miden-tx-batch-prover]
+# VM stack: dominate local execute_transaction cost in debug builds.
+[profile.dev.package.miden-processor]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.miden-core]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.miden-protocol]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.miden-assembly]
 opt-level = 3
 debug-assertions = false
 
