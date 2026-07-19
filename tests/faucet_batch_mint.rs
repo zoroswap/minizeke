@@ -9,9 +9,7 @@ use miden_protocol::note::NoteAttachments;
 use miden_standards::note::P2idNote;
 use minizeke::{
     faucet::build_batch_mint_request,
-    test_utils::{
-        consume_all_notes_for, get_client, get_faucet, get_user, submit_tx_resilient,
-    },
+    test_utils::{consume_all_notes_for, get_client, get_faucet, get_user, submit_tx_resilient},
 };
 use uuid::Uuid;
 
@@ -54,8 +52,8 @@ async fn batch_mints_two_recipients_in_one_transaction() -> Result<()> {
         client.rng(),
     )?;
 
-    let request = build_batch_mint_request(vec![note_a, note_b])
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let request =
+        build_batch_mint_request(vec![note_a, note_b]).map_err(|error| anyhow::anyhow!(error))?;
     let tx_id = submit_tx_resilient(&mut client, faucet_id, request).await?;
     tracing::info!(%tx_id, "batch mint submitted");
 
@@ -63,7 +61,10 @@ async fn batch_mints_two_recipients_in_one_transaction() -> Result<()> {
         loop {
             consume_all_notes_for(&mut client, user_id).await?;
             client.sync_state().await?;
-            let balance = client.account_reader(user_id).get_balance(faucet_id).await?;
+            let balance = client
+                .account_reader(user_id)
+                .get_balance(faucet_id)
+                .await?;
             if balance >= amount {
                 break;
             }

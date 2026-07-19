@@ -1053,6 +1053,69 @@ impl ExecutionStore {
         Ok(())
     }
 
+    /// Fail every order that is still awaiting submission in a batch owned by `worker`.
+    ///
+    /// This is a batch-level safety net for preparation paths which fail before a shard can
+    /// record a submission. It allows reconciliation to release the single claimed-batch slot.
+    pub fn fail_remaining_batched_orders(
+        &self,
+        batch_id: uuid::Uuid,
+        worker: &str,
+        reason: &str,
+        now: u64,
+    ) -> Result<Vec<uuid::Uuid>> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let order_ids = {
+            let mut statement = tx.prepare(
+                "SELECT order_id FROM durable_orders
+                 WHERE batch_id = ?1 AND state = 'batched'
+                   AND EXISTS(SELECT 1 FROM execution_batches WHERE batch_id = ?1
+                              AND state = 'claimed' AND claim_owner = ?2)
+                 ORDER BY created_at, order_id",
+            )?;
+            statement
+                .query_map(params![batch_id.to_string(), worker], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut failed = Vec::with_capacity(order_ids.len());
+        for order_id in order_ids {
+            let order_id = uuid::Uuid::parse_str(&order_id)?;
+            let changed = tx.execute(
+                "UPDATE durable_orders SET state = 'failed', terminal_error = ?2, updated_at = ?3
+                 WHERE order_id = ?1 AND batch_id = ?4 AND state = 'batched'",
+                params![
+                    order_id.to_string(),
+                    reason,
+                    to_i64(now)?,
+                    batch_id.to_string()
+                ],
+            )?;
+            if changed != 1 {
+                continue;
+            }
+            tx.execute(
+                "UPDATE swap_accounting SET status = 'failed', finalized_at = ?2
+                 WHERE order_id = ?1 AND status = 'proposed'",
+                params![order_id.to_string(), to_i64(now)?],
+            )?;
+            append_event(
+                &tx,
+                order_id,
+                "failed",
+                Some(reason),
+                &format!("order:{order_id}:terminal"),
+                now,
+            )?;
+            failed.push(order_id);
+        }
+        tx.commit()?;
+        Ok(failed)
+    }
+
     /// Ends transaction submission and moves the batch to `reconciling`. Each of
     /// `pending` and `claimed` remains single-flight; the admit gate only holds while a
     /// batch is `pending`, so Processing can claim new orders during prove/submit and
@@ -1736,7 +1799,11 @@ fn to_i64(value: u64) -> Result<i64> {
 
 fn from_sql_u64(value: i64) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
     })
 }
 
@@ -2302,6 +2369,65 @@ mod tests {
                 .unwrap()
         );
         assert!(store.begin_reconciliation(batch_a, "executor", 15).unwrap());
+
+        let claimed_b = store
+            .claim_pending_batch("executor", 16, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed_b.id, batch_b);
+    }
+
+    #[test]
+    fn pre_submission_failure_terminalizes_batch_and_releases_claimed_slot() {
+        let store = ExecutionStore::open(":memory:").unwrap();
+        let (batch_a, processed_a) = create_claimed_test_batch(&store, "processing");
+
+        let second_client = uuid::Uuid::new_v4();
+        let second = test_order(second_client);
+        store
+            .admit_order(second_client, "second", &second, 10)
+            .unwrap();
+        let claimed = store
+            .claim_admitted_orders("processing", 11, 100, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let processed_b = claimed
+            .start_processing()
+            .processed(crate::order::OrderExecutionResult { amount_out: 9 });
+        let batch_b = store
+            .create_execution_batch(
+                "processing",
+                std::slice::from_ref(&processed_b),
+                &[proposed(&processed_b)],
+                12,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store
+                .claim_pending_batch("executor", 13, 100)
+                .unwrap()
+                .is_none()
+        );
+        let failed = store
+            .fail_remaining_batched_orders(
+                batch_a,
+                "executor",
+                "transient sync failed before submission",
+                14,
+            )
+            .unwrap();
+        assert_eq!(failed, vec![processed_a.id]);
+        assert_eq!(
+            store.order_state(processed_a.id).unwrap().as_deref(),
+            Some("failed")
+        );
+        assert!(store.begin_reconciliation(batch_a, "executor", 15).unwrap());
+        assert!(store.pending_outbox(10).unwrap().iter().any(|entry| {
+            entry.topic == "batch_terminal" && entry.aggregate_id == batch_a.to_string()
+        }));
 
         let claimed_b = store
             .claim_pending_batch("executor", 16, 100)

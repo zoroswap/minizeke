@@ -1,232 +1,128 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use clap::{ArgAction, Parser};
+use clap::Parser;
 use serde::{Deserialize, Serialize};
+
+const DEFAULT_TRADE_INTERVAL_SECS: u64 = 10;
+const DEFAULT_JITTER: f64 = 0.2;
+const DEFAULT_AUTH_WARMUP_GAP_MS: u64 = 3_500;
+const DEFAULT_TRADE_AMOUNT: u64 = 1_000;
+const DEFAULT_FUND_AMOUNT: u64 = 1_000_000;
+const DEFAULT_SLIPPAGE_BPS: u16 = 500;
+const DEFAULT_INTENT_TTL_SECS: u64 = 1_800;
+const DEFAULT_SETUP_CONCURRENCY: usize = 8;
+const DEFAULT_MAX_USERS_PER_POOL: usize = 16;
+const DEFAULT_SUMMARY_INTERVAL_SECS: u64 = 30;
+const DEFAULT_ORDER_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_GROW_INTERVAL_SECS: u64 = 60;
+const DEFAULT_VAULT_CYCLE_INTERVAL_SECS: u64 = 180;
+const DEFAULT_VAULT_CYCLE_AMOUNT: u64 = 10_000;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "simulate_traders",
-    about = "Run synthetic traders against a minizeke staging deployment",
+    about = "Run high-frequency synthetic traders against a minizeke staging deployment",
     long_about = "Creates and funds synthetic Miden wallets, then continuously submits \
-                  oracle-priced swaps through the production HTTP API. Runs until Ctrl+C unless \
-                  --duration is set.\n\nSetup mints each asset directly to every trader via the \
-                  faucet (concurrent /mint calls so the faucet can batch many recipients into \
-                  one tx), then onboards traders in parallel workers (consume mint notes, \
-                  register+fund vault in one tx per trader). Each mint delivers FAUCET_MINT_AMOUNT; \
-                  fund_amount must not exceed that (extra mint rounds wait on \
-                  FAUCET_MINT_COOLDOWN_SECS).\n\nStaging example:\n  MIDEN_NETWORK=testnet \
-                  SIMULATE_API_URL=https://staging-api.example \
-                  SIMULATE_FAUCET_URL=https://staging-faucet.example \
-                  ORACLE_URL=https://oracle.zoroswap.com FAUCET_SERVICE_TOKEN=... \
-                  cargo run --bin simulate_traders -- 50"
+                  oracle-priced swaps through the production HTTP API. All MAX traders are \
+                  pre-staged; START are activated initially and the rest ramp in fixed stages. \
+                  Runs until Ctrl+C.\n\nUsage:\n  cargo run --bin simulate_traders -- \
+                  <START> <MAX>\n\nExample (20 traders at start, grow to 100):\n  \
+                  MIDEN_NETWORK=testnet FAUCET_SERVICE_TOKEN=... \
+                  cargo run --bin simulate_traders -- 20 100"
 )]
 pub struct Config {
-    /// Number of concurrent traders. There is no hard maximum.
-    #[arg(default_value_t = 10)]
+    /// Traders to activate at start.
+    #[arg(default_value_t = 20)]
     pub num_traders: usize,
 
-    /// Relative share of low-frequency traders.
-    #[arg(long, default_value_t = 1.0 / 3.0)]
-    pub low_ratio: f64,
-    /// Relative share of average-frequency traders.
-    #[arg(long, default_value_t = 1.0 / 3.0)]
-    pub avg_ratio: f64,
-    /// Relative share of high-frequency traders.
-    #[arg(long, default_value_t = 1.0 / 3.0)]
-    pub hf_ratio: f64,
-
-    /// Base interval for low-frequency traders, in seconds.
-    #[arg(long, default_value_t = 300)]
-    pub low_interval: u64,
-    /// Base interval for average-frequency traders, in seconds.
-    #[arg(long, default_value_t = 60)]
-    pub avg_interval: u64,
-    /// Base interval for high-frequency traders, in seconds.
-    #[arg(long, default_value_t = 20)]
-    pub hf_interval: u64,
-    /// Uniform interval jitter as a fraction (0.5 means +/-50%).
-    #[arg(long, default_value_t = 0.5)]
-    pub jitter: f64,
-    /// Unused by trade loops (kept for CLI compatibility). Traders desync with a
-    /// random initial delay in `[0, tier_interval]` instead of index-based stagger.
-    #[arg(long, default_value_t = 400)]
-    pub start_stagger_ms: u64,
-    /// Gap between successive auth warmups (ms). Keeps challenge+login under
-    /// `RATE_LIMIT_AUTH_PER_MINUTE` (default 20) before trade loops start.
-    #[arg(long, default_value_t = 3500)]
-    pub auth_warmup_gap_ms: u64,
-
-    /// Input amount for every swap, in asset base units.
-    #[arg(long, default_value_t = 1_000)]
-    pub trade_amount: u64,
-    /// Amount funded into the vault per trader and asset. Must be <= FAUCET_MINT_AMOUNT
-    /// (default 10_000_000) unless you accept cooldown waits for extra mint rounds.
-    #[arg(long, default_value_t = 1_000_000)]
-    pub fund_amount: u64,
-    /// Oracle-price cushion applied to min_amount_out.
-    #[arg(long, default_value_t = 500)]
-    pub slippage_bps: u16,
-    /// Signed intent lifetime in seconds. Should stay ≥ server `MAX_ADMITTED_AGE_MS`
-    /// (default 60s); the server fails over-age admitted orders as `stale_queue`
-    /// before quote. Default 30 minutes covers prove/submit after admit.
-    #[arg(long, default_value_t = 1_800)]
-    pub intent_ttl_secs: u64,
+    /// Traders to pre-stage (must be >= START).
+    #[arg(default_value_t = 100)]
+    pub max_traders: usize,
 
     /// Minizeke public API base URL.
     #[arg(
-        long,
         env = "SIMULATE_API_URL",
-        default_value = "http://127.0.0.1:7799"
+        default_value = "http://127.0.0.1:7799",
+        hide = true
     )]
     pub api_url: String,
     /// Faucet service base URL.
     #[arg(
-        long,
         env = "SIMULATE_FAUCET_URL",
-        default_value = "http://127.0.0.1:7800"
+        default_value = "http://127.0.0.1:7800",
+        hide = true
     )]
     pub faucet_url: String,
     /// Zeke oracle base URL.
     #[arg(
-        long,
         env = "ORACLE_URL",
-        default_value = "https://oracle.zoroswap.com"
+        default_value = "https://oracle.zoroswap.com",
+        hide = true
     )]
     pub oracle_url: String,
     /// Scoped credential accepted by the staging faucet.
-    #[arg(long, env = "FAUCET_SERVICE_TOKEN", hide_env_values = true)]
+    #[arg(env = "FAUCET_SERVICE_TOKEN", hide_env_values = true, hide = true)]
     pub faucet_token: Option<String>,
 
-    /// JSON file holding resumable trader identities.
-    #[arg(long, default_value = "simulate_traders.state.json")]
+    #[arg(skip = PathBuf::from("simulation_stores/traders.json"))]
     pub state_file: PathBuf,
-    /// Isolated directory for trader signing keys.
-    #[arg(long, default_value = "simulate_keystore")]
+    #[arg(skip = PathBuf::from("simulation_stores/keystore"))]
     pub keystore_dir: PathBuf,
-    /// Isolated Miden client SQLite store.
-    #[arg(long, default_value = "simulate.store.sqlite3")]
+    #[arg(skip = PathBuf::from("simulation_stores/simulate.store.sqlite3"))]
     pub store_path: PathBuf,
 
-    /// Max concurrent per-trader setup workers (consume/register/fund). Default: 8.
-    #[arg(long, default_value_t = 8)]
+    #[arg(skip = DEFAULT_TRADE_INTERVAL_SECS)]
+    pub trade_interval_secs: u64,
+    #[arg(skip = DEFAULT_JITTER)]
+    pub jitter: f64,
+    #[arg(skip = DEFAULT_AUTH_WARMUP_GAP_MS)]
+    pub auth_warmup_gap_ms: u64,
+    #[arg(skip = DEFAULT_TRADE_AMOUNT)]
+    pub trade_amount: u64,
+    #[arg(skip = DEFAULT_FUND_AMOUNT)]
+    pub fund_amount: u64,
+    #[arg(skip = DEFAULT_SLIPPAGE_BPS)]
+    pub slippage_bps: u16,
+    #[arg(skip = DEFAULT_INTENT_TTL_SECS)]
+    pub intent_ttl_secs: u64,
+    #[arg(skip = DEFAULT_SETUP_CONCURRENCY)]
     pub setup_concurrency: usize,
-    /// Max traders bound to one pool shard at registration. Extra pools are spawned
-    /// and activated in waves so load can execute across shards in parallel.
-    #[arg(long, env = "MAX_USERS_PER_POOL", default_value_t = 16)]
+    #[arg(skip = DEFAULT_MAX_USERS_PER_POOL)]
     pub max_users_per_pool: usize,
-
-    /// Create, register, and fund traders, then exit.
-    #[arg(long, conflicts_with = "skip_setup")]
-    pub setup_only: bool,
-    /// Load traders from --state-file without onboarding.
-    #[arg(long)]
-    pub skip_setup: bool,
-    /// Stop after this many seconds. By default the simulator runs until Ctrl+C.
-    #[arg(long)]
-    pub duration: Option<u64>,
-    /// Interval between aggregate metric summaries, in seconds.
-    #[arg(long, default_value_t = 30)]
+    #[arg(skip = DEFAULT_SUMMARY_INTERVAL_SECS)]
     pub summary_interval: u64,
-
-    /// Wait this long for a WebSocket Confirmed/Failed after admit (seconds).
-    #[arg(long, default_value_t = 120)]
+    #[arg(skip = DEFAULT_ORDER_TIMEOUT_SECS)]
     pub order_timeout_secs: u64,
-
-    /// Keep onboarding new traders until --max-traders while the sim runs.
-    #[arg(long)]
-    pub keep_increasing: bool,
-    /// Cap for --keep-increasing (default 100).
-    #[arg(long, default_value_t = 100)]
-    pub max_traders: usize,
-    /// Seconds between starting live onboardings when --keep-increasing is set.
-    #[arg(long, default_value_t = 5)]
+    #[arg(skip = DEFAULT_GROW_INTERVAL_SECS)]
     pub grow_interval_secs: u64,
-
-    /// Seconds between vault fund/init_redeem/redeem cycles (`0` disables).
-    #[arg(long, default_value_t = 180)]
+    #[arg(skip = DEFAULT_VAULT_CYCLE_INTERVAL_SECS)]
     pub vault_cycle_interval_secs: u64,
-    /// Base units for each vault fund/redeem round-trip.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(skip = DEFAULT_VAULT_CYCLE_AMOUNT)]
     pub vault_cycle_amount: u64,
-
-    /// Increase logging verbosity (-v or -vv).
-    #[arg(short, long, action = ArgAction::Count)]
-    pub verbose: u8,
 }
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.num_traders == 0 {
-            bail!("NUM_TRADERS must be at least 1");
+            bail!("START traders must be at least 1");
         }
-        if self.setup_concurrency == 0 {
-            bail!("--setup-concurrency must be at least 1");
+        if self.max_traders < self.num_traders {
+            bail!("MAX traders must be >= START traders");
         }
-        if self.max_users_per_pool == 0 {
-            bail!("--max-users-per-pool must be at least 1");
-        }
-        if self.keep_increasing && self.max_traders < self.num_traders {
-            bail!("--max-traders must be >= NUM_TRADERS when --keep-increasing is set");
-        }
-        if self.keep_increasing && self.grow_interval_secs == 0 {
-            bail!("--grow-interval-secs must be non-zero when --keep-increasing is set");
-        }
-        if self.order_timeout_secs == 0 {
-            bail!("--order-timeout-secs must be non-zero");
-        }
-        if self.vault_cycle_amount == 0 {
-            bail!("--vault-cycle-amount must be non-zero");
-        }
-        if self.vault_cycle_amount > self.fund_amount {
-            bail!("--vault-cycle-amount cannot exceed --fund-amount");
-        }
-        let ratios = [self.low_ratio, self.avg_ratio, self.hf_ratio];
-        if ratios
-            .iter()
-            .any(|ratio| !ratio.is_finite() || *ratio < 0.0)
-            || ratios.iter().sum::<f64>() <= 0.0
-        {
-            bail!("tier ratios must be finite, non-negative, and not all zero");
-        }
-        if self.jitter < 0.0 || self.jitter > 1.0 || !self.jitter.is_finite() {
-            bail!("--jitter must be between 0 and 1");
-        }
-        if self.start_stagger_ms > 60_000 {
-            bail!("--start-stagger-ms must be at most 60000");
-        }
-        if self.auth_warmup_gap_ms > 60_000 {
-            bail!("--auth-warmup-gap-ms must be at most 60000");
-        }
-        if self.slippage_bps >= 10_000 {
-            bail!("--slippage-bps must be less than 10000");
-        }
-        if self.trade_amount == 0 || self.fund_amount == 0 {
-            bail!("trade and funding amounts must be non-zero");
-        }
-        if self.intent_ttl_secs == 0 {
-            bail!("--intent-ttl-secs must be non-zero");
-        }
-        if self.trade_amount > self.fund_amount {
-            bail!("--trade-amount cannot exceed --fund-amount");
-        }
-        if [self.low_interval, self.avg_interval, self.hf_interval].contains(&0)
-            || self.summary_interval == 0
-            || self.duration == Some(0)
-        {
-            bail!("intervals and duration must be non-zero");
-        }
-        if !self.skip_setup && self.faucet_token.as_deref().is_none_or(str::is_empty) {
-            bail!("--faucet-token or FAUCET_SERVICE_TOKEN is required during setup");
+        if self.faucet_token.as_deref().is_none_or(str::is_empty) {
+            bail!("FAUCET_SERVICE_TOKEN is required");
         }
         Ok(())
     }
 
+    /// Grow live when the max cohort is larger than the starting cohort.
+    pub fn should_grow(&self) -> bool {
+        self.max_traders > self.num_traders
+    }
+
     pub fn tier_assignments(&self) -> Vec<TraderTier> {
-        assign_tiers(
-            self.num_traders,
-            [self.low_ratio, self.avg_ratio, self.hf_ratio],
-        )
+        vec![TraderTier::HighFrequency; self.max_traders]
     }
 }
 
@@ -248,61 +144,92 @@ impl TraderTier {
     }
 
     pub fn interval_secs(self, config: &Config) -> u64 {
-        match self {
-            Self::Low => config.low_interval,
-            Self::Average => config.avg_interval,
-            Self::HighFrequency => config.hf_interval,
-        }
+        // All live traders are high-frequency; keep the match for persisted state.
+        let _ = self;
+        config.trade_interval_secs
     }
-}
-
-fn assign_tiers(count: usize, ratios: [f64; 3]) -> Vec<TraderTier> {
-    let total = ratios.iter().sum::<f64>();
-    let exact = ratios.map(|ratio| ratio / total * count as f64);
-    let mut counts = exact.map(|value| value.floor() as usize);
-    let assigned = counts.iter().sum::<usize>();
-    let mut remainders = [
-        (exact[0] - counts[0] as f64, 0),
-        (exact[1] - counts[1] as f64, 1),
-        (exact[2] - counts[2] as f64, 2),
-    ];
-    remainders.sort_by(|left, right| {
-        right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| right.1.cmp(&left.1))
-    });
-    for (_, index) in remainders.into_iter().take(count - assigned) {
-        counts[index] += 1;
-    }
-
-    let mut tiers = Vec::with_capacity(count);
-    tiers.extend(std::iter::repeat_n(TraderTier::Low, counts[0]));
-    tiers.extend(std::iter::repeat_n(TraderTier::Average, counts[1]));
-    tiers.extend(std::iter::repeat_n(TraderTier::HighFrequency, counts[2]));
-    tiers
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TraderTier, assign_tiers};
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    use super::{Config, TraderTier};
 
     #[test]
-    fn largest_remainder_assigns_every_trader() {
-        let tiers = assign_tiers(10, [1.0, 1.0, 1.0]);
-        assert_eq!(tiers.len(), 10);
-        assert_eq!(
-            tiers
-                .iter()
-                .filter(|tier| **tier == TraderTier::HighFrequency)
-                .count(),
-            4
-        );
+    fn all_traders_are_high_frequency() {
+        let config = Config {
+            num_traders: 10,
+            max_traders: 100,
+            api_url: "http://127.0.0.1:7799".into(),
+            faucet_url: "http://127.0.0.1:7800".into(),
+            oracle_url: "https://oracle.zoroswap.com".into(),
+            faucet_token: Some("token".into()),
+            state_file: "simulate_traders.state.json".into(),
+            keystore_dir: "simulate_keystore".into(),
+            store_path: "simulate.store.sqlite3".into(),
+            trade_interval_secs: 20,
+            jitter: 0.5,
+            auth_warmup_gap_ms: 3_500,
+            trade_amount: 1_000,
+            fund_amount: 1_000_000,
+            slippage_bps: 500,
+            intent_ttl_secs: 1_800,
+            setup_concurrency: 8,
+            max_users_per_pool: 16,
+            summary_interval: 30,
+            order_timeout_secs: 120,
+            grow_interval_secs: 5,
+            vault_cycle_interval_secs: 180,
+            vault_cycle_amount: 10_000,
+        };
+        let tiers = config.tier_assignments();
+        assert_eq!(tiers.len(), 100);
+        assert!(tiers.iter().all(|tier| *tier == TraderTier::HighFrequency));
+        assert!(config.should_grow());
     }
 
     #[test]
-    fn zero_ratio_omits_a_tier() {
-        let tiers = assign_tiers(7, [1.0, 0.0, 1.0]);
-        assert!(!tiers.contains(&TraderTier::Average));
+    fn equal_start_and_max_disables_growth() {
+        let config = Config {
+            num_traders: 20,
+            max_traders: 20,
+            api_url: "http://127.0.0.1:7799".into(),
+            faucet_url: "http://127.0.0.1:7800".into(),
+            oracle_url: "https://oracle.zoroswap.com".into(),
+            faucet_token: Some("token".into()),
+            state_file: "simulate_traders.state.json".into(),
+            keystore_dir: "simulate_keystore".into(),
+            store_path: "simulate.store.sqlite3".into(),
+            trade_interval_secs: 20,
+            jitter: 0.5,
+            auth_warmup_gap_ms: 3_500,
+            trade_amount: 1_000,
+            fund_amount: 1_000_000,
+            slippage_bps: 500,
+            intent_ttl_secs: 1_800,
+            setup_concurrency: 8,
+            max_users_per_pool: 16,
+            summary_interval: 30,
+            order_timeout_secs: 120,
+            grow_interval_secs: 5,
+            vault_cycle_interval_secs: 180,
+            vault_cycle_amount: 10_000,
+        };
+        assert!(!config.should_grow());
+    }
+
+    #[test]
+    fn command_line_uses_fixed_load_profile() {
+        let config = Config::try_parse_from(["simulate_traders", "20", "100"]).unwrap();
+        assert_eq!(config.trade_interval_secs, 10);
+        assert_eq!(config.jitter, 0.2);
+        assert_eq!(config.grow_interval_secs, 60);
+        assert_eq!(
+            config.state_file,
+            PathBuf::from("simulation_stores/traders.json")
+        );
     }
 }

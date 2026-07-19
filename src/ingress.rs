@@ -59,7 +59,7 @@ impl IngressConfig {
             rpc_concurrency: number("MIDEN_RPC_MAX_CONCURRENCY", 8).max(1),
             ws_queue_capacity: number("WS_QUEUE_CAPACITY", 128).max(1),
             ws_global_cap: number("WS_GLOBAL_CONNECTION_CAP", 2_000).max(1),
-            ws_per_ip_cap: number("WS_PER_IP_CONNECTION_CAP", 20).max(1),
+            ws_per_ip_cap: number("WS_PER_IP_CONNECTION_CAP", 256).max(1),
             ws_message_bytes: number("WS_MAX_MESSAGE_BYTES", 65_536).max(1),
             ws_max_subscriptions: number("WS_MAX_SUBSCRIPTIONS", 64).max(1),
             ws_session_recheck: Duration::from_secs(number("WS_SESSION_RECHECK_SECS", 30)),

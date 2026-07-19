@@ -169,10 +169,7 @@ impl FaucetWorker {
         client.sync_chain().await?;
         info!(
             assets = supported_faucets.len(),
-            mint_amount,
-            cooldown_secs,
-            batch_size,
-            "Standalone faucet service initialized"
+            mint_amount, cooldown_secs, batch_size, "Standalone faucet service initialized"
         );
         Ok(Self {
             client,
@@ -215,11 +212,7 @@ impl FaucetWorker {
         }
     }
 
-    fn validate_command(
-        &self,
-        recipient: AccountId,
-        faucet_id: AccountId,
-    ) -> Result<(), String> {
+    fn validate_command(&self, recipient: AccountId, faucet_id: AccountId) -> Result<(), String> {
         if !self.supported_faucets.contains(&faucet_id) {
             return Err(format!("faucet {} is not supported", faucet_id.to_hex()));
         }
@@ -272,8 +265,7 @@ impl FaucetWorker {
                 let tx_hex = transaction_id.to_hex();
                 let now = tokio::time::Instant::now();
                 for command in &accepted {
-                    self.last_mint
-                        .insert((command.recipient, faucet_id), now);
+                    self.last_mint.insert((command.recipient, faucet_id), now);
                 }
                 info!(
                     faucet = %faucet_id.to_hex(),

@@ -501,24 +501,75 @@ impl MidenExecution {
             return;
         };
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        match self
-            .execution_store
-            .begin_reconciliation(batch_id, &self.worker_id, now)
-        {
+        match self.execution_store.fail_remaining_batched_orders(
+            batch_id,
+            &self.worker_id,
+            "shard preparation ended before transaction submission",
+            now,
+        ) {
+            Ok(order_ids) if !order_ids.is_empty() => {
+                failed_chunks += 1;
+                warn!(
+                    %batch_id,
+                    orders = order_ids.len(),
+                    "Failed residual unsubmitted orders before reconciliation"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%batch_id, %error, "Failed to clean up unsubmitted batch orders");
+            }
+        }
+
+        let mut reconciliation =
+            self.execution_store
+                .begin_reconciliation(batch_id, &self.worker_id, now);
+        if let Err(first_error) = &reconciliation {
+            error!(
+                %batch_id,
+                error = %first_error,
+                "Initial batch reconciliation failed; attempting unsubmitted-order recovery"
+            );
+            let recovery_reason = format!("batch reconciliation recovery: {first_error}");
+            reconciliation = match self.execution_store.fail_remaining_batched_orders(
+                batch_id,
+                &self.worker_id,
+                &recovery_reason,
+                chrono::Utc::now().timestamp_millis() as u64,
+            ) {
+                Ok(order_ids) => {
+                    warn!(
+                        %batch_id,
+                        orders = order_ids.len(),
+                        "Recovered residual unsubmitted orders"
+                    );
+                    self.execution_store.begin_reconciliation(
+                        batch_id,
+                        &self.worker_id,
+                        chrono::Utc::now().timestamp_millis() as u64,
+                    )
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        match reconciliation {
             Ok(true) => {
                 // Admit gate may release while finality runs. A batch containing only
                 // pre-submission failures is finalized by begin_reconciliation and
                 // replayed through the outbox.
-                let _ = self
-                    .message_broker
-                    .broadcast_amm(AmmEvent::BatchSubmitted);
+                let _ = self.message_broker.broadcast_amm(AmmEvent::BatchSubmitted);
             }
             Ok(false) => {
                 warn!(%batch_id, "Execution batch lease was no longer owned");
                 return;
             }
             Err(error) => {
-                error!(%batch_id, %error, "Failed to commit execution batch outcome");
+                error!(
+                    %batch_id,
+                    %error,
+                    "Failed to commit execution batch outcome after recovery"
+                );
                 return;
             }
         }
@@ -649,8 +700,7 @@ async fn filter_live_orders_for_client(
             {
                 error!(order_id = %order.id, %store_error, "Failed to persist expiry failure");
             }
-            let update =
-                OrderUpdate::Failed(order.failed(OrderFailureReason::Expired, None));
+            let update = OrderUpdate::Failed(order.failed(OrderFailureReason::Expired, None));
             let _ = message_broker.broadcast_order_update(update);
             continue;
         }
@@ -681,6 +731,49 @@ async fn fail_chunk_orders(
             error!(order_id = %order.id, %store_error, "Failed to persist pre-submission failure");
         }
     }
+}
+
+async fn sync_before_execution(client: &mut Client<FilesystemKeyStore>) -> Result<()> {
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+    const TIP_RACE_RETRIES: usize = 3;
+
+    for attempt in 0..TIP_RACE_RETRIES {
+        match tokio::time::timeout(SYNC_TIMEOUT, client.sync_state()).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) => {
+                let message = format!("{error:#}").to_ascii_lowercase();
+                let tip_race =
+                    message.contains("block_to") && message.contains("greater than chain tip");
+                if tip_race && attempt + 1 < TIP_RACE_RETRIES {
+                    warn!(
+                        attempt = attempt + 1,
+                        "Miden sync raced the chain tip; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+
+                warn!(%error, "sync_state failed before execution; falling back to sync_chain");
+                return tokio::time::timeout(SYNC_TIMEOUT, client.sync_chain())
+                    .await
+                    .map_err(|_| anyhow!("sync_chain timed out after sync_state failure"))?
+                    .map_err(|fallback| {
+                        anyhow!("sync_state failed: {error:#}; sync_chain failed: {fallback:#}")
+                    })
+                    .map(|_| ());
+            }
+            Err(_) => {
+                warn!("sync_state timed out before execution; falling back to sync_chain");
+                return tokio::time::timeout(SYNC_TIMEOUT, client.sync_chain())
+                    .await
+                    .map_err(|_| anyhow!("sync_chain timed out after sync_state timeout"))?
+                    .map_err(|error| anyhow!("sync_chain failed: {error:#}"))
+                    .map(|_| ());
+            }
+        }
+    }
+
+    unreachable!("sync retry loop always returns")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -730,22 +823,65 @@ async fn execute_shard_on_client(
 
     let tx_script = make_exec_script(intents);
     let sync_started = Instant::now();
-    pool_client.sync_state().await?;
+    if let Err(error) = sync_before_execution(pool_client).await {
+        fail_chunk_orders(
+            execution_store,
+            worker_id,
+            batch_id,
+            &orders,
+            &error.to_string(),
+        )
+        .await;
+        return Err(error);
+    }
     let sync_ms = sync_started.elapsed().as_millis();
 
     let compile_started = Instant::now();
-    let cb = link_math(pool_client.code_builder())?;
-    let cb = link_operator(cb)?;
-    let cb = link_pool(cb)?;
-    let tx_script = cb.compile_tx_script(tx_script)?;
+    let tx_script = match (|| -> Result<_> {
+        let cb = link_math(pool_client.code_builder())?;
+        let cb = link_operator(cb)?;
+        let cb = link_pool(cb)?;
+        Ok(cb.compile_tx_script(tx_script)?)
+    })() {
+        Ok(script) => script,
+        Err(error) => {
+            fail_chunk_orders(
+                execution_store,
+                worker_id,
+                batch_id,
+                &orders,
+                &error.to_string(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let compile_ms = compile_started.elapsed().as_millis();
 
     let advice_map_key = Word::from([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]);
-    let tx_req = TransactionRequestBuilder::new()
-        .custom_script(tx_script)
-        .extend_advice_map([(advice_map_key, advice_data)])
-        .foreign_accounts(vec![vault_foreign_account(vault_id, &fpi_asset_user_pairs)?])
-        .build()?;
+    let tx_req = match (|| -> Result<_> {
+        Ok(TransactionRequestBuilder::new()
+            .custom_script(tx_script)
+            .extend_advice_map([(advice_map_key, advice_data)])
+            .foreign_accounts(vec![vault_foreign_account(
+                vault_id,
+                &fpi_asset_user_pairs,
+            )?])
+            .build()?)
+    })() {
+        Ok(request) => request,
+        Err(error) => {
+            fail_chunk_orders(
+                execution_store,
+                worker_id,
+                batch_id,
+                &orders,
+                &error.to_string(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
 
     let fpi_probe_ms = if execute_fpi_probe_enabled() {
         let probe_started = Instant::now();
@@ -760,8 +896,14 @@ async fn execute_shard_on_client(
     let tx_result = match pool_client.execute_transaction(pool_id, tx_req).await {
         Ok(result) => result,
         Err(error) => {
-            fail_chunk_orders(execution_store, worker_id, batch_id, &orders, &error.to_string())
-                .await;
+            fail_chunk_orders(
+                execution_store,
+                worker_id,
+                batch_id,
+                &orders,
+                &error.to_string(),
+            )
+            .await;
             return Err(error.into());
         }
     };
@@ -774,8 +916,14 @@ async fn execute_shard_on_client(
     {
         Ok(proven) => proven,
         Err(error) => {
-            fail_chunk_orders(execution_store, worker_id, batch_id, &orders, &error.to_string())
-                .await;
+            fail_chunk_orders(
+                execution_store,
+                worker_id,
+                batch_id,
+                &orders,
+                &error.to_string(),
+            )
+            .await;
             return Err(error.into());
         }
     };
@@ -787,8 +935,14 @@ async fn execute_shard_on_client(
     {
         Ok(height) => height,
         Err(error) => {
-            fail_chunk_orders(execution_store, worker_id, batch_id, &orders, &error.to_string())
-                .await;
+            fail_chunk_orders(
+                execution_store,
+                worker_id,
+                batch_id,
+                &orders,
+                &error.to_string(),
+            )
+            .await;
             return Err(error.into());
         }
     };
@@ -818,17 +972,18 @@ async fn execute_shard_on_client(
     {
         return Err(anyhow!("execution batch lease was lost after submission"));
     }
-    if let Err(e) = pool_client.apply_transaction_update(transaction_update).await {
+    if let Err(e) = pool_client
+        .apply_transaction_update(transaction_update)
+        .await
+    {
         warn!(
             pool = %pool_id.to_hex(),
             transaction = %tx_result.id().to_hex(),
             "Shard transaction was submitted but local apply failed: {e:?}"
         );
     } else if batch_id.is_some()
-        && let Err(error) = execution_store.mark_submission_local_applied(
-            &tx_hash,
-            chrono::Utc::now().timestamp_millis() as u64,
-        )
+        && let Err(error) = execution_store
+            .mark_submission_local_applied(&tx_hash, chrono::Utc::now().timestamp_millis() as u64)
     {
         warn!(%tx_hash, %error, "Failed to persist local-apply completion");
     }
@@ -893,8 +1048,7 @@ fn chunk_orders_for_fpi(
     for order in orders {
         let pair = (order.details().asset_in, order.user_id());
         let would_add_pair = !pairs.contains(&pair);
-        let over_pair_budget =
-            would_add_pair && pairs.len() >= MAX_FPI_ASSET_USER_PAIRS;
+        let over_pair_budget = would_add_pair && pairs.len() >= MAX_FPI_ASSET_USER_PAIRS;
         let over_order_budget = current.len() >= max_orders;
         if !current.is_empty() && (over_pair_budget || over_order_budget) {
             chunks.push(std::mem::take(&mut current));

@@ -549,6 +549,35 @@ impl AnalyticsStore {
         Ok(())
     }
 
+    /// Durably records a malformed note and advances its source cursor in one transaction.
+    ///
+    /// Returns `true` only when this is the first quarantine record for the note.
+    pub fn quarantine_note(
+        &self,
+        source: &str,
+        cursor: &NoteCursor,
+        reason: &str,
+        skipped_at: u64,
+    ) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO analytics_note_skips(
+                 source, note_id, block_num, reason, skipped_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![source, cursor.note_id, cursor.block_num, reason, skipped_at],
+        )? == 1;
+        tx.execute(
+            "INSERT INTO analytics_note_cursors(source, block_num, note_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(source) DO UPDATE SET
+               block_num=excluded.block_num, note_id=excluded.note_id",
+            params![source, cursor.block_num, cursor.note_id],
+        )?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Seeds pre-journal holdings. It does not manufacture historical volume or cash flows.
     pub fn record_opening_position(&self, opening: &OpeningPosition) -> Result<bool> {
         let payload = serde_json::to_string(opening)?;
@@ -897,6 +926,17 @@ CREATE TABLE IF NOT EXISTS analytics_note_cursors (
     block_num INTEGER NOT NULL,
     note_id TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS analytics_note_skips (
+    source TEXT NOT NULL,
+    note_id TEXT NOT NULL,
+    block_num INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    skipped_at INTEGER NOT NULL,
+    PRIMARY KEY(source, note_id)
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_note_skips_block
+    ON analytics_note_skips(source, block_num, note_id);
 
 CREATE TABLE IF NOT EXISTS analytics_positions (
     user_id TEXT NOT NULL,
@@ -1887,5 +1927,57 @@ mod tests {
                 note_id: "note-03".into()
             } > cursor
         );
+    }
+
+    #[test]
+    fn quarantining_note_is_idempotent_and_advances_cursor() {
+        let store = AnalyticsStore::open(":memory:").unwrap();
+        let cursor = NoteCursor {
+            block_num: 12,
+            note_id: "malformed-note".into(),
+        };
+        assert!(
+            store
+                .quarantine_note("vault_cash_flows", &cursor, "invalid beneficiary", 100)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .quarantine_note("vault_cash_flows", &cursor, "invalid beneficiary", 101)
+                .unwrap()
+        );
+        assert_eq!(store.note_cursor("vault_cash_flows").unwrap(), cursor);
+
+        let connection = store.connection().unwrap();
+        let (reason, skipped_at): (String, i64) = connection
+            .query_row(
+                "SELECT reason, skipped_at FROM analytics_note_skips
+                 WHERE source = ?1 AND note_id = ?2",
+                params!["vault_cash_flows", "malformed-note"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "invalid beneficiary");
+        assert_eq!(skipped_at, 100);
+        drop(connection);
+
+        let later = NoteCursor {
+            block_num: 13,
+            note_id: "valid-note".into(),
+        };
+        assert!(
+            store
+                .record_cash_flow(&CashFlow {
+                    event_id: "vault:valid-note".into(),
+                    kind: CashFlowKind::InitRedeem,
+                    user_id: "user".into(),
+                    asset_id: "asset".into(),
+                    amount: 10,
+                    event_time: 110,
+                })
+                .unwrap()
+        );
+        store.set_note_cursor("vault_cash_flows", &later).unwrap();
+        assert_eq!(store.note_cursor("vault_cash_flows").unwrap(), later);
     }
 }

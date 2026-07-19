@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::simulate::{api::OrderOutcome, config::TraderTier};
 
 const MAX_SAMPLES_PER_TRADER: usize = 2_048;
+const TRADE_INTERVAL_SECS: f64 = 10.0;
+const SATURATION_ERROR_PERCENT: u64 = 5;
+const SATURATION_SETTLE_P95_MS: u64 = 30_000;
 
 #[derive(Clone, Default)]
 pub struct Metrics {
@@ -35,6 +38,9 @@ impl Metrics {
 
     pub fn record_trade(&self, measurement: TradeMeasurement) {
         let mut inner = self.inner.lock().expect("metrics mutex poisoned");
+        if let Some(settle) = measurement.settle {
+            inner.window_settle.push(settle);
+        }
         let trader = inner
             .traders
             .entry(measurement.trader_index)
@@ -83,9 +89,45 @@ impl Metrics {
         }
     }
 
-    pub fn print_summary(&self, final_summary: bool) {
-        let inner = self.inner.lock().expect("metrics mutex poisoned");
-        let label = if final_summary { "FINAL" } else { "ROLLING" };
+    pub fn set_active_traders(&self, active: usize) {
+        let mut inner = self.inner.lock().expect("metrics mutex poisoned");
+        if inner.active == 0 && inner.scheduled == 0 {
+            inner.last_report = Instant::now();
+        }
+        if inner.active != active {
+            inner.consecutive_unhealthy = 0;
+            inner.consecutive_healthy = 0;
+        }
+        inner.active = active;
+    }
+
+    pub fn record_schedule(&self) {
+        self.inner.lock().expect("metrics mutex poisoned").scheduled += 1;
+    }
+
+    pub fn record_skipped_schedule(&self) {
+        self.inner.lock().expect("metrics mutex poisoned").skipped += 1;
+    }
+
+    pub fn record_submitted(&self) {
+        self.inner.lock().expect("metrics mutex poisoned").submitted += 1;
+    }
+
+    pub fn order_started(&self) {
+        self.inner.lock().expect("metrics mutex poisoned").in_flight += 1;
+    }
+
+    pub fn order_finished(&self) {
+        let mut inner = self.inner.lock().expect("metrics mutex poisoned");
+        inner.in_flight = inner.in_flight.saturating_sub(1);
+    }
+
+    pub fn is_saturated(&self) -> bool {
+        self.inner.lock().expect("metrics mutex poisoned").saturated
+    }
+
+    pub fn print_summary(&self, final_summary: bool) -> LoadSnapshot {
+        let mut inner = self.inner.lock().expect("metrics mutex poisoned");
         let totals = inner
             .traders
             .values()
@@ -100,61 +142,124 @@ impl Metrics {
                 total.timed_out += trader.timed_out;
                 total
             });
-        println!(
-            "[{label}] traders={} attempted={} confirmed={} admitted_only={} rate_limited={} \
-             rejected={} exec_failed={} timed_out={} failed={} vault_ok={} vault_fail={}",
-            inner.traders.len(),
-            totals.attempted,
-            totals.confirmed,
-            totals.accepted,
-            totals.rate_limited,
-            totals.rejected,
-            totals.execution_failed,
-            totals.timed_out,
-            totals.failed,
-            inner.vault_cycle_ok,
-            inner.vault_cycle_failed,
-        );
-        for (index, trader) in &inner.traders {
-            if trader.attempted == 0 && !final_summary {
-                continue;
-            }
-            println!(
-                "  trader={index} tier={} trades={} confirmed={} 429={} rejected={} \
-                 exec_failed={} timed_out={} failed={} \
-                 oracle[p50/p95]={}/{}ms auth={}/{}ms order={}/{}ms settle={}/{}ms cycle={}/{}ms",
-                trader.tier.label(),
-                trader.attempted,
-                trader.confirmed,
-                trader.rate_limited,
-                trader.rejected,
-                trader.execution_failed,
-                trader.timed_out,
-                trader.failed,
-                trader.oracle.percentile(50),
-                trader.oracle.percentile(95),
-                trader.auth.percentile(50),
-                trader.auth.percentile(95),
-                trader.order.percentile(50),
-                trader.order.percentile(95),
-                trader.settle.percentile(50),
-                trader.settle.percentile(95),
-                trader.cycle.percentile(50),
-                trader.cycle.percentile(95),
+        let elapsed = inner.last_report.elapsed().as_secs_f64().max(0.001);
+        let scheduled = inner.scheduled.saturating_sub(inner.last.scheduled);
+        let skipped = inner.skipped.saturating_sub(inner.last.skipped);
+        let submitted = inner.submitted.saturating_sub(inner.last.submitted);
+        let confirmed = totals
+            .confirmed
+            .saturating_sub(inner.last.outcomes.confirmed);
+        let rate_limited = totals
+            .rate_limited
+            .saturating_sub(inner.last.outcomes.rate_limited);
+        let rejected = totals.rejected.saturating_sub(inner.last.outcomes.rejected);
+        let failed = totals
+            .failed
+            .saturating_sub(inner.last.outcomes.failed)
+            .saturating_add(
+                totals
+                    .execution_failed
+                    .saturating_sub(inner.last.outcomes.execution_failed),
             );
-            if final_summary {
-                println!(
-                    "    setup mint={}/{}ms register={}/{}ms fund={}/{}ms (p50/p95)",
-                    trader.setup_mint.percentile(50),
-                    trader.setup_mint.percentile(95),
-                    trader.setup_register.percentile(50),
-                    trader.setup_register.percentile(95),
-                    trader.setup_fund.percentile(50),
-                    trader.setup_fund.percentile(95),
-                );
+        let timed_out = totals
+            .timed_out
+            .saturating_sub(inner.last.outcomes.timed_out);
+        let settle_p50_ms = inner.window_settle.percentile(50);
+        let settle_p95_ms = inner.window_settle.percentile(95);
+        let unhealthy_count = skipped
+            .saturating_add(rate_limited)
+            .saturating_add(rejected)
+            .saturating_add(failed)
+            .saturating_add(timed_out);
+        let unhealthy = (scheduled > 0
+            && unhealthy_count.saturating_mul(100)
+                > scheduled.saturating_mul(SATURATION_ERROR_PERCENT))
+            || settle_p95_ms > SATURATION_SETTLE_P95_MS;
+        if unhealthy {
+            inner.consecutive_unhealthy += 1;
+            inner.consecutive_healthy = 0;
+        } else {
+            inner.consecutive_unhealthy = 0;
+            inner.consecutive_healthy += 1;
+            if inner.consecutive_healthy >= 2 {
+                inner.last_healthy_active = inner.active;
             }
         }
+        if inner.consecutive_unhealthy >= 2 {
+            inner.saturated = true;
+            let active = inner.active;
+            inner.first_saturated_active.get_or_insert(active);
+        }
+        let snapshot = LoadSnapshot {
+            active: inner.active,
+            target_rate: inner.active as f64 / TRADE_INTERVAL_SECS,
+            submitted_rate: submitted as f64 / elapsed,
+            confirmed_rate: confirmed as f64 / elapsed,
+            confirmed,
+            in_flight: inner.in_flight,
+            skipped,
+            rate_limited,
+            rejected,
+            failed,
+            timed_out,
+            settle_p50_ms,
+            settle_p95_ms,
+            saturated: inner.saturated,
+        };
+        println!(
+            "[LOAD] active={} target={:.1}/s submitted={:.1}/s confirmed={:.1}/s \
+             inflight={} skipped={} 429/503={} rejected={} failed={} timeouts={} \
+             settle_p50={}ms settle_p95={}ms",
+            snapshot.active,
+            snapshot.target_rate,
+            snapshot.submitted_rate,
+            snapshot.confirmed_rate,
+            snapshot.in_flight,
+            snapshot.skipped,
+            snapshot.rate_limited,
+            snapshot.rejected,
+            snapshot.failed,
+            snapshot.timed_out,
+            snapshot.settle_p50_ms,
+            snapshot.settle_p95_ms,
+        );
+        if final_summary || (inner.saturated && !inner.limit_reported) {
+            println!(
+                "[LIMIT] last_healthy={} first_saturated={} achieved={:.1}/s",
+                inner.last_healthy_active,
+                inner.first_saturated_active.unwrap_or(inner.active),
+                snapshot.submitted_rate,
+            );
+            inner.limit_reported = true;
+        }
+        inner.last = WindowBaseline {
+            scheduled: inner.scheduled,
+            skipped: inner.skipped,
+            submitted: inner.submitted,
+            outcomes: totals,
+        };
+        inner.window_settle = Samples::default();
+        inner.last_report = Instant::now();
+        snapshot
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LoadSnapshot {
+    pub active: usize,
+    pub target_rate: f64,
+    pub submitted_rate: f64,
+    pub confirmed_rate: f64,
+    pub confirmed: u64,
+    pub in_flight: usize,
+    pub skipped: u64,
+    pub rate_limited: u64,
+    pub rejected: u64,
+    pub failed: u64,
+    pub timed_out: u64,
+    pub settle_p50_ms: u64,
+    pub settle_p95_ms: u64,
+    pub saturated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,15 +282,52 @@ pub struct TradeMeasurement {
     pub cycle: Duration,
 }
 
-#[derive(Default)]
 struct MetricsInner {
     traders: BTreeMap<usize, TraderMetrics>,
     vault_cycle_ok: u64,
     vault_cycle_failed: u64,
+    active: usize,
+    scheduled: u64,
+    skipped: u64,
+    submitted: u64,
+    in_flight: usize,
+    last: WindowBaseline,
+    last_report: Instant,
+    window_settle: Samples,
+    consecutive_unhealthy: u8,
+    consecutive_healthy: u8,
+    saturated: bool,
+    last_healthy_active: usize,
+    first_saturated_active: Option<usize>,
+    limit_reported: bool,
+}
+
+impl Default for MetricsInner {
+    fn default() -> Self {
+        Self {
+            traders: BTreeMap::new(),
+            vault_cycle_ok: 0,
+            vault_cycle_failed: 0,
+            active: 0,
+            scheduled: 0,
+            skipped: 0,
+            submitted: 0,
+            in_flight: 0,
+            last: WindowBaseline::default(),
+            last_report: Instant::now(),
+            window_settle: Samples::default(),
+            consecutive_unhealthy: 0,
+            consecutive_healthy: 0,
+            saturated: false,
+            last_healthy_active: 0,
+            first_saturated_active: None,
+            limit_reported: false,
+        }
+    }
 }
 
 struct TraderMetrics {
-    tier: TraderTier,
+    _tier: TraderTier,
     attempted: u64,
     accepted: u64,
     confirmed: u64,
@@ -208,7 +350,7 @@ struct TraderMetrics {
 impl TraderMetrics {
     fn new(tier: TraderTier) -> Self {
         Self {
-            tier,
+            _tier: tier,
             attempted: 0,
             accepted: 0,
             confirmed: 0,
@@ -253,7 +395,7 @@ impl Samples {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct OutcomeCounts {
     attempted: u64,
     accepted: u64,
@@ -265,6 +407,14 @@ struct OutcomeCounts {
     timed_out: u64,
 }
 
+#[derive(Default)]
+struct WindowBaseline {
+    scheduled: u64,
+    skipped: u64,
+    submitted: u64,
+    outcomes: OutcomeCounts,
+}
+
 pub fn jittered_interval(base: Duration, jitter: f64) -> Duration {
     let factor = 1.0 + ((rand::random::<f64>() * 2.0 - 1.0) * jitter);
     Duration::from_secs_f64((base.as_secs_f64() * factor).max(0.001))
@@ -274,14 +424,14 @@ pub fn jittered_interval(base: Duration, jitter: f64) -> Duration {
 mod tests {
     use std::time::Duration;
 
-    use super::{Samples, jittered_interval};
+    use super::{Metrics, Samples, jittered_interval};
 
     #[test]
     fn jitter_stays_in_configured_bounds() {
         for _ in 0..1_000 {
-            let value = jittered_interval(Duration::from_secs(20), 0.2);
-            assert!(value >= Duration::from_secs(16));
-            assert!(value <= Duration::from_secs(24));
+            let value = jittered_interval(Duration::from_secs(10), 0.2);
+            assert!(value >= Duration::from_secs(8));
+            assert!(value <= Duration::from_secs(12));
         }
     }
 
@@ -293,5 +443,21 @@ mod tests {
         }
         assert_eq!(samples.percentile(50), 51);
         assert_eq!(samples.percentile(95), 96);
+    }
+
+    #[test]
+    fn saturation_requires_two_bad_windows() {
+        let metrics = Metrics::default();
+        metrics.set_active_traders(20);
+        for _ in 0..2 {
+            for _ in 0..100 {
+                metrics.record_schedule();
+            }
+            for _ in 0..6 {
+                metrics.record_skipped_schedule();
+            }
+            metrics.print_summary(false);
+        }
+        assert!(metrics.is_saturated());
     }
 }

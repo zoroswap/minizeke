@@ -22,8 +22,9 @@ use crate::{faucet::MintRequest, intent::INTENT_VERSION, order::OrderDetails};
 /// Caps concurrent challenge+login pairs so we do not stampede the server's
 /// `MIDEN_RPC_MAX_CONCURRENCY` vault lookups (default 8) or auth rate bucket.
 const AUTH_CONCURRENCY: usize = 4;
-/// Faucet proves serially under load; pile-ups just hit the HTTP timeout.
-const FAUCET_MINT_CONCURRENCY: usize = 1;
+/// Let the faucet receive enough requests together to build multi-recipient transactions.
+/// The faucet worker itself serializes prove/submit and caps each transaction's batch size.
+const FAUCET_MINT_CONCURRENCY: usize = 64;
 /// Per-request wait for a slow faucet prove/submit under staging load.
 const FAUCET_MINT_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 /// Cap how long one (recipient, faucet) mint may retry before failing the onboard.
@@ -161,7 +162,13 @@ impl SimulationApi {
             match result {
                 Ok(session) => {
                     http += attempt_started.elapsed();
-                    return Ok((session, AuthTiming { http, wait: wait_total }));
+                    return Ok((
+                        session,
+                        AuthTiming {
+                            http,
+                            wait: wait_total,
+                        },
+                    ));
                 }
                 Err(error) => {
                     let Some(wait) = retry_after_from_error(&error) else {
@@ -183,11 +190,7 @@ impl SimulationApi {
         }
     }
 
-    async fn authenticate_once(
-        &self,
-        user_id: AccountId,
-        key: &AuthSecretKey,
-    ) -> Result<Session> {
+    async fn authenticate_once(&self, user_id: AccountId, key: &AuthSecretKey) -> Result<Session> {
         let challenge_response = self
             .client
             .post(format!("{}/auth/challenge", self.api_url))
@@ -418,8 +421,8 @@ fn http_error(
 /// Transient ingress pressure: 429 rate limits and 503 worker saturation.
 fn retry_after_from_error(error: &anyhow::Error) -> Option<Duration> {
     let message = error.to_string();
-    let retryable = message.contains("429 Too Many Requests")
-        || message.contains("503 Service Unavailable");
+    let retryable =
+        message.contains("429 Too Many Requests") || message.contains("503 Service Unavailable");
     if !retryable {
         return None;
     }
@@ -490,8 +493,13 @@ mod tests {
              (retry-after=1)"
         );
         assert_eq!(retry_after_from_error(&err), Some(Duration::from_secs(1)));
-        let err = anyhow!("auth login returned 429 Too Many Requests: rate limit exceeded (retry-after=42)");
+        let err = anyhow!(
+            "auth login returned 429 Too Many Requests: rate limit exceeded (retry-after=42)"
+        );
         assert_eq!(retry_after_from_error(&err), Some(Duration::from_secs(42)));
-        assert_eq!(retry_after_from_error(&anyhow!("auth login returned 401")), None);
+        assert_eq!(
+            retry_after_from_error(&anyhow!("auth login returned 401")),
+            None
+        );
     }
 }

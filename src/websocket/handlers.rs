@@ -19,7 +19,21 @@ use uuid::Uuid;
 use crate::{
     api::AppState,
     message_broker::messages::{ClientMessage, ServerMessage, SubscriptionChannel},
+    order::OrderStatus,
 };
+
+fn is_expected_peer_disconnect(error: &axum::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "connection reset without closing handshake",
+        "connection closed",
+        "connection reset by peer",
+        "broken pipe",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|expected| message.contains(expected))
+}
 
 /// WebSocket upgrade handler
 pub async fn websocket_handler(
@@ -138,7 +152,11 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState, ip: Opt
                 warn!(conn_id = %conn_id, "Received unexpected binary message");
             }
             Err(e) => {
-                error!(conn_id = %conn_id, "WebSocket error: {}", e);
+                if is_expected_peer_disconnect(&e) {
+                    debug!(conn_id = %conn_id, "WebSocket peer disconnected: {}", e);
+                } else {
+                    error!(conn_id = %conn_id, "WebSocket error: {}", e);
+                }
                 break;
             }
         }
@@ -148,6 +166,30 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState, ip: Opt
     state.connection_manager.remove_connection(conn_id);
     sender_task.abort();
     debug!(conn_id = %conn_id, "WebSocket connection closed");
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_expected_peer_disconnects() {
+        for message in [
+            "Connection reset without closing handshake",
+            "connection reset by peer",
+            "broken pipe",
+            "unexpected EOF",
+        ] {
+            let error = axum::Error::new(std::io::Error::other(message));
+            assert!(is_expected_peer_disconnect(&error), "{message}");
+        }
+    }
+
+    #[test]
+    fn retains_unexpected_websocket_errors() {
+        let error = axum::Error::new(std::io::Error::other("invalid websocket opcode"));
+        assert!(!is_expected_peer_disconnect(&error));
+    }
 }
 
 async fn revalidate_session(conn_id: Uuid, state: &AppState) -> bool {
@@ -226,6 +268,7 @@ async fn handle_client_message(msg: ClientMessage, conn_id: Uuid, state: &AppSta
             debug!(conn_id = %conn_id, "Client subscribing to {} channels", channels.len());
             for channel in channels {
                 let authenticated = state.connection_manager.authenticated_user(conn_id);
+                let mut current_order = None;
                 let private_allowed = match &channel {
                     SubscriptionChannel::UserEvent {
                         user_id: Some(user_id),
@@ -240,15 +283,36 @@ async fn handle_client_message(msg: ClientMessage, conn_id: Uuid, state: &AppSta
                     } => {
                         if let Ok(id) = uuid::Uuid::parse_str(order_id) {
                             let history = state.history.clone();
-                            state
+                            let order = state
                                 .work_limits
                                 .database(move || Ok(history.order(id)?))
                                 .await
                                 .ok()
-                                .flatten()
-                                .is_some_and(|order| {
-                                    authenticated.as_deref() == Some(order.user_id.as_str())
-                                })
+                                .flatten();
+                            order.is_some_and(|order| {
+                                let allowed =
+                                    authenticated.as_deref() == Some(order.user_id.as_str());
+                                if allowed {
+                                    let status = match order.status.as_str() {
+                                        "created" => Some(OrderStatus::Created),
+                                        "processing" => Some(OrderStatus::Processing),
+                                        "processed" => Some(OrderStatus::Processed),
+                                        "submitted" => Some(OrderStatus::Submitted),
+                                        "confirmed" => Some(OrderStatus::Confirmed),
+                                        "executed" => Some(OrderStatus::Executed),
+                                        "settled" => Some(OrderStatus::Settled),
+                                        "failed" => Some(OrderStatus::Failed),
+                                        _ => None,
+                                    };
+                                    current_order =
+                                        status.map(|status| ServerMessage::OrderUpdate {
+                                            order_id: order.id,
+                                            status,
+                                            timestamp: order.last_updated_at,
+                                        });
+                                }
+                                allowed
+                            })
                         } else {
                             false
                         }
@@ -282,6 +346,9 @@ async fn handle_client_message(msg: ClientMessage, conn_id: Uuid, state: &AppSta
                         channel: channel.clone(),
                     },
                 );
+                if let Some(update) = current_order {
+                    state.connection_manager.send_to_connection(conn_id, update);
+                }
 
                 if matches!(channel, SubscriptionChannel::Stats) {
                     let stats = state.store.order_stats();

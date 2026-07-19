@@ -406,9 +406,7 @@ impl Processing {
                     self.try_start_batch().await;
                 }
                 AmmEvent::BatchFailed => {
-                    warn!(
-                        "Reconciling batch failed; will reload pool states before next claim"
-                    );
+                    warn!("Reconciling batch failed; will reload pool states before next claim");
                     self.pool_resync_required = true;
                     // Pause further claims until resync runs in try_start_batch.
                     self.engine_busy = true;
@@ -670,21 +668,25 @@ impl Processing {
         }
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let claim_limit = crate::miden_execution::max_orders_per_shard_tx().saturating_mul(2);
-        let batch =
-            match self
-                .execution_store
-                .claim_admitted_orders(&self.worker_id, now, 600_000, claim_limit)
-            {
-                Ok(batch) => batch,
-                Err(error) => {
-                    error!(%error, "Failed to claim durable admitted orders");
-                    return;
-                }
-            };
+        let batch = match self.execution_store.claim_admitted_orders(
+            &self.worker_id,
+            now,
+            600_000,
+            claim_limit,
+        ) {
+            Ok(batch) => batch,
+            Err(error) => {
+                error!(%error, "Failed to claim durable admitted orders");
+                return;
+            }
+        };
         if batch.is_empty() {
             return;
         }
-        info!(trades = batch.len(), "Trading cycle: quoting admitted orders");
+        info!(
+            trades = batch.len(),
+            "Trading cycle: quoting admitted orders"
+        );
         self.engine_busy = true;
         self.execution_finished = false;
         let started = Instant::now();
@@ -1306,17 +1308,11 @@ mod tests {
     #[test]
     fn init_redeem_reduces_warm_balance_and_leaves_cold_untouched() {
         let mut balances = HashMap::new();
-        apply_vault_cashflow_to_balances(
-            &mut balances,
-            &event(VaultCashFlowKind::InitRedeem, 100),
-        );
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::InitRedeem, 100));
         assert!(balances.is_empty());
 
         apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Fund, 500));
-        apply_vault_cashflow_to_balances(
-            &mut balances,
-            &event(VaultCashFlowKind::InitRedeem, 200),
-        );
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::InitRedeem, 200));
         assert_eq!(balances.get(&(user(), faucet())), Some(&300));
     }
 
@@ -1324,10 +1320,7 @@ mod tests {
     fn redeem_does_not_double_subtract() {
         let mut balances = HashMap::new();
         apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Fund, 500));
-        apply_vault_cashflow_to_balances(
-            &mut balances,
-            &event(VaultCashFlowKind::InitRedeem, 200),
-        );
+        apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::InitRedeem, 200));
         apply_vault_cashflow_to_balances(&mut balances, &event(VaultCashFlowKind::Redeem, 200));
         assert_eq!(balances.get(&(user(), faucet())), Some(&300));
     }

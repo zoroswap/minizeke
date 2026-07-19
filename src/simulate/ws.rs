@@ -1,11 +1,17 @@
 //! WebSocket client for waiting on order terminal status (`Confirmed` / `Failed`).
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::time::timeout;
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    time::timeout,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -34,98 +40,279 @@ pub enum TerminalOrderStatus {
     Failed,
 }
 
-/// Long-lived (per-wait) WS session: authenticate, subscribe to one order, wait for terminal.
-pub async fn wait_for_order_terminal(
-    ws_url: &str,
-    access_token: &str,
-    order_id: Uuid,
-    timeout_secs: u64,
-) -> Result<TerminalOrderStatus> {
-    let (stream, _) = connect_async(ws_url)
-        .await
-        .with_context(|| format!("connect websocket {ws_url}"))?;
-    let (mut write, mut read) = stream.split();
+#[derive(Clone)]
+pub struct SettlementTracker {
+    commands: mpsc::Sender<TrackerCommand>,
+    order_timeout: Duration,
+}
 
-    send_json(
-        &mut write,
-        &ClientMessage::Authenticate {
-            token: access_token.to_owned(),
-        },
-    )
-    .await?;
+struct PendingOrder {
+    deadline: Instant,
+    result: oneshot::Sender<std::result::Result<TerminalOrderStatus, String>>,
+}
 
-    // Wait for Authenticated (or Error) before subscribing.
-    let auth_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() >= auth_deadline {
-            bail!("websocket auth timed out");
-        }
-        let remaining = auth_deadline.saturating_duration_since(Instant::now());
-        let msg = timeout(remaining, read.next())
-            .await
-            .map_err(|_| anyhow!("websocket auth timed out"))?
-            .ok_or_else(|| anyhow!("websocket closed during auth"))?
-            .context("websocket read during auth")?;
-        match parse_server_text(&msg)? {
-            Some(WsInbound::Authenticated { .. }) => break,
-            Some(WsInbound::Error { message }) => {
-                bail!("websocket auth failed: {message}");
-            }
-            Some(other) => {
-                debug!(?other, "ignoring pre-auth websocket message");
-            }
-            None => {}
+enum TrackerCommand {
+    Track {
+        order_id: Uuid,
+        deadline: Instant,
+        result: oneshot::Sender<std::result::Result<TerminalOrderStatus, String>>,
+    },
+    UpdateToken(String),
+}
+
+impl SettlementTracker {
+    pub fn spawn(
+        ws_url: String,
+        access_token: String,
+        timeout_secs: u64,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
+        let (commands, receiver) = mpsc::channel(16);
+        tokio::spawn(run_settlement_tracker(
+            ws_url,
+            access_token,
+            receiver,
+            shutdown,
+        ));
+        Self {
+            commands,
+            order_timeout: Duration::from_secs(timeout_secs),
         }
     }
 
-    send_json(
-        &mut write,
-        &ClientMessage::Subscribe {
-            channels: vec![SubscriptionChannel::OrderUpdates {
-                order_id: Some(order_id.to_string()),
-            }],
-        },
-    )
-    .await?;
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        if Instant::now() >= deadline {
-            bail!("order {order_id} websocket wait timed out after {timeout_secs}s");
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let msg = timeout(remaining, read.next())
+    pub async fn track(&self, order_id: Uuid) -> Result<TerminalOrderStatus> {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(TrackerCommand::Track {
+                order_id,
+                deadline: Instant::now() + self.order_timeout,
+                result,
+            })
             .await
-            .map_err(|_| anyhow!("order {order_id} websocket wait timed out"))?
-            .ok_or_else(|| anyhow!("websocket closed while waiting for order {order_id}"))?
-            .context("websocket read while waiting for order")?;
+            .context("settlement tracker stopped")?;
+        receiver
+            .await
+            .context("settlement tracker dropped order")?
+            .map_err(anyhow::Error::msg)
+    }
 
-        if let Message::Ping(payload) = msg {
-            write
-                .send(Message::Pong(payload))
+    pub async fn update_token(&self, access_token: String) {
+        let _ = self
+            .commands
+            .send(TrackerCommand::UpdateToken(access_token))
+            .await;
+    }
+}
+
+async fn run_settlement_tracker(
+    ws_url: String,
+    mut access_token: String,
+    mut commands: mpsc::Receiver<TrackerCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut pending = HashMap::<Uuid, PendingOrder>::new();
+    loop {
+        loop {
+            match commands.try_recv() {
+                Ok(TrackerCommand::Track {
+                    order_id,
+                    deadline,
+                    result,
+                }) => {
+                    pending.insert(order_id, PendingOrder { deadline, result });
+                }
+                Ok(TrackerCommand::UpdateToken(token)) => access_token = token,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    fail_pending(&mut pending, "settlement tracker stopped");
+                    return;
+                }
+            }
+        }
+        if *shutdown.borrow() {
+            fail_pending(&mut pending, "simulator shutting down");
+            return;
+        }
+        expire_pending(&mut pending);
+        let connected = timeout(Duration::from_secs(5), connect_async(&ws_url)).await;
+        let (stream, _) = match connected {
+            Ok(Ok(connected)) => connected,
+            Ok(Err(error)) => {
+                debug!(%error, "settlement websocket connect failed; retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            fail_pending(&mut pending, "simulator shutting down");
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(_) => {
+                debug!("settlement websocket connect timed out; retrying");
+                continue;
+            }
+        };
+        let (mut write, mut read) = stream.split();
+        if let Err(error) = send_json(
+            &mut write,
+            &ClientMessage::Authenticate {
+                token: access_token.clone(),
+            },
+        )
+        .await
+        {
+            debug!(%error, "settlement websocket auth send failed; reconnecting");
+            continue;
+        }
+        let authenticated = timeout(Duration::from_secs(15), async {
+            loop {
+                let message = read
+                    .next()
+                    .await
+                    .ok_or_else(|| anyhow!("websocket closed during auth"))?
+                    .context("websocket read during auth")?;
+                match parse_server_text(&message)? {
+                    Some(WsInbound::Authenticated { .. }) => return Ok(()),
+                    Some(WsInbound::Error { message }) => {
+                        bail!("websocket auth failed: {message}");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        match authenticated {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "settlement websocket authentication failed");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(_) => {
+                debug!("settlement websocket authentication timed out");
+                continue;
+            }
+        }
+        if !pending.is_empty()
+            && send_subscriptions(&mut write, pending.keys().copied())
                 .await
-                .context("websocket pong")?;
+                .is_err()
+        {
             continue;
         }
 
-        match parse_server_text(&msg)? {
-            Some(WsInbound::OrderUpdate {
-                order_id: update_id,
-                status,
-                ..
-            }) if update_id == order_id.to_string() => match status {
-                OrderStatus::Confirmed => return Ok(TerminalOrderStatus::Confirmed),
-                OrderStatus::Failed => return Ok(TerminalOrderStatus::Failed),
-                other => {
-                    debug!(%order_id, ?other, "order status update");
+        let mut expiry = tokio::time::interval(Duration::from_secs(1));
+        expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut reconnect = false;
+        while !reconnect {
+            tokio::select! {
+                command = commands.recv() => match command {
+                    Some(TrackerCommand::Track { order_id, deadline, result }) => {
+                        pending.insert(order_id, PendingOrder { deadline, result });
+                        if send_subscriptions(&mut write, [order_id]).await.is_err() {
+                            reconnect = true;
+                        }
+                    }
+                    Some(TrackerCommand::UpdateToken(token)) => {
+                        access_token = token;
+                        reconnect = true;
+                    }
+                    None => {
+                        fail_pending(&mut pending, "settlement tracker stopped");
+                        return;
+                    }
+                },
+                message = read.next() => match message {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if write.send(Message::Pong(payload)).await.is_err() {
+                            reconnect = true;
+                        }
+                    }
+                    Some(Ok(message)) => match parse_server_text(&message) {
+                        Ok(Some(WsInbound::OrderUpdate { order_id, status, .. })) => {
+                            if let Ok(order_id) = Uuid::parse_str(&order_id) {
+                                let terminal = match status {
+                                    OrderStatus::Confirmed => Some(TerminalOrderStatus::Confirmed),
+                                    OrderStatus::Failed => Some(TerminalOrderStatus::Failed),
+                                    _ => None,
+                                };
+                                if let (Some(status), Some(order)) =
+                                    (terminal, pending.remove(&order_id))
+                                {
+                                    let _ = order.result.send(Ok(status));
+                                }
+                            }
+                        }
+                        Ok(Some(WsInbound::Error { message })) => {
+                            debug!(%message, "settlement websocket server error");
+                        }
+                        Ok(_) => {}
+                        Err(error) => debug!(%error, "invalid settlement websocket message"),
+                    },
+                    Some(Err(error)) => {
+                        debug!(%error, "settlement websocket disconnected; reconnecting");
+                        reconnect = true;
+                    }
+                    None => reconnect = true,
+                },
+                _ = expiry.tick() => expire_pending(&mut pending),
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        fail_pending(&mut pending, "simulator shutting down");
+                        return;
+                    }
                 }
-            },
-            Some(WsInbound::Error { message }) => {
-                warn!(%order_id, %message, "websocket error while waiting for order");
             }
-            Some(WsInbound::Subscribed { .. }) | Some(WsInbound::Pong) => {}
-            Some(_) | None => {}
         }
+    }
+}
+
+async fn send_subscriptions<S>(
+    write: &mut S,
+    order_ids: impl IntoIterator<Item = Uuid>,
+) -> Result<()>
+where
+    S: SinkExt<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let message = subscription_message(order_ids);
+    send_json(write, &message).await
+}
+
+fn subscription_message(order_ids: impl IntoIterator<Item = Uuid>) -> ClientMessage {
+    ClientMessage::Subscribe {
+        channels: order_ids
+            .into_iter()
+            .map(|order_id| SubscriptionChannel::OrderUpdates {
+                order_id: Some(order_id.to_string()),
+            })
+            .collect(),
+    }
+}
+
+fn expire_pending(pending: &mut HashMap<Uuid, PendingOrder>) {
+    let now = Instant::now();
+    let expired = pending
+        .iter()
+        .filter_map(|(order_id, order)| (order.deadline <= now).then_some(*order_id))
+        .collect::<Vec<_>>();
+    for order_id in expired {
+        if let Some(order) = pending.remove(&order_id) {
+            let _ = order
+                .result
+                .send(Err(format!("order {order_id} settlement timed out")));
+        }
+    }
+}
+
+fn fail_pending(pending: &mut HashMap<Uuid, PendingOrder>, reason: &str) {
+    for (order_id, order) in pending.drain() {
+        let _ = order
+            .result
+            .send(Err(format!("order {order_id}: {reason}")));
     }
 }
 
@@ -177,4 +364,49 @@ fn parse_server_text(message: &Message) -> Result<Option<WsInbound>> {
     let inbound: WsInbound =
         serde_json::from_str(text).with_context(|| format!("decode websocket message: {text}"))?;
     Ok(Some(inbound))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    use super::{PendingOrder, expire_pending, subscription_message};
+
+    #[tokio::test]
+    async fn reconnect_bookkeeping_resubscribes_only_pending_orders() {
+        let expired_id = Uuid::new_v4();
+        let pending_id = Uuid::new_v4();
+        let (expired_tx, expired_rx) = oneshot::channel();
+        let (pending_tx, _pending_rx) = oneshot::channel();
+        let mut pending = HashMap::from([
+            (
+                expired_id,
+                PendingOrder {
+                    deadline: Instant::now() - Duration::from_secs(1),
+                    result: expired_tx,
+                },
+            ),
+            (
+                pending_id,
+                PendingOrder {
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    result: pending_tx,
+                },
+            ),
+        ]);
+
+        expire_pending(&mut pending);
+
+        assert!(expired_rx.await.unwrap().is_err());
+        assert!(!pending.contains_key(&expired_id));
+        let json = serde_json::to_string(&subscription_message(pending.keys().copied())).unwrap();
+        assert!(json.contains(&pending_id.to_string()));
+        assert!(!json.contains(&expired_id.to_string()));
+    }
 }

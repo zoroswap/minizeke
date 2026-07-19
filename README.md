@@ -18,7 +18,7 @@ Ingress defaults are:
   `RATE_LIMIT_MUTATION_PER_MINUTE=60`, `RATE_LIMIT_MAX_KEYS=100000`
 - `DB_MAX_CONCURRENCY=8`, `MIDEN_RPC_MAX_CONCURRENCY=8`
 - `WS_QUEUE_CAPACITY=128`, `WS_GLOBAL_CONNECTION_CAP=2000`,
-  `WS_PER_IP_CONNECTION_CAP=20`, `WS_MAX_MESSAGE_BYTES=65536`,
+  `WS_PER_IP_CONNECTION_CAP=256`, `WS_MAX_MESSAGE_BYTES=65536`,
   `WS_MAX_SUBSCRIPTIONS=64`
 - `WS_SESSION_RECHECK_SECS=30`, `WS_PING_INTERVAL_SECS=20`,
   `WS_PONG_TIMEOUT_SECS=60`, `WS_WRITE_TIMEOUT_SECS=10`,
@@ -81,8 +81,10 @@ Optional values:
 - `MAX_ADMITTED_AGE_MS`: max age of an admitted order before quote fails it as `stale_queue`. Default: `60000`.
 - `MAX_ORDERS_PER_SHARD_TX`: soft cap on swaps packed into one pool transaction. Default: `16`.
 - `FINALITY_TIMEOUT_SECS`: terminal timeout for a submitted transaction that remains unconfirmed. Default: `1800`.
-- `FINALITY_RETRY_SECS`: minimum interval between reconciliation attempts. Default: `2`.
+- `FINALITY_RETRY_MS`: minimum interval between finality reconciliation attempts. Default: `500`.
+- `FINALITY_RETRY_SECS`: legacy fallback for finality retry cadence (`secs * 1000`) when `FINALITY_RETRY_MS` is unset.
 - `FINALITY_MAX_ATTEMPTS`: terminal reconciliation-attempt limit. Default: `900`.
+- `MIDEN_DEBUG_MODE`: opt-in Miden VM debug execution (`1|true|yes`). Default: off (much faster).
 - `ANALYTICS_DB_PATH`: WAC user and pool analytics journal. Default: `analytics.<network>.sqlite3`.
 - `AUTH_DB_PATH`: wallet challenges and hashed opaque sessions. Default: `auth.<network>.sqlite3`.
 - `FEE_DB_PATH`: volatility-fee batches and validity state. Default: `fees.<network>.sqlite3`.
@@ -102,17 +104,20 @@ Optional values:
   transaction per faucet id (standard multi-note `send_notes` mint). Default: `32`.
 - `ASSETS_FILE`: deploy-time asset config. Default: `assets.toml`.
 
-`simulate_traders` setup also accepts `--setup-concurrency` (default `8`) for parallel
-per-trader consume/register/fund workers. Before trading it warms auth sessions with
-`--auth-warmup-gap-ms` (default `3500`) so challenge/login stays under
-`RATE_LIMIT_AUTH_PER_MINUTE` (default `20`). For faster local/staging load tests,
-raise that server env (e.g. `RATE_LIMIT_AUTH_PER_MINUTE=120`).
+`simulate_traders` takes two numbers: `START` and `MAX` (defaults `20` `100`).
+It pre-stages all `MAX` traders, starts `START`, then activates about eight equal
+stages at one-minute intervals. Every trader submits every 10 seconds with 20%
+jitter and tracks up to two unsettled orders over one persistent WebSocket. The
+server default supports 256 same-host trader connections; set
+`WS_PER_IP_CONNECTION_CAP` only when testing a larger `MAX`.
 
-After admit, each trade waits on the API WebSocket for `Confirmed`/`Failed`
-(`--order-timeout-secs`, default `120`). Optional live growth:
-`--keep-increasing --max-traders 100 --grow-interval-secs 60`. Mid-run vault
-fund/init_redeem/redeem cycles run every `--vault-cycle-interval-secs` (default
-`180`; `0` disables) for `--vault-cycle-amount` base units.
+Completed cohorts are reused on later runs when the network, vault, and requested
+`MAX` match. Simulator state, keys, and SQLite stores live under
+`simulation_stores/`; delete that directory to intentionally create a fresh cohort.
+
+```sh
+cargo run --bin simulate_traders -- 20 100
+```
 
 ## Deploy
 

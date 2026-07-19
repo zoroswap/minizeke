@@ -1,4 +1,4 @@
-use std::{future::pending, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
@@ -10,24 +10,21 @@ use minizeke::{
         metrics::Metrics,
         oracle::OracleClient,
         trader::{
-            TraderRegistry, build_simulation_client, load_traders, reset_setup_artifacts,
-            run_growth_loop, run_trader, run_vault_cycle_loop, setup_traders, validate_deployment,
-            warm_auth_sessions,
+            build_simulation_client, load_traders, migrate_legacy_setup_artifacts,
+            reset_setup_artifacts, run_activation_ramp, run_trader, setup_traders,
+            validate_deployment, warm_auth_sessions,
         },
     },
 };
-use tokio::{
-    sync::{Mutex, Semaphore, watch},
-    task::JoinSet,
-};
-use tracing::info;
+use tokio::{sync::watch, task::JoinSet};
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     let config = Config::parse();
     config.validate()?;
-    init_tracing(config.verbose);
+    init_tracing();
 
     let mut deployment = Deployment::load()?;
     validate_deployment(&deployment)?;
@@ -39,15 +36,41 @@ async fn main() -> Result<()> {
     let oracle = OracleClient::new(&config.oracle_url)?;
     let metrics = Metrics::default();
 
-    if !config.skip_setup {
-        reset_setup_artifacts(&config)?;
-    }
-
-    let (mut miden_client, keystore) = build_simulation_client(&config).await?;
-
-    let traders = if config.skip_setup {
-        load_traders(&config, &deployment, &keystore).await?
+    migrate_legacy_setup_artifacts(&config)?;
+    let mut traders = if config.state_file.exists() {
+        let (miden_client, keystore) = build_simulation_client(&config).await?;
+        match load_traders(&config, &deployment, &keystore).await {
+            Ok(traders) => {
+                info!(
+                    traders = traders.len(),
+                    state = %config.state_file.display(),
+                    "reusing saved trader cohort"
+                );
+                traders
+            }
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "saved trader cohort is unusable; rebuilding once"
+                );
+                drop(miden_client);
+                drop(keystore);
+                reset_setup_artifacts(&config)?;
+                let (mut miden_client, keystore) = build_simulation_client(&config).await?;
+                setup_traders(
+                    &config,
+                    &mut deployment,
+                    &api,
+                    &metrics,
+                    &mut miden_client,
+                    &keystore,
+                )
+                .await?
+            }
+        }
     } else {
+        reset_setup_artifacts(&config)?;
+        let (mut miden_client, keystore) = build_simulation_client(&config).await?;
         setup_traders(
             &config,
             &mut deployment,
@@ -58,25 +81,14 @@ async fn main() -> Result<()> {
         )
         .await?
     };
-    if config.setup_only {
-        metrics.print_summary(true);
-        return Ok(());
-    }
+    let staged = traders.split_off(config.num_traders);
 
-    let tier_counts = traders.iter().fold([0_usize; 3], |mut counts, trader| {
-        match trader.tier {
-            minizeke::simulate::config::TraderTier::Low => counts[0] += 1,
-            minizeke::simulate::config::TraderTier::Average => counts[1] += 1,
-            minizeke::simulate::config::TraderTier::HighFrequency => counts[2] += 1,
-        }
-        counts
-    });
     info!(
-        traders = traders.len(),
-        low = tier_counts[0],
-        average = tier_counts[1],
-        high_frequency = tier_counts[2],
-        "warming auth sessions"
+        active = traders.len(),
+        staged = staged.len(),
+        max_traders = config.max_traders,
+        interval_secs = config.trade_interval_secs,
+        "warming auth sessions (all high-frequency)"
     );
     let sessions = warm_auth_sessions(
         &traders,
@@ -85,14 +97,17 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    info!(traders = traders.len(), "starting simulation");
+    info!(
+        active = traders.len(),
+        max_traders = config.max_traders,
+        "starting open-loop simulation"
+    );
 
     let config = Arc::new(config);
     let deployment = Arc::new(deployment);
-    let registry: TraderRegistry = Arc::new(Mutex::new(traders.clone()));
-    let prove_slots = Arc::new(Semaphore::new(config.setup_concurrency));
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    metrics.set_active_traders(traders.len());
     for (trader, session) in traders.into_iter().zip(sessions) {
         tasks.spawn(run_trader(
             trader,
@@ -106,85 +121,60 @@ async fn main() -> Result<()> {
         ));
     }
 
-    if config.keep_increasing {
+    if !staged.is_empty() {
         info!(
             max_traders = config.max_traders,
-            grow_interval_secs = config.grow_interval_secs,
-            "starting live trader growth"
+            stage_interval_secs = 60,
+            "starting activation ramp"
         );
-        tasks.spawn(run_growth_loop(
+        tasks.spawn(run_activation_ramp(
             config.clone(),
+            deployment,
             api.clone(),
             oracle.clone(),
             metrics.clone(),
-            registry.clone(),
-            prove_slots.clone(),
-            shutdown_rx.clone(),
-        ));
-    }
-
-    if config.vault_cycle_interval_secs > 0 {
-        info!(
-            interval_secs = config.vault_cycle_interval_secs,
-            amount = config.vault_cycle_amount,
-            "starting vault fund/redeem cycles"
-        );
-        tasks.spawn(run_vault_cycle_loop(
-            config.clone(),
-            api.clone(),
-            metrics.clone(),
-            registry,
-            prove_slots,
+            staged,
             shutdown_rx.clone(),
         ));
     }
 
     let mut summary = tokio::time::interval(Duration::from_secs(config.summary_interval));
     summary.tick().await;
-    let duration = async {
-        match config.duration {
-            Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
-            None => pending::<()>().await,
-        }
-    };
-    tokio::pin!(duration);
 
     loop {
         tokio::select! {
-            _ = summary.tick() => metrics.print_summary(false),
+            _ = summary.tick() => {
+                metrics.print_summary(false);
+            }
             result = tokio::signal::ctrl_c() => {
                 let _ = result;
                 // Immediate hard kill — do not drain traders / onboarding.
                 eprintln!("Ctrl+C");
                 std::process::exit(130);
             }
-            _ = &mut duration => {
-                info!("configured simulation duration elapsed");
-                break;
-            }
         }
     }
-
-    let _ = shutdown_tx.send(true);
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result {
-            tracing::error!(%error, "trader task failed");
-        }
-    }
-    metrics.print_summary(true);
-    Ok(())
 }
 
-fn init_tracing(verbosity: u8) {
-    let default_filter = match verbosity {
-        0 => "info,miden_core=off,log=warn",
-        1 => "debug,miden_core=off",
-        _ => "trace",
-    };
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,\
+                     miden_client=warn,\
+                     miden_client::rpc::tonic_client::retry=off,\
+                     miden_core=off,\
+                     miden_processor=warn,\
+                     miden_prover=warn,\
+                     rusqlite_migration=warn,\
+                     reqwest=warn,\
+                     hyper=warn,\
+                     tungstenite=warn,\
+                     tokio_tungstenite=warn,\
+                     log=warn",
+                )
+            }),
         )
         .with_target(false)
         .init();

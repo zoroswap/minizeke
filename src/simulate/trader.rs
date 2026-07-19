@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -24,13 +25,13 @@ use tokio::{
     sync::{Mutex, Semaphore, mpsc, watch},
     task::JoinSet,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     deployment::{AssetInfo, Deployment},
     intent::Intent,
-    miden_env::MidenNetwork,
+    miden_env::{MidenNetwork, miden_debug_mode_enabled},
     order::OrderDetails,
     pool::deploy_pool,
     simulate::{
@@ -42,7 +43,8 @@ use crate::{
     },
     test_utils::{
         consume_all_notes_for, consume_all_notes_for_setup, fund_user_on_vault, get_client,
-        get_pool_client_for, init_redeem_on_vault, redeem_on_vault, register_and_fund_user_on_vault,
+        get_pool_client_for, init_redeem_on_vault, redeem_on_vault,
+        register_and_fund_user_on_vault,
     },
     vault::{add_pool_to_vault, get_vault_user_asset_info},
 };
@@ -54,6 +56,7 @@ pub type TraderRegistry = Arc<Mutex<Vec<Trader>>>;
 /// Concurrent `get_client()` opens the same SQLite DB and fails with bare "storage error" /
 /// "RPC error".
 static LIVE_ONBOARD_SHARED: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const MAX_IN_FLIGHT_PER_TRADER: usize = 2;
 
 #[derive(Clone)]
 pub struct Trader {
@@ -73,7 +76,7 @@ pub async fn warm_auth_sessions(
     let mut sessions = Vec::with_capacity(traders.len());
     for (index, trader) in traders.iter().enumerate() {
         let (session, timing) = api.authenticate(trader.user_id, &trader.key).await?;
-        info!(
+        debug!(
             trader = trader.index,
             auth_ms = timing.http.as_millis(),
             auth_wait_ms = timing.wait.as_millis(),
@@ -113,6 +116,8 @@ struct SetupJob {
 struct SimulationState {
     network: String,
     vault_id: String,
+    #[serde(default)]
+    setup_complete: bool,
     traders: Vec<TraderState>,
 }
 
@@ -129,8 +134,12 @@ pub async fn build_simulation_client(
     let network = MidenNetwork::from_env();
     let store = Arc::new(SqliteStore::new(config.store_path.clone()).await?);
     let keystore = Arc::new(FilesystemKeyStore::new(config.keystore_dir.clone())?);
+    let debug_mode = miden_debug_mode_enabled();
+    if debug_mode {
+        warn!("MIDEN_DEBUG_MODE enabled; simulation client execution will be substantially slower");
+    }
     let mut builder = MidenNetwork::client_builder()
-        .in_debug_mode(true.into())
+        .in_debug_mode(debug_mode.into())
         .store(store)
         .authenticator(keystore.clone());
     if let Some(url) = std::env::var("TX_PROVER_URL")
@@ -154,13 +163,78 @@ pub async fn build_simulation_client(
 /// Removes prior setup artifacts so a full setup run starts clean. Call before opening the
 /// simulation client when `--skip-setup` is not set.
 pub fn reset_setup_artifacts(config: &Config) -> Result<()> {
-    remove_path_if_exists(&config.state_file)?;
-    remove_sqlite_store(&config.store_path)?;
-    remove_worker_stores(&config.store_path)?;
+    let removed = remove_path_if_exists(&config.state_file)?
+        + remove_sqlite_store(&config.store_path)?
+        + remove_worker_stores(&config.store_path)?;
+    if removed > 0 {
+        info!(removed, "removed previous setup artifacts");
+    }
     Ok(())
 }
 
-fn remove_worker_stores(base: &PathBuf) -> Result<()> {
+/// Moves stores created by older simulator versions out of the repository root.
+/// Existing files in the destination win, so a completed migrated cohort is never overwritten.
+pub fn migrate_legacy_setup_artifacts(config: &Config) -> Result<()> {
+    let storage_dir = config
+        .state_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("simulation_stores"));
+    std::fs::create_dir_all(storage_dir)
+        .with_context(|| format!("create simulator storage {}", storage_dir.display()))?;
+
+    let mut moved = 0;
+    moved += move_path_if_destination_missing(
+        std::path::Path::new("simulate_traders.state.json"),
+        &config.state_file,
+    )?;
+    moved += move_path_if_destination_missing(
+        std::path::Path::new("simulate_keystore"),
+        &config.keystore_dir,
+    )?;
+
+    for entry in std::fs::read_dir(".").context("read repository root for legacy stores")? {
+        let entry = entry.context("read legacy simulator store entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("simulate.store.sqlite3") {
+            continue;
+        }
+        moved += move_path_if_destination_missing(&entry.path(), &storage_dir.join(name))?;
+    }
+    if moved > 0 {
+        info!(
+            moved,
+            directory = %storage_dir.display(),
+            "migrated legacy simulator artifacts"
+        );
+    }
+    Ok(())
+}
+
+fn move_path_if_destination_missing(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<usize> {
+    if !source.exists() || destination.exists() {
+        return Ok(0);
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::rename(source, destination).with_context(|| {
+        format!(
+            "move legacy simulator artifact {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(1)
+}
+
+fn remove_worker_stores(base: &PathBuf) -> Result<usize> {
     let file_name = base
         .file_name()
         .and_then(|name| name.to_str())
@@ -170,11 +244,12 @@ fn remove_worker_stores(base: &PathBuf) -> Result<()> {
     let dir = parent.unwrap_or_else(|| std::path::Path::new("."));
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => {
             return Err(error).with_context(|| format!("read {}", dir.display()));
         }
     };
+    let mut removed = 0;
     for entry in entries {
         let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
         let name = entry.file_name();
@@ -182,29 +257,28 @@ fn remove_worker_stores(base: &PathBuf) -> Result<()> {
             continue;
         };
         if name.starts_with(&prefix) {
-            remove_sqlite_store(&entry.path())?;
+            removed += remove_sqlite_store(&entry.path())?;
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
-fn remove_path_if_exists(path: &PathBuf) -> Result<()> {
+fn remove_path_if_exists(path: &PathBuf) -> Result<usize> {
     if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("remove {}", path.display()))?;
-        info!(path = %path.display(), "removed previous setup artifact");
+        std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        return Ok(1);
     }
-    Ok(())
+    Ok(0)
 }
 
-fn remove_sqlite_store(path: &PathBuf) -> Result<()> {
-    remove_path_if_exists(path)?;
+fn remove_sqlite_store(path: &PathBuf) -> Result<usize> {
+    let mut removed = remove_path_if_exists(path)?;
     for suffix in ["-wal", "-shm"] {
         let mut sidecar = path.as_os_str().to_owned();
         sidecar.push(suffix);
-        remove_path_if_exists(&PathBuf::from(sidecar))?;
+        removed += remove_path_if_exists(&PathBuf::from(sidecar))?;
     }
-    Ok(())
+    Ok(removed)
 }
 
 pub async fn setup_traders(
@@ -216,14 +290,14 @@ pub async fn setup_traders(
     keystore: &FilesystemKeyStore,
 ) -> Result<Vec<Trader>> {
     let tiers = config.tier_assignments();
-    info!(traders = config.num_traders, "creating trader wallets");
+    info!(traders = config.max_traders, "creating trader wallets");
 
-    ensure_pool_shards(config, deployment, config.num_traders).await?;
+    ensure_pool_shards(config, deployment, config.max_traders).await?;
 
-    let mut traders = Vec::with_capacity(config.num_traders);
+    let mut traders = Vec::with_capacity(config.max_traders);
     for (index, tier) in tiers.into_iter().enumerate() {
         let wallet = create_wallet(client, keystore).await?;
-        info!(
+        debug!(
             trader = index,
             tier = tier.label(),
             user = %wallet.user_id.to_hex(),
@@ -236,7 +310,7 @@ pub async fn setup_traders(
             key: wallet.key,
         });
     }
-    save_state(config, deployment, &traders)?;
+    save_state(config, deployment, &traders, false)?;
 
     // Workers must add_account (and thus track note tags) *before* mint notes are
     // committed. Fresh stores created after mint sync at tip with notes=0 forever.
@@ -280,14 +354,18 @@ pub async fn setup_traders(
     );
     let (mint_done_tx, mint_done_rx) = watch::channel(false);
     let (ready_tx, mut ready_rx) = mpsc::channel(traders.len());
+    let prepare_slots = Arc::new(Semaphore::new(concurrency));
     let prove_slots = Arc::new(Semaphore::new(concurrency));
     let mut set = JoinSet::new();
     let expected = jobs.len();
     for job in jobs {
         let ready_tx = ready_tx.clone();
         let mint_done_rx = mint_done_rx.clone();
+        let prepare_slots = prepare_slots.clone();
         let prove_slots = prove_slots.clone();
-        set.spawn_blocking(move || run_setup_job(job, ready_tx, mint_done_rx, prove_slots));
+        set.spawn_blocking(move || {
+            run_setup_job(job, ready_tx, mint_done_rx, prepare_slots, prove_slots)
+        });
     }
     drop(ready_tx);
 
@@ -296,7 +374,7 @@ pub async fn setup_traders(
             .recv()
             .await
             .ok_or_else(|| anyhow!("setup worker exited before signaling ready"))?;
-        if prepared == expected || prepared % 5 == 0 {
+        if prepared == expected || prepared % 10 == 0 {
             info!(prepared, expected, "worker clients ready");
         }
     }
@@ -335,7 +413,7 @@ pub async fn setup_traders(
         joined.map_err(|error| anyhow!("setup worker join failed: {error}"))??;
     }
 
-    save_state(config, deployment, &traders)?;
+    save_state(config, deployment, &traders, true)?;
     info!(
         traders = traders.len(),
         pools = deployment.pools.len(),
@@ -356,8 +434,7 @@ async fn ensure_pool_shards(
         let pool_index = deployment.pools.len();
         info!(
             pool_index,
-            needed,
-            "deploying additional pool shard for user cap"
+            needed, "deploying additional pool shard for user cap"
         );
         let mut deploy_client = crate::test_utils::get_pool_client().await?;
         deploy_client.ensure_genesis_in_place().await?;
@@ -434,9 +511,11 @@ async fn mint_all_assets(
         let faucet_id = asset.faucet_id;
         let symbol = asset.symbol.clone();
         async move {
+            let started = Instant::now();
+            let recipient_count = recipients.len();
             info!(
                 asset = %symbol,
-                recipients = recipients.len(),
+                recipients = recipient_count,
                 "minting to traders via faucet batch"
             );
             let mint_futures = recipients.into_iter().map(|(index, tier, user_id)| {
@@ -445,10 +524,15 @@ async fn mint_all_assets(
             });
             let results = futures_util::future::join_all(mint_futures).await;
             for (index, tier, result) in results {
-                let latency =
-                    result.with_context(|| format!("mint {symbol} to trader {index}"))?;
+                let latency = result.with_context(|| format!("mint {symbol} to trader {index}"))?;
                 metrics.record_setup(index, tier, SetupPhase::Mint, latency);
             }
+            info!(
+                asset = %symbol,
+                recipients = recipient_count,
+                elapsed_ms = started.elapsed().as_millis(),
+                "faucet batch mint requests completed"
+            );
             Ok::<(), anyhow::Error>(())
         }
     });
@@ -462,19 +546,27 @@ fn run_setup_job(
     job: SetupJob,
     ready_tx: mpsc::Sender<usize>,
     mint_done_rx: watch::Receiver<bool>,
+    prepare_slots: Arc<Semaphore>,
     prove_slots: Arc<Semaphore>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build setup worker runtime")?;
-    runtime.block_on(onboard_trader(job, ready_tx, mint_done_rx, prove_slots))
+    runtime.block_on(onboard_trader(
+        job,
+        ready_tx,
+        mint_done_rx,
+        prepare_slots,
+        prove_slots,
+    ))
 }
 
 async fn onboard_trader(
     job: SetupJob,
     ready_tx: mpsc::Sender<usize>,
     mut mint_done_rx: watch::Receiver<bool>,
+    prepare_slots: Arc<Semaphore>,
     prove_slots: Arc<Semaphore>,
 ) -> Result<()> {
     let SetupJob {
@@ -493,6 +585,10 @@ async fn onboard_trader(
         shard_done_tx,
     } = job;
 
+    let prepare_slot = prepare_slots
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("prepare slot closed for trader {index}"))?;
     let mut client = build_worker_client(&keystore_dir, &store_path).await?;
     client.add_account(&account, false).await?;
     client.sync_state().await?;
@@ -500,6 +596,7 @@ async fn onboard_trader(
         .send(index)
         .await
         .map_err(|_| anyhow!("setup coordinator dropped while trader {index} was preparing"))?;
+    drop(prepare_slot);
 
     mint_done_rx
         .wait_for(|done| *done)
@@ -560,7 +657,7 @@ async fn onboard_trader(
         .await
         .map_err(|_| anyhow!("setup coordinator dropped after trader {index} registered"))?;
 
-    info!(
+    debug!(
         trader = index,
         shard_wave,
         user = %user_id.to_hex(),
@@ -656,13 +753,20 @@ async fn build_worker_client(
     store_path: &PathBuf,
 ) -> Result<Client<FilesystemKeyStore>> {
     let network = MidenNetwork::from_env();
-    if let Some(parent) = store_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+    if let Some(parent) = store_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     let store = Arc::new(SqliteStore::new(store_path.clone()).await?);
     let keystore = Arc::new(FilesystemKeyStore::new(keystore_dir.clone())?);
+    let debug_mode = miden_debug_mode_enabled();
+    if debug_mode {
+        warn!("MIDEN_DEBUG_MODE enabled; worker client execution will be substantially slower");
+    }
     let mut builder = MidenNetwork::client_builder()
-        .in_debug_mode(true.into())
+        .in_debug_mode(debug_mode.into())
         .store(store)
         .authenticator(keystore);
     if let Some(url) = std::env::var("TX_PROVER_URL")
@@ -729,16 +833,19 @@ pub async fn load_traders(
     if state.network != network.as_str() || state.vault_id != deployment.vault_id.to_hex() {
         bail!("state file belongs to a different network or vault");
     }
-    if state.traders.len() < config.num_traders {
+    if !state.setup_complete && !legacy_setup_looks_complete(config, state.traders.len()) {
+        bail!("saved trader setup did not complete");
+    }
+    if state.traders.len() < config.max_traders {
         bail!(
             "state file contains {} traders, but {} were requested",
             state.traders.len(),
-            config.num_traders
+            config.max_traders
         );
     }
 
     let tiers = config.tier_assignments();
-    let mut traders = Vec::with_capacity(config.num_traders);
+    let mut traders = Vec::with_capacity(config.max_traders);
     for (tier, saved) in tiers.into_iter().zip(state.traders.into_iter()) {
         let user_id = AccountId::from_hex(&saved.user_id)
             .map_err(|error| anyhow!("invalid trader user id: {error}"))?;
@@ -762,6 +869,22 @@ pub async fn load_traders(
     Ok(traders)
 }
 
+fn legacy_setup_looks_complete(config: &Config, trader_count: usize) -> bool {
+    if trader_count < config.max_traders {
+        return false;
+    }
+    let Ok(state_modified) = std::fs::metadata(&config.state_file).and_then(|meta| meta.modified())
+    else {
+        return false;
+    };
+    (0..config.max_traders).all(|index| {
+        let path = worker_store_path(&config.store_path, index);
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|store_modified| store_modified <= state_modified)
+    })
+}
+
 pub async fn run_trader(
     trader: Trader,
     config: Arc<Config>,
@@ -769,58 +892,96 @@ pub async fn run_trader(
     api: SimulationApi,
     oracle: OracleClient,
     metrics: Metrics,
-    mut session: Option<Session>,
+    session: Option<Session>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Sleep → trade → repeat so settle completion does not re-phase the cohort.
-    // First sleep is uniform in [0, tier_interval]; later sleeps use jittered base.
+    let Some(session) = session else {
+        warn!(
+            trader = trader.index,
+            "trader started without an auth session"
+        );
+        return;
+    };
+    let ws_url = match ws::ws_url_from_api(api.api_url()) {
+        Ok(url) => url,
+        Err(error) => {
+            warn!(trader = trader.index, %error, "invalid settlement websocket URL");
+            return;
+        }
+    };
+    let tracker = ws::SettlementTracker::spawn(
+        ws_url,
+        session.access_token.clone(),
+        config.order_timeout_secs,
+        shutdown.clone(),
+    );
+    let session = Arc::new(Mutex::new(session));
+    let slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_TRADER));
+    let mut trades = JoinSet::new();
     let tier_secs = trader.tier.interval_secs(&config);
     let base_interval = Duration::from_secs(tier_secs);
-    let mut first_cycle = true;
+    let initial_delay = Duration::from_secs(rand::random_range(0..=tier_secs));
+    let mut next_schedule = tokio::time::Instant::now() + initial_delay;
     loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        let delay = if first_cycle {
-            first_cycle = false;
-            Duration::from_secs(rand::random_range(0..=tier_secs))
-        } else {
-            jittered_interval(base_interval, config.jitter)
-        };
+        let sleep = tokio::time::sleep_until(next_schedule);
+        tokio::pin!(sleep);
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+            _ = &mut sleep => {
+                next_schedule += jittered_interval(base_interval, config.jitter);
+                metrics.record_schedule();
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    metrics.record_skipped_schedule();
+                    continue;
+                };
+                metrics.order_started();
+                let trader = trader.clone();
+                let config = config.clone();
+                let deployment = deployment.clone();
+                let api = api.clone();
+                let oracle = oracle.clone();
+                let metrics = metrics.clone();
+                let session = session.clone();
+                let tracker = tracker.clone();
+                trades.spawn(async move {
+                    let started = Instant::now();
+                    let result = trade_once(
+                        &trader,
+                        &config,
+                        &deployment,
+                        &api,
+                        &oracle,
+                        &metrics,
+                        &session,
+                        &tracker,
+                        started,
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        metrics.record_cycle_failure(
+                            trader.index,
+                            trader.tier,
+                            started.elapsed(),
+                        );
+                        debug!(trader = trader.index, %error, "trade attempt failed");
+                    }
+                    metrics.order_finished();
+                    drop(permit);
+                });
+            }
+            Some(joined) = trades.join_next(), if !trades.is_empty() => {
+                if let Err(error) = joined {
+                    metrics.order_finished();
+                    warn!(trader = trader.index, %error, "trade task failed");
+                }
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
             }
         }
-        if *shutdown.borrow() {
-            break;
-        }
-
-        let cycle_started = Instant::now();
-        if let Err(error) = trade_once(
-            &trader,
-            &config,
-            &deployment,
-            &api,
-            &oracle,
-            &metrics,
-            &mut session,
-            cycle_started,
-        )
-        .await
-        {
-            metrics.record_cycle_failure(trader.index, trader.tier, cycle_started.elapsed());
-            warn!(
-                trader = trader.index,
-                tier = trader.tier.label(),
-                %error,
-                "trade cycle failed"
-            );
-        }
     }
+    trades.abort_all();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -831,7 +992,8 @@ async fn trade_once(
     api: &SimulationApi,
     oracle: &OracleClient,
     metrics: &Metrics,
-    session: &mut Option<Session>,
+    session: &Arc<Mutex<Session>>,
+    tracker: &ws::SettlementTracker,
     cycle_started: Instant,
 ) -> Result<()> {
     let sell_index = rand::random_range(0..deployment.assets.len());
@@ -851,16 +1013,20 @@ async fn trade_once(
     )?;
 
     let now = u64::try_from(Utc::now().timestamp()).context("system clock is before Unix epoch")?;
-    let auth_timing = if session
-        .as_ref()
-        .is_none_or(|current| current.needs_refresh(now))
-    {
-        let (new_session, timing) = api.authenticate(trader.user_id, &trader.key).await?;
-        *session = Some(new_session);
-        Some(timing)
-    } else {
-        None
+    let (current_session, auth_timing, refreshed_token) = {
+        let mut current = session.lock().await;
+        if current.needs_refresh(now) {
+            let (new_session, timing) = api.authenticate(trader.user_id, &trader.key).await?;
+            let token = new_session.access_token.clone();
+            *current = new_session;
+            (current.clone(), Some(timing), Some(token))
+        } else {
+            (current.clone(), None, None)
+        }
     };
+    if let Some(token) = refreshed_token {
+        tracker.update_token(token).await;
+    }
 
     let client_order_id = Uuid::new_v4();
     let expires_at = now.saturating_add(config.intent_ttl_secs);
@@ -875,7 +1041,7 @@ async fn trade_once(
     );
     let response = api
         .submit_order(
-            session.as_ref().expect("session was initialized"),
+            &current_session,
             trader.user_id,
             trader.key.public_key(),
             trader.key.sign(intent.message_word()),
@@ -889,36 +1055,22 @@ async fn trade_once(
             ),
         )
         .await?;
+    metrics.record_submitted();
 
     let mut outcome = response.outcome;
     let mut settle_latency = None;
     if outcome == OrderOutcome::RateLimited {
-        let backoff_secs = response.retry_after.unwrap_or(1).max(1);
-        warn!(
+        debug!(
             trader = trader.index,
             status = %response.status,
             body = %response.body,
-            backoff_secs,
-            "execution queue full or rate limited; backing off"
+            "execution queue full or rate limited"
         );
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
     } else if outcome == OrderOutcome::Accepted {
         match response.order_id {
             Some(order_id) => {
-                let ws_url = ws::ws_url_from_api(api.api_url())?;
-                let token = &session
-                    .as_ref()
-                    .expect("session was initialized")
-                    .access_token;
                 let wait_started = Instant::now();
-                match ws::wait_for_order_terminal(
-                    &ws_url,
-                    token,
-                    order_id,
-                    config.order_timeout_secs,
-                )
-                .await
-                {
+                match tracker.track(order_id).await {
                     Ok(TerminalOrderStatus::Confirmed) => {
                         outcome = OrderOutcome::Confirmed;
                         settle_latency = Some(wait_started.elapsed());
@@ -926,7 +1078,7 @@ async fn trade_once(
                     Ok(TerminalOrderStatus::Failed) => {
                         outcome = OrderOutcome::ExecutionFailed;
                         settle_latency = Some(wait_started.elapsed());
-                        warn!(
+                        debug!(
                             trader = trader.index,
                             %order_id,
                             "order failed after admit"
@@ -935,7 +1087,7 @@ async fn trade_once(
                     Err(error) => {
                         outcome = OrderOutcome::TimedOut;
                         settle_latency = Some(wait_started.elapsed());
-                        warn!(
+                        debug!(
                             trader = trader.index,
                             %order_id,
                             %error,
@@ -945,7 +1097,7 @@ async fn trade_once(
                 }
             }
             None => {
-                warn!(
+                debug!(
                     trader = trader.index,
                     body = %response.body,
                     "admit succeeded but order id missing; counting as accepted only"
@@ -953,14 +1105,14 @@ async fn trade_once(
             }
         }
     } else {
-        warn!(
+        debug!(
             trader = trader.index,
             status = %response.status,
             body = %response.body,
             "order was not accepted"
         );
     }
-    info!(
+    debug!(
         trader = trader.index,
         tier = trader.tier.label(),
         pair = %format!("{}/{}", sell.symbol, buy.symbol),
@@ -989,6 +1141,94 @@ async fn trade_once(
     Ok(())
 }
 
+pub fn activation_stage_size(start: usize, max: usize) -> usize {
+    max.saturating_sub(start).div_ceil(8).max(1)
+}
+
+pub async fn run_activation_ramp(
+    config: Arc<Config>,
+    deployment: Arc<Deployment>,
+    api: SimulationApi,
+    oracle: OracleClient,
+    metrics: Metrics,
+    staged: Vec<Trader>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let stage_size = activation_stage_size(config.num_traders, config.max_traders);
+    let mut staged = VecDeque::from(staged);
+    let mut active = config.num_traders;
+    let mut stages = tokio::time::interval(Duration::from_secs(60));
+    stages.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    stages.tick().await;
+    let mut traders = JoinSet::new();
+    let mut activation_stopped = false;
+
+    loop {
+        tokio::select! {
+            _ = stages.tick(), if !staged.is_empty() && !activation_stopped => {
+                if metrics.is_saturated() {
+                    activation_stopped = true;
+                    warn!(
+                        active,
+                        remaining = staged.len(),
+                        "load saturated; stopping trader activation"
+                    );
+                    continue;
+                }
+                let count = stage_size.min(staged.len());
+                let batch = staged.drain(..count).collect::<Vec<_>>();
+                let mut activated = 0;
+                let mut retry = Vec::new();
+                let mut ready = Vec::new();
+                for trader in batch {
+                    match api.authenticate(trader.user_id, &trader.key).await {
+                        Ok((session, _)) => {
+                            ready.push((trader, session));
+                            activated += 1;
+                        }
+                        Err(error) => {
+                            warn!(%error, "failed to authenticate staged trader");
+                            retry.push(trader);
+                        }
+                    }
+                }
+                staged.extend(retry);
+                for (trader, session) in ready {
+                    traders.spawn(run_trader(
+                        trader,
+                        config.clone(),
+                        deployment.clone(),
+                        api.clone(),
+                        oracle.clone(),
+                        metrics.clone(),
+                        Some(session),
+                        shutdown.clone(),
+                    ));
+                }
+                active = active.saturating_add(activated);
+                metrics.set_active_traders(active);
+                info!(
+                    active,
+                    activated,
+                    remaining = staged.len(),
+                    "activated trader stage"
+                );
+            }
+            Some(result) = traders.join_next(), if !traders.is_empty() => {
+                if let Err(error) = result {
+                    warn!(%error, "activated trader task failed");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    traders.abort_all();
+}
+
 /// Live-onboard traders until `max_traders`, spawning a trade loop for each.
 ///
 /// Starts a new onboard attempt every `grow_interval_secs` without waiting for the previous
@@ -1002,7 +1242,7 @@ pub async fn run_growth_loop(
     prove_slots: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    if !config.keep_increasing {
+    if !config.should_grow() {
         return;
     }
     let mut grow = tokio::time::interval(Duration::from_secs(config.grow_interval_secs));
@@ -1019,8 +1259,11 @@ pub async fn run_growth_loop(
             .unwrap_or(0)
     };
     let mut in_flight = 0_usize;
-    let mut onboard_tasks: JoinSet<(usize, Instant, Result<Result<Trader, anyhow::Error>, tokio::task::JoinError>)> =
-        JoinSet::new();
+    let mut onboard_tasks: JoinSet<(
+        usize,
+        Instant,
+        Result<Result<Trader, anyhow::Error>, tokio::task::JoinError>,
+    )> = JoinSet::new();
     let mut child_tasks = JoinSet::new();
 
     loop {
@@ -1164,8 +1407,7 @@ pub async fn run_vault_cycle_loop(
     if config.vault_cycle_interval_secs == 0 {
         return;
     }
-    let mut ticker =
-        tokio::time::interval(Duration::from_secs(config.vault_cycle_interval_secs));
+    let mut ticker = tokio::time::interval(Duration::from_secs(config.vault_cycle_interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
@@ -1264,8 +1506,7 @@ async fn onboard_live_trader(
     // Reload under the lock so concurrent onboards see each other's new pools.
     let deployment = {
         let _shared = LIVE_ONBOARD_SHARED.lock().await;
-        let mut deployment = Deployment::load()
-            .context("load deployment for live onboard")?;
+        let mut deployment = Deployment::load().context("load deployment for live onboard")?;
         info!(trader = index, "live onboard: ensuring pool shards");
         ensure_pool_shards(config, &mut deployment, index + 1)
             .await
@@ -1294,8 +1535,7 @@ async fn onboard_live_trader(
             )
         })?;
 
-    let tiers = [TraderTier::Low, TraderTier::Average, TraderTier::HighFrequency];
-    let tier = tiers[index % tiers.len()];
+    let tier = TraderTier::HighFrequency;
     let wallet = {
         // Keystore is a shared directory; serialize creates so we don't race key files.
         let _shared = LIVE_ONBOARD_SHARED.lock().await;
@@ -1324,12 +1564,7 @@ async fn onboard_live_trader(
         let latency = api
             .mint(trader.user_id, asset.faucet_id)
             .await
-            .with_context(|| {
-                format!(
-                    "live onboard mint {} for trader {index}",
-                    asset.symbol
-                )
-            })?;
+            .with_context(|| format!("live onboard mint {} for trader {index}", asset.symbol))?;
         metrics.record_setup(trader.index, trader.tier, SetupPhase::Mint, latency);
         info!(
             trader = index,
@@ -1361,7 +1596,10 @@ async fn onboard_live_trader(
         .collect::<Result<Vec<_>>>()?;
     let pubkey = trader.key.public_key().to_commitment().into();
 
-    info!(trader = index, "live onboard: acquiring prove slot for register/fund");
+    info!(
+        trader = index,
+        "live onboard: acquiring prove slot for register/fund"
+    );
     let started = Instant::now();
     {
         let _slot = prove_slots
@@ -1411,10 +1649,15 @@ fn append_trader_state(config: &Config, deployment: &Deployment, trader: &Trader
         SimulationState {
             network: MidenNetwork::from_env().as_str().to_owned(),
             vault_id: deployment.vault_id.to_hex(),
+            setup_complete: true,
             traders: Vec::new(),
         }
     };
-    if !state.traders.iter().any(|saved| saved.index == trader.index) {
+    if !state
+        .traders
+        .iter()
+        .any(|saved| saved.index == trader.index)
+    {
         state.traders.push(TraderState {
             index: trader.index,
             user_id: trader.user_id.to_hex(),
@@ -1556,8 +1799,7 @@ async fn run_vault_cycle_once(
             vault_after_init.total_initiated_redeems
         );
     }
-    if vault_after_init.pending_redeem()
-        != vault_after_fund.pending_redeem().saturating_add(amount)
+    if vault_after_init.pending_redeem() != vault_after_fund.pending_redeem().saturating_add(amount)
     {
         bail!(
             "pending_redeem mismatch after init: before={} after={}",
@@ -1581,9 +1823,7 @@ async fn run_vault_cycle_once(
         trader.user_id,
     )
     .await?;
-    if vault_after_redeem.total_redeems
-        != vault_after_init.total_redeems.saturating_add(amount)
-    {
+    if vault_after_redeem.total_redeems != vault_after_init.total_redeems.saturating_add(amount) {
         bail!(
             "redeem counter mismatch: before={} after={}",
             vault_after_init.total_redeems,
@@ -1641,10 +1881,16 @@ async fn run_vault_cycle_once(
     Ok(())
 }
 
-fn save_state(config: &Config, deployment: &Deployment, traders: &[Trader]) -> Result<()> {
+fn save_state(
+    config: &Config,
+    deployment: &Deployment,
+    traders: &[Trader],
+    setup_complete: bool,
+) -> Result<()> {
     let state = SimulationState {
         network: MidenNetwork::from_env().as_str().to_owned(),
         vault_id: deployment.vault_id.to_hex(),
+        setup_complete,
         traders: traders
             .iter()
             .map(|trader| TraderState {
@@ -1676,4 +1922,36 @@ pub fn validate_deployment(deployment: &Deployment) -> Result<()> {
         bail!("simulation requires at least two deployment assets");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod load_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Semaphore;
+
+    use super::{MAX_IN_FLIGHT_PER_TRADER, SimulationState, activation_stage_size};
+
+    #[test]
+    fn derives_eight_stable_activation_stages() {
+        assert_eq!(activation_stage_size(20, 100), 10);
+        assert_eq!(activation_stage_size(20, 21), 1);
+        assert_eq!(activation_stage_size(100, 100), 1);
+    }
+
+    #[tokio::test]
+    async fn trader_in_flight_limit_skips_a_third_order() {
+        let slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_TRADER));
+        let _first = slots.clone().try_acquire_owned().unwrap();
+        let _second = slots.clone().try_acquire_owned().unwrap();
+        assert!(slots.try_acquire_owned().is_err());
+    }
+
+    #[test]
+    fn legacy_state_is_not_assumed_complete() {
+        let state: SimulationState =
+            serde_json::from_str(r#"{"network":"testnet","vault_id":"0x01","traders":[]}"#)
+                .unwrap();
+        assert!(!state.setup_complete);
+    }
 }

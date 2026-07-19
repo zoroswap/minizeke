@@ -27,6 +27,26 @@ use crate::{
     test_utils::get_pool_finality_client_for,
 };
 
+/// Cadence for rechecking submitted txs for chain confirmation.
+///
+/// Prefers `FINALITY_RETRY_MS` (default **500**). Falls back to legacy
+/// `FINALITY_RETRY_SECS * 1000` when only that env var is set.
+fn finality_retry_millis() -> u64 {
+    if let Some(ms) = env::var("FINALITY_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return ms;
+    }
+    if let Some(secs) = env::var("FINALITY_RETRY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return secs.saturating_mul(1_000);
+    }
+    500
+}
+
 pub struct FinalityObserver {
     pool_clients: HashMap<AccountId, Client<FilesystemKeyStore>>,
     message_broker: Arc<MessageBroker>,
@@ -152,11 +172,7 @@ impl FinalityObserver {
     /// a separate store, so it must apply the durable `transaction_update` here before
     /// `sync_state` / `get_transactions` can see the pending row.
     async fn reconcile_submissions(&mut self, now: u64) -> Result<()> {
-        let retry_millis = env::var("FINALITY_RETRY_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(2)
-            .saturating_mul(1_000);
+        let retry_millis = finality_retry_millis();
         let submissions: Vec<_> = self
             .execution_store
             .submitted_transactions()?
@@ -456,4 +472,38 @@ async fn attach_finality_client(pool_id: AccountId) -> Result<Client<FilesystemK
     client.import_account_by_id(pool_id).await?;
     client.sync_state().await?;
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn finality_retry_prefers_ms_then_legacy_secs_then_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by ENV_LOCK; test-only env mutation.
+        unsafe {
+            env::remove_var("FINALITY_RETRY_MS");
+            env::remove_var("FINALITY_RETRY_SECS");
+        }
+        assert_eq!(finality_retry_millis(), 500);
+
+        unsafe {
+            env::set_var("FINALITY_RETRY_SECS", "2");
+        }
+        assert_eq!(finality_retry_millis(), 2_000);
+
+        unsafe {
+            env::set_var("FINALITY_RETRY_MS", "250");
+        }
+        assert_eq!(finality_retry_millis(), 250);
+
+        unsafe {
+            env::remove_var("FINALITY_RETRY_MS");
+            env::remove_var("FINALITY_RETRY_SECS");
+        }
+    }
 }

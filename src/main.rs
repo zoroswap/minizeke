@@ -329,7 +329,9 @@ async fn main_tokio(
                         std::process::exit(1);
                     });
                     if let Err(error) = observer.start().await {
-                        eprintln!("Critical error on finality observer: {error}. Exiting with status 1.");
+                        eprintln!(
+                            "Critical error on finality observer: {error}. Exiting with status 1."
+                        );
                         std::process::exit(1);
                     }
                 });

@@ -1,11 +1,11 @@
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use miden_client::{
     Client, account::AccountId, keystore::FilesystemKeyStore, note::NoteScriptRoot,
     store::NoteFilter,
 };
-use miden_core::Word;
+use miden_core::{Felt, Word};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -152,35 +152,71 @@ impl AnalyticsWorker {
                 continue;
             }
             let storage = note.details().storage().items();
-            if storage.len() < 12 {
-                warn!("ignoring malformed user cash-flow note");
-                self.store.set_note_cursor(SOURCE, &note_cursor)?;
-                continue;
-            }
-            let (kind, user_id, asset) = if root == self.fund_root {
-                let user_id = AccountId::try_from_elements(storage[8], storage[9])?;
-                let asset = note
-                    .assets()
-                    .iter_fungible()
-                    .next()
-                    .ok_or_else(|| anyhow!("FUND note has no fungible asset"))?;
-                (CashFlowKind::Fund, user_id, asset)
-            } else {
-                let expected = Word::new([storage[0], storage[1], storage[2], storage[3]]);
-                let asset = word_to_asset(expected)?;
-                let user_id = if root == self.redeem_root {
-                    AccountId::try_from_elements(storage[8], storage[9])?
+            let decoded: Result<_> = (|| {
+                if storage.len() < 12 {
+                    bail!(
+                        "cash-flow note storage has {} elements; expected at least 12",
+                        storage.len()
+                    );
+                }
+                if root == self.fund_root {
+                    let user_id = user_id_from_storage(storage, "FUND")?;
+                    let asset = note
+                        .assets()
+                        .iter_fungible()
+                        .next()
+                        .ok_or_else(|| anyhow!("FUND note has no fungible asset"))?;
+                    Ok((CashFlowKind::Fund, user_id, asset))
                 } else {
-                    note.metadata()
-                        .map(|metadata| metadata.sender())
-                        .ok_or_else(|| anyhow!("INIT_REDEEM note is missing sender metadata"))?
-                };
-                let kind = if root == self.redeem_root {
-                    CashFlowKind::Redeem
-                } else {
-                    CashFlowKind::InitRedeem
-                };
-                (kind, user_id, asset)
+                    let expected = Word::new([storage[0], storage[1], storage[2], storage[3]]);
+                    let asset = word_to_asset(expected).context("invalid cash-flow asset word")?;
+                    let kind = if root == self.redeem_root {
+                        CashFlowKind::Redeem
+                    } else {
+                        CashFlowKind::InitRedeem
+                    };
+                    let user_id = user_id_from_storage(
+                        storage,
+                        match kind {
+                            CashFlowKind::InitRedeem => "INIT_REDEEM",
+                            CashFlowKind::Redeem => "REDEEM",
+                            CashFlowKind::Fund => unreachable!(),
+                        },
+                    )?;
+                    if kind == CashFlowKind::InitRedeem
+                        && let Some(metadata) = note.metadata()
+                        && metadata.sender() != user_id
+                    {
+                        warn!(
+                            note_id = %note_cursor.note_id,
+                            stored_user = %user_id.to_hex(),
+                            metadata_sender = %metadata.sender().to_hex(),
+                            "INIT_REDEEM sender metadata disagrees with stored beneficiary; using storage"
+                        );
+                    }
+                    Ok((kind, user_id, asset))
+                }
+            })();
+            let (kind, user_id, asset) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    let inserted = self.store.quarantine_note(
+                        SOURCE,
+                        &note_cursor,
+                        &reason,
+                        chrono::Utc::now().timestamp_millis() as u64,
+                    )?;
+                    if inserted {
+                        warn!(
+                            note_id = %note_cursor.note_id,
+                            block_num,
+                            %reason,
+                            "quarantined malformed analytics cash-flow note"
+                        );
+                    }
+                    continue;
+                }
             };
             if !self.supported_assets.contains(&asset.faucet_id()) {
                 self.store.set_note_cursor(SOURCE, &note_cursor)?;
@@ -210,12 +246,14 @@ impl AnalyticsWorker {
                     CashFlowKind::InitRedeem => VaultCashFlowKind::InitRedeem,
                     CashFlowKind::Redeem => VaultCashFlowKind::Redeem,
                 };
-                let _ = self.message_broker.broadcast_vault_cashflow(VaultCashFlowEvent {
-                    user_id,
-                    faucet_id,
-                    amount,
-                    kind,
-                });
+                let _ = self
+                    .message_broker
+                    .broadcast_vault_cashflow(VaultCashFlowEvent {
+                        user_id,
+                        faucet_id,
+                        amount,
+                        kind,
+                    });
             }
             self.store.set_note_cursor(SOURCE, &note_cursor)?;
         }
@@ -223,8 +261,44 @@ impl AnalyticsWorker {
     }
 }
 
+fn user_id_from_storage(storage: &[Felt], kind: &str) -> Result<AccountId> {
+    if storage.len() < 10 {
+        bail!("{kind} note storage is missing its beneficiary word");
+    }
+    AccountId::try_from_elements(storage[8], storage[9])
+        .with_context(|| format!("{kind} note has an invalid stored beneficiary"))
+}
+
 fn stable_note_id(note: &miden_client::store::InputNoteRecord) -> String {
     note.id()
         .map(|id| id.to_hex())
         .unwrap_or_else(|| note.details_commitment().to_hex())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_free_init_redeem_user_is_recovered_from_storage() {
+        let user_id = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
+        let mut storage = [Felt::ZERO; 12];
+        storage[8] = user_id.suffix();
+        storage[9] = user_id.prefix().as_felt();
+
+        assert_eq!(
+            user_id_from_storage(&storage, "INIT_REDEEM").unwrap(),
+            user_id
+        );
+    }
+
+    #[test]
+    fn malformed_cash_flow_storage_is_rejected_for_quarantine() {
+        let error = user_id_from_storage(&[Felt::ZERO; 8], "INIT_REDEEM").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("storage is missing its beneficiary word")
+        );
+    }
 }

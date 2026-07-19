@@ -33,7 +33,7 @@ use tracing::info;
 use crate::{
     assembly_utils::storage_slot_name,
     message_broker::message_broker::MessageBroker,
-    miden_env::MidenNetwork,
+    miden_env::{MidenNetwork, miden_debug_mode_enabled},
     miden_execution::MidenExecution,
     note::{
         DepositInstructions, FundInstructions, InitRedeemInstructions, RedeemInstructions,
@@ -77,7 +77,9 @@ pub async fn get_pool_client_for(pool_id: AccountId) -> Result<Client<Filesystem
 
 /// Finality observer client — separate store so sync/confirm never contends with
 /// the execute/prove client's SQLite file for the same pool.
-pub async fn get_pool_finality_client_for(pool_id: AccountId) -> Result<Client<FilesystemKeyStore>> {
+pub async fn get_pool_finality_client_for(
+    pool_id: AccountId,
+) -> Result<Client<FilesystemKeyStore>> {
     let network = MidenNetwork::from_env();
     let pool_hex = sanitize_store_hex(&pool_id.to_hex());
     build_client(format!(
@@ -137,8 +139,14 @@ async fn build_client(store_path: String) -> Result<Client<FilesystemKeyStore>> 
     let store = Arc::new(sqlite_store);
     let keystore = Arc::new(FilesystemKeyStore::new("keystore".into())?);
 
+    let debug_mode = miden_debug_mode_enabled();
+    if debug_mode {
+        tracing::warn!(
+            "MIDEN_DEBUG_MODE enabled; transaction execution will be substantially slower"
+        );
+    }
     let mut client_builder = MidenNetwork::client_builder()
-        .in_debug_mode(true.into())
+        .in_debug_mode(debug_mode.into())
         .store(store)
         .authenticator(keystore);
 
