@@ -32,7 +32,6 @@ use minizeke::{
     },
 };
 use tracing::info;
-use uuid::Uuid;
 
 const FUND_AMOUNT: u64 = 1_000;
 
@@ -81,13 +80,36 @@ fn signed_intent(
     buy_asset: AccountId,
     buy_amount: u64,
 ) -> (Intent, Vec<Felt>) {
+    signed_intent_with_nonce(
+        user_id,
+        trading_key,
+        sell_asset,
+        sell_amount,
+        buy_asset,
+        buy_amount,
+        rand::random::<u32>(),
+    )
+}
+
+fn signed_intent_with_nonce(
+    user_id: AccountId,
+    trading_key: &AuthSecretKey,
+    sell_asset: AccountId,
+    sell_amount: u64,
+    buy_asset: AccountId,
+    buy_amount: u64,
+    nonce: u32,
+) -> (Intent, Vec<Felt>) {
+    let mut random = [0_u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut random);
+    let client_order_id = minizeke::nonce_window::client_order_id_for_nonce(nonce, random);
     let intent = Intent::new_swap(
         user_id,
         sell_asset,
         sell_amount,
         buy_asset,
         buy_amount,
-        Uuid::new_v4(),
+        client_order_id,
         chrono::Utc::now().timestamp() as u64 + 3_600,
     );
     let msg = intent.message_word();
@@ -215,7 +237,7 @@ async fn test_swap_minimal() -> Result<()> {
     .await;
     assert!(
         replay.is_err(),
-        "the pool must reject a replayed signed client UUID"
+        "the pool must reject a replayed order nonce"
     );
 
     let pool_account = pool_client.try_get_account(pool_id).await?;
@@ -471,7 +493,7 @@ async fn test_vault_pool_e2e() -> Result<()> {
     .await;
     assert!(
         replay.is_err(),
-        "the pool must reject a replayed signed client UUID"
+        "the pool must reject a replayed order nonce"
     );
 
     let pool_account = pool_client.try_get_account(pool_id).await?;

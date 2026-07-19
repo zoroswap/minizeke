@@ -71,6 +71,8 @@ async fn test_swap() -> Result<()> {
         })
         .collect(),
         pools: vec![pool_id],
+        pool_user_capacity: minizeke::vault::DEFAULT_POOL_USER_CAPACITY,
+        asset_capacity: minizeke::vault::DEFAULT_ASSET_CAPACITY,
         lp_account_id: None,
         deposits: Vec::new(),
     }

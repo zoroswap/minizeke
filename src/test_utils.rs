@@ -234,7 +234,12 @@ pub async fn get_miden_execution() -> Result<MidenExecution> {
 pub async fn get_vault(client: &mut Client<FilesystemKeyStore>) -> Result<(AccountId, AccountId)> {
     dotenv().ok();
     let operator_id = get_operator(client).await?;
-    let vault = deploy_vault(client, operator_id).await?;
+    let vault = deploy_vault(
+        client,
+        operator_id,
+        crate::vault::DEFAULT_POOL_USER_CAPACITY,
+    )
+    .await?;
     Ok((vault.id(), operator_id))
 }
 

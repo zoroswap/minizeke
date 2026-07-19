@@ -4,10 +4,12 @@ use miden_protocol::crypto::hash::poseidon2::Poseidon2;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Breaking v2 wire/on-chain intent constants. These values are also asserted by
+use crate::nonce_window::nonce_from_client_order_id;
+
+/// Breaking v3 wire/on-chain intent constants. These values are also asserted by
 /// `pool.masm`; changing any of them requires deploying fresh pool accounts.
-pub const INTENT_VERSION: u8 = 2;
-pub const SWAP_PURPOSE_TAG: u64 = u64::from_be_bytes(*b"ZKSWPV2\0");
+pub const INTENT_VERSION: u8 = 3;
+pub const SWAP_PURPOSE_TAG: u64 = u64::from_be_bytes(*b"ZKSWPV3\0");
 pub const INTENT_DOMAIN_TAG: u64 = u64::from_be_bytes(*b"minizeke");
 pub const TESTNET_NETWORK_TAG: u64 = u64::from_be_bytes(*b"testnet\0");
 pub const INTENT_FELT_COUNT: usize = 16;
@@ -17,8 +19,10 @@ pub const fn is_expired_at(expires_at: u64, unix_timestamp_seconds: u64) -> bool
     unix_timestamp_seconds >= expires_at
 }
 
-/// The exact v2 authorization consumed by a pool. The client-generated UUID is
+/// The exact v3 authorization consumed by a pool. The server-issued client UUID is
 /// represented as four 32-bit limbs so every value is a valid Miden field element.
+/// Limb 0 carries the per-user order nonce; limbs 1..=3 remain random for API
+/// idempotency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intent {
     pub purpose: u64,
@@ -94,15 +98,20 @@ impl Intent {
     pub fn client_order_uuid(&self) -> Uuid {
         uuid_from_felts(self.client_order_id)
     }
+
+    /// Server-allocated per-user order nonce encoded in UUID limb 0.
+    pub fn order_nonce(&self) -> u32 {
+        nonce_from_client_order_id(self.client_order_uuid())
+    }
 }
 
 /// Hash a canonical felt vector to the signable Word.
 ///
 /// Uses Poseidon2 (the protocol's canonical `Hasher`), which is the algebraic hash the
 /// Miden VM reconstructs on-chain via the native `hperm` instruction. The authorizer
-/// component (Task 5) rebuilds this exact Word inside the transaction to verify the
-/// signature; using any other algebraic hash (e.g. RPO) would be impossible to reproduce
-/// on-chain in this toolchain, since the VM exposes no RPO permutation instruction.
+/// component rebuilds this exact Word inside the transaction to verify the signature;
+/// using any other algebraic hash (e.g. RPO) would be impossible to reproduce on-chain
+/// in this toolchain, since the VM exposes no RPO permutation instruction.
 pub fn message_word(felts: &[u64]) -> Word {
     let elements: Vec<Felt> = felts.iter().map(|&v| Felt::new(v).unwrap()).collect();
     Poseidon2::hash_elements(&elements)
@@ -122,7 +131,7 @@ pub fn uuid_from_felts(limbs: [u64; 4]) -> Uuid {
     let mut bytes = [0_u8; 16];
     for (index, limb) in limbs.into_iter().enumerate() {
         let limb = u32::try_from(limb)
-            .expect("v2 UUID limbs are always unsigned 32-bit integers")
+            .expect("v3 UUID limbs are always unsigned 32-bit integers")
             .to_be_bytes();
         bytes[index * 4..index * 4 + 4].copy_from_slice(&limb);
     }
@@ -152,18 +161,20 @@ mod tests {
             buy_asset_suffix: 31,
             buy_asset_prefix: 32,
             buy_amount: 33,
-            client_order_id: [0x0011_2233, 0x4455_6677, 0x8899_aabb, 0xccdd_eeff],
+            // Limb 0 is the order nonce; remaining limbs stay random/idempotent.
+            client_order_id: [0x0000_0007, 0x4455_6677, 0x8899_aabb, 0xccdd_eeff],
             expires_at: 1_800_000_000,
         }
     }
 
     #[test]
-    fn v2_intent_encoding_and_message_are_golden() {
+    fn v3_intent_encoding_and_message_are_golden() {
         let intent = golden_intent();
+        assert_eq!(intent.order_nonce(), 7);
         assert_eq!(
             intent.canonical_felts(),
             [
-                6_506_385_721_141_899_776,
+                6_506_385_721_141_900_032, // ZKSWPV3\0
                 7_883_954_021_992_852_325,
                 8_387_236_824_952_960_000,
                 11,
@@ -174,7 +185,7 @@ mod tests {
                 31,
                 32,
                 33,
-                0x0011_2233,
+                0x0000_0007,
                 0x4455_6677,
                 0x8899_aabb,
                 0xccdd_eeff,
@@ -189,19 +200,20 @@ mod tests {
             elements[2].as_canonical_u64(),
             elements[3].as_canonical_u64(),
         ];
+        // Captured once from Poseidon2; keep in sync with TypeScript golden vectors.
         assert_eq!(
             actual,
             [
-                1_287_624_692_678_322_763,
-                16_579_098_118_194_020_297,
-                3_915_596_742_747_418_088,
-                16_468_033_906_718_177_848,
+                14_679_449_024_156_102_030,
+                11_802_393_995_137_049_376,
+                13_991_692_530_890_841_766,
+                14_202_507_866_894_551_169,
             ]
         );
     }
 
     #[test]
-    fn masm_v2_hash_matches_rust_golden() {
+    fn masm_v3_hash_matches_rust_golden() {
         let operator_source = include_str!("../masm/accounts/operator.masm");
         assert!(operator_source.contains("loc_storew_le.0 dropw"));
         assert!(!operator_source.contains("\n    loc_storew_be."));
@@ -272,5 +284,11 @@ mod tests {
         let pool_source = include_str!("../masm/accounts/pool.masm");
         assert!(pool_source.contains("exec.tx::get_block_timestamp\n    # => [block_timestamp_unix_seconds, expires_at_unix_seconds]\n"));
         assert!(pool_source.contains("swap lt assert.err=ERR_INTENT_EXPIRED"));
+    }
+
+    #[test]
+    fn purpose_tag_is_v3() {
+        assert_eq!(&SWAP_PURPOSE_TAG.to_be_bytes(), b"ZKSWPV3\0");
+        assert_eq!(INTENT_VERSION, 3);
     }
 }

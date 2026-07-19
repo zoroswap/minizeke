@@ -50,7 +50,7 @@ The resolved feed IDs are stored in deployment JSON. Server startup checks that 
 A Miden account can use at most 255 storage slots. One pool shard uses:
 
 - 247 generic asset-user cell slots.
-- Six pool metadata slots, including the consumed-order map.
+- Six pool metadata slots, including the per-user nonce-window map.
 - Two `AuthSingleSig` slots.
 - No `BasicWallet` storage slots.
 
@@ -60,13 +60,26 @@ One swap must update both the sell and buy legs in one native account. A user is
 
 ## Registration and placement
 
-`spawn` deploys and authorizes the first shard. `spawn_pool` deploys another shard, authorizes it, and replaces the vault's active-pool value.
+`spawn` deploys and authorizes the first shard. Additional shards are owned by the
+**server pool provisioner**: it monitors active-pool registration fill, deploys a
+spare shard, eagerly attaches execution/finality clients, publishes the pool into
+`deployment.json`, then authorizes it and sets `ACTIVE_POOL`. The admin binary
+`spawn_pool` performs the same sequence manually. Clients (including
+`simulate_traders`) never deploy pools.
 
-The `REGISTER` note stores the user's public-key commitment and copies the current active pool into the user's placement map. Registration fails if the user already exists or the active pool is not authorized.
+The vault stores `pool_user_capacity` and per-pool `pool_user_counts`. The
+`REGISTER` note stores the user's public-key commitment, asserts
+`count < capacity`, increments the active pool's count, and copies `ACTIVE_POOL`
+into the user's placement map. Registration fails if the user already exists, the
+active pool is unauthorized, or the shard is at capacity
+(`VAULT: active pool user capacity reached`). Capacity races are safe because
+registration mutates the vault account and serializes concurrent notes.
 
-Placement is permanent in the current code. Adding a shard does not move existing users. Later registrations go to the new active shard. There is no load balancer or migration procedure.
+Placement is permanent. Adding a shard does not move existing users. Later
+registrations go to the new active shard. There is no migration procedure.
 
-`GET /users/{id}/placement` reads public vault storage from RPC, validates the assigned pool against the authorization map, then reads each configured asset's cell allocation from that shard. A `null` cell means that no swap has allocated it yet.
+`GET /users/{id}/placement` and `/pools/info` / `/health` expose placement and
+provisioning status (active pool, user count/capacity, cell use, pending attach).
 
 ## User flows
 
@@ -86,14 +99,15 @@ Available balance subtracts pending redeems:
 
 ### Swap
 
-1. The client submits a v2 order with a signed client UUID and expiry, serialized public key, and signature.
-2. The API verifies the purpose/domain/network/user/assets/amounts/UUID/expiry signature and durably reserves the client UUID before publishing a separate server lifecycle ID. Identical retries return that ID; conflicting reuse returns 409.
-3. The server quotes against in-memory curve state and current oracle prices after rechecking expiry.
-4. The server checks a lazy local balance mirror. This is only a pre-flight check.
-5. The execution worker resolves the user's shard from public vault storage.
-6. The shard transaction fetches fresh vault values by FPI.
-7. The pool verifies the canonical sixteen-felt intent, chain-time expiry, and unused UUID, then checks the sell balance.
-8. The pool increments `sold` and `bought` and consumes the UUID atomically.
+1. The client authenticates, then calls `POST /orders/nonce` to lease the next per-user order nonce and client UUID.
+2. The client signs a v3 intent (nonce in UUID limb 0) and submits it with expiry, serialized public key, and signature.
+3. The API verifies the purpose/domain/network/user/assets/amounts/UUID/expiry signature, validates the durable nonce lease, and reserves the full client UUID before publishing a separate server lifecycle ID. Identical retries return that ID; conflicting reuse returns 409.
+4. The server quotes against in-memory curve state and current oracle prices after rechecking expiry.
+5. The server checks a lazy local balance mirror. This is only a pre-flight check.
+6. The execution worker resolves the user's shard from a targeted vault storage read.
+7. The shard transaction fetches fresh vault values by FPI.
+8. The pool verifies the canonical sixteen-felt intent, chain-time expiry, and the user's 96-slot sliding nonce window, then checks the sell balance.
+9. The pool increments `sold` and `bought` and updates the nonce window atomically.
 
 The on-chain FPI check and signature check are authoritative. The server quote determines `buy_amount`; the signed intent binds that amount.
 

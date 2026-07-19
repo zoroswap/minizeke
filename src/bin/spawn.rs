@@ -9,16 +9,16 @@
 
 use std::{collections::HashSet, env};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use dotenv::dotenv;
 use minizeke::{
     asset_config::load_asset_configs,
-    deployment::{AssetInfo, DEPLOYMENT_SCHEMA_VERSION, Deployment},
+    deployment::{AssetInfo, DEPLOYMENT_SCHEMA_VERSION, Deployment, validate_capacity_budget},
     miden_env::MidenNetwork,
     oracle_sse::{fetch_price_feeds, oracle_base_url, resolve_feed_id},
     pool::deploy_pool,
     test_utils::{get_client, get_faucet, get_operator, get_pool_client},
-    vault::{add_pool_to_vault, deploy_vault},
+    vault::{DEFAULT_ASSET_CAPACITY, DEFAULT_POOL_USER_CAPACITY, add_pool_to_vault, deploy_vault},
 };
 
 #[tokio::main]
@@ -87,10 +87,33 @@ async fn main() -> Result<()> {
         });
     }
 
+    let pool_user_capacity = env::var("POOL_USER_CAPACITY")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()
+        .context("POOL_USER_CAPACITY must be an unsigned integer")?
+        .unwrap_or(DEFAULT_POOL_USER_CAPACITY);
+    let asset_capacity = env::var("ASSET_CAPACITY")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()
+        .context("ASSET_CAPACITY must be an unsigned integer")?
+        .unwrap_or(DEFAULT_ASSET_CAPACITY);
+    validate_capacity_budget(pool_user_capacity, asset_capacity)?;
+    if assets.len() > asset_capacity as usize {
+        bail!(
+            "configured assets ({}) exceed ASSET_CAPACITY ({asset_capacity})",
+            assets.len()
+        );
+    }
+
     println!("[SPAWN] deploying network vault");
-    let vault = deploy_vault(&mut client, operator_id).await?;
+    let vault = deploy_vault(&mut client, operator_id, pool_user_capacity).await?;
     let vault_id = vault.id();
-    println!("[SPAWN] vault: {}", vault_id.to_hex());
+    println!(
+        "[SPAWN] vault: {} (pool_user_capacity={pool_user_capacity}, asset_capacity={asset_capacity})",
+        vault_id.to_hex()
+    );
 
     // deployed from the pool client so the vault stays untracked in the store that
     // submits the FPI swap txs (see get_pool_client docs)
@@ -113,6 +136,8 @@ async fn main() -> Result<()> {
         vault_id,
         assets,
         pools: vec![pool_id],
+        pool_user_capacity,
+        asset_capacity,
         lp_account_id: None,
         deposits: Vec::new(),
     };

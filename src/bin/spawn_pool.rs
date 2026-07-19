@@ -1,12 +1,12 @@
-//! Deploys and authorizes one additional pool shard for an existing deployment.
+//! Deploys and activates one additional pool shard for an existing deployment.
+//! Prefer the server-owned pool provisioner for automatic growth; this binary is the
+//! explicit admin path for the same deploy → publish → activate sequence.
 
 use anyhow::Result;
 use dotenv::dotenv;
 use minizeke::{
     deployment::Deployment,
-    pool::deploy_pool,
-    test_utils::{get_client, get_pool_client},
-    vault::add_pool_to_vault,
+    pool_manager::{activate_pool_shard, deploy_pool_shard, publish_pool_to_deployment},
 };
 
 #[tokio::main]
@@ -21,32 +21,17 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let mut deployment = Deployment::load()?;
-
-    let mut pool_client = get_pool_client().await?;
-    pool_client.ensure_genesis_in_place().await?;
-    pool_client.sync_state().await?;
-
-    let mut client = get_client().await?;
-    client.ensure_genesis_in_place().await?;
-    client.sync_state().await?;
+    let deployment = Deployment::load()?;
 
     println!("[SPAWN_POOL] deploying pool shard");
-    let pool_id = deploy_pool(&mut pool_client, deployment.vault_id)
-        .await?
-        .id();
+    let pool_id = deploy_pool_shard(deployment.vault_id).await?;
+
+    println!("[SPAWN_POOL] publishing {}", pool_id.to_hex());
+    publish_pool_to_deployment(pool_id)?;
 
     println!("[SPAWN_POOL] authorizing {}", pool_id.to_hex());
-    add_pool_to_vault(
-        &mut client,
-        deployment.operator_account_id,
-        deployment.vault_id,
-        pool_id,
-    )
-    .await?;
+    activate_pool_shard(deployment.operator_account_id, deployment.vault_id, pool_id).await?;
 
-    deployment.pools.push(pool_id);
-    deployment.save()?;
     println!(
         "[SPAWN_POOL] added {} to {}",
         pool_id.to_hex(),

@@ -228,6 +228,19 @@ impl SimulationApi {
         })
     }
 
+    pub async fn reserve_order_nonce(&self, session: &Session) -> Result<(u32, Uuid)> {
+        let response = self
+            .client
+            .post(format!("{}/orders/nonce", self.api_url))
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .context("request order nonce lease")?;
+        let lease: ApiResponse<NonceLeaseResponse> =
+            decode_success(response, "order nonce lease").await?;
+        Ok((lease.data.nonce, lease.data.client_order_id))
+    }
+
     pub async fn submit_order(
         &self,
         session: &Session,
@@ -361,6 +374,12 @@ struct AuthChallenge {
 struct AuthLogin {
     access_token: String,
     expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct NonceLeaseResponse {
+    nonce: u32,
+    client_order_id: Uuid,
 }
 
 #[derive(Serialize)]

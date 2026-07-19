@@ -17,7 +17,7 @@ Named storage slots use `StorageSlotName` IDs derived from the exact names below
 
 ## Vault storage
 
-The vault component defines 11 slots.
+The vault component defines 13 slots.
 
 ### User accounting maps
 
@@ -49,6 +49,14 @@ The vault component defines 11 slots.
 - `zorovault::active_pool`
   - value: pool key used by later registrations
   - initial value: zero word
+- `zorovault::pool_user_capacity`
+  - value: `[capacity, 0, 0, 0]`
+  - max registered users per pool shard; set at vault deploy
+- `zorovault::pool_user_counts`
+  - key: pool key
+  - value: `[registered_user_count, 0, 0, 0]`
+  - incremented atomically inside `register_user`; registration fails with
+    `VAULT: active pool user capacity reached` when `count >= capacity`
 
 ### Configuration
 
@@ -101,8 +109,11 @@ Each starts as `[0, 0, 0, 0]` and later stores:
   - value: `[vault_suffix, vault_prefix, 0, 0]`
 - `zoropool::user_trading_details_proc_root`
   - value: MAST root of `vault::get_user_trading_details`
-- `zoropool::consumed_orders`
-  - authenticated map from the four-limb client UUID to `[1, 0, 0, 0]`
+- `zoropool::user_nonce_windows`
+  - key: user key
+  - value: `[base_nonce, bitmap0, bitmap1, bitmap2]`
+  - 96-bit sliding window: bit `i` marks nonce `base_nonce + i` as consumed
+  - one map entry per user regardless of order count
 
 Allocation uses `cell_slot_ids[next_index]`, writes `cell_index[asset-user key]`, then increments `next_cell`. It requires `next_index < 247`.
 
@@ -249,9 +260,9 @@ share amount, the configured minimum deposit, and `pricing: \"execution_time\"`.
 
 ## Signed intent
 
-Intent v1 is rejected. The canonical testnet intent v2 is exactly sixteen felts:
+Intent v1/v2 are rejected. The canonical testnet intent v3 is exactly sixteen felts:
 
-1. `purpose = u64::from_be_bytes("ZKSWPV2\0")`
+1. `purpose = u64::from_be_bytes("ZKSWPV3\0")`
 2. `domain = u64::from_be_bytes("minizeke")`
 3. `network = u64::from_be_bytes("testnet\0")`
 4. `user_suffix`
@@ -262,13 +273,17 @@ Intent v1 is rejected. The canonical testnet intent v2 is exactly sixteen felts:
 9. `buy_asset_suffix`
 10. `buy_asset_prefix`
 11. `buy_amount`
-12-15. the signed client UUID as four big-endian `u32` limbs
+12-15. the server-issued client UUID as four big-endian `u32` limbs
+    - limb 0 is the per-user order nonce
+    - limbs 1..=3 stay random for API idempotency
 16. `expires_at`, Unix seconds
 
-Rust and MASM hash the same sixteen felts with `Poseidon2::hash_elements`. The API verifies
-the signature before atomically reserving the client UUID in `execution.<network>.sqlite3`.
-An identical retry returns the original server lifecycle ID; rebinding the UUID returns HTTP
-409. Processing checks expiry again before quoting.
+Clients call authenticated `POST /orders/nonce` first. The durable allocator returns
+`{ nonce, client_order_id }`, advances atomically per user, and tolerates unused leases as
+gaps. Rust and MASM hash the same sixteen felts with `Poseidon2::hash_elements`. The API
+verifies the signature and the nonce lease before atomically reserving the full client UUID
+in `execution.<network>.sqlite3`. An identical retry returns the original server lifecycle
+ID; rebinding the UUID returns HTTP 409. Processing checks expiry again before quoting.
 
 The pool verifier receives:
 
@@ -280,11 +295,15 @@ Its advice data for each order is:
 
 The transaction script pushes:
 
-`[purpose, domain, network, user_suffix, user_prefix, sell_asset_suffix, sell_asset_prefix, sell_amount, buy_asset_suffix, buy_asset_prefix, buy_amount, uuid0, uuid1, uuid2, uuid3, expires_at]`
+`[purpose, domain, network, user_suffix, user_prefix, sell_asset_suffix, sell_asset_prefix, sell_amount, buy_asset_suffix, buy_asset_prefix, buy_amount, nonce, uuid1, uuid2, uuid3, expires_at]`
 
 and calls `pool::execute_swap`. The pool asserts the fixed purpose/domain/network, checks the
-chain timestamp, and rejects a UUID already present in its authenticated
-`zoropool::consumed_orders` map. The UUID is consumed atomically with the balance-counter writes.
+chain timestamp, and consumes the order nonce in the user's 96-slot sliding window under
+`zoropool::user_nonce_windows`. Nonces below `base_nonce` are rejected as stale; already-set
+bits are rejected as replays; nonces above the window slide it forward. The window write is
+atomic with the balance-counter updates. Changes to this pool MASM logic change the account
+code root; pick them up with `SPAWN_FORCE` redeploy, `deposit_pools`, and a local SQLite wipe
+(see README Deploy).
 
 ## FPI interfaces
 

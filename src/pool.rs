@@ -10,12 +10,19 @@ use miden_client::{
     Client,
     account::{
         Account, AccountBuilder, AccountComponent, AccountId, AccountStorage, AccountType,
-        StorageMap, StorageMapKey, StorageSlot, StorageSlotName, component::BasicWallet,
+        StorageMap, StorageMapKey, StorageSlot, StorageSlotName, StorageSlotType,
+        component::BasicWallet,
     },
     assembly::CodeBuilder,
     auth::{AuthScheme, AuthSecretKey, AuthSingleSig},
     keystore::{FilesystemKeyStore, Keystore},
-    rpc::{GrpcClient, NodeRpcClient},
+    rpc::{
+        GrpcClient, NodeRpcClient,
+        domain::account::{
+            AccountStorageRequirements, GetAccountRequest, StorageMapEntries, StorageMapFetch,
+            VaultFetch,
+        },
+    },
 };
 use miden_core::{Felt, Word};
 use miden_protocol::account::AccountComponentMetadata;
@@ -27,12 +34,17 @@ use crate::{
     curve::ZoroCurve,
     miden_env::MidenNetwork,
     test_utils::touch_account,
-    vault::{VaultUserAssetInfo, vault_user_asset_info_from_storage},
+    vault::{
+        AUTHORIZED_POOLS_SLOT, USER_ASSET_TOTAL_FUNDING_SLOT,
+        USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT, USER_ASSET_TOTAL_REDEEMS_SLOT, USER_POOL_SLOT,
+        USER_PUBKEYS_SLOT, VaultUserAssetInfo, vault_user_asset_info_from_storage,
+        vault_user_asset_key, vault_user_key,
+    },
 };
 
 /// Maximum number of lazily allocated `(asset, user)` accounting cells.
 ///
-/// The pool component uses six additional slots (including the consumed-intent map),
+/// The pool component uses six additional slots (including the per-user nonce window map),
 /// `AuthSingleSig` uses two, and `BasicWallet` uses none: `247 + 6 + 2 = 255`.
 pub const MAX_POOL_CELLS: usize = 247;
 
@@ -44,7 +56,7 @@ pub const CELL_INDEX_SLOT: &str = "zoropool::cell_index";
 pub const NEXT_CELL_SLOT: &str = "zoropool::next_cell";
 pub const VAULT_ACCOUNT_ID_SLOT: &str = "zoropool::vault_account_id";
 pub const USER_TRADING_DETAILS_PROC_ROOT_SLOT: &str = "zoropool::user_trading_details_proc_root";
-pub const CONSUMED_ORDERS_SLOT: &str = "zoropool::consumed_orders";
+pub const USER_NONCE_WINDOWS_SLOT: &str = "zoropool::user_nonce_windows";
 
 static FETCH_RPC: OnceLock<Arc<GrpcClient>> = OnceLock::new();
 static FETCH_RPC_LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -56,7 +68,11 @@ fn get_fetch_rpc() -> &'static Arc<GrpcClient> {
     })
 }
 
-pub async fn fetch_account_storage_from_rpc(account_id: AccountId) -> Result<AccountStorage> {
+async fn with_fetch_rpc_permit<T, F, Fut>(f: F) -> Result<T>
+where
+    F: FnOnce(Arc<GrpcClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     let concurrency = std::env::var("MIDEN_RPC_MAX_CONCURRENCY")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -67,13 +83,227 @@ pub async fn fetch_account_storage_from_rpc(account_id: AccountId) -> Result<Acc
         .clone()
         .try_acquire_owned()
         .map_err(|_| anyhow!("Miden RPC concurrency is saturated; retry later"))?;
-    let account = get_fetch_rpc()
-        .get_account_details(account_id)
-        .await
-        .map_err(|e| anyhow!("failed to fetch account from RPC: {e:?}"))?
-        .ok_or_else(|| anyhow!("account {} not found or is private", account_id.to_hex()))?;
+    f(get_fetch_rpc().clone()).await
+}
 
-    Ok(account.storage().clone())
+/// Full-account hydration. Prefer [`fetch_targeted_account_storage`] for request paths that
+/// only need a few map keys; oversized maps (or future growth) make this fail.
+pub async fn fetch_account_storage_from_rpc(account_id: AccountId) -> Result<AccountStorage> {
+    with_fetch_rpc_permit(|rpc| async move {
+        let account = rpc
+            .get_account_details(account_id)
+            .await
+            .map_err(|e| anyhow!("failed to fetch account from RPC: {e:?}"))?
+            .ok_or_else(|| anyhow!("account {} not found or is private", account_id.to_hex()))?;
+        Ok(account.storage().clone())
+    })
+    .await
+}
+
+/// Fetches value slots plus only the explicitly requested map keys.
+///
+/// Unrequested map slots are reconstructed as empty maps. Callers must only read keys they
+/// requested; missing keys read as the zero word.
+pub async fn fetch_targeted_account_storage(
+    account_id: AccountId,
+    requirements: AccountStorageRequirements,
+) -> Result<AccountStorage> {
+    with_fetch_rpc_permit(|rpc| {
+        let requirements = requirements.clone();
+        async move {
+            let (_block, proof) = rpc
+                .get_account(
+                    account_id,
+                    GetAccountRequest::new()
+                        .with_storage(StorageMapFetch::Slots(requirements.clone()))
+                        .with_vault(VaultFetch::Skip),
+                )
+                .await
+                .map_err(|e| anyhow!("failed to fetch targeted account storage: {e:?}"))?;
+            let details = proof.into_details().ok_or_else(|| {
+                anyhow!(
+                    "account {} returned without details for targeted storage fetch",
+                    account_id.to_hex()
+                )
+            })?;
+
+            let mut slots = Vec::new();
+            for slot_header in details.storage_details.header.slots() {
+                match slot_header.slot_type() {
+                    StorageSlotType::Value => {
+                        slots.push(StorageSlot::with_value(
+                            slot_header.name().clone(),
+                            slot_header.value(),
+                        ));
+                    }
+                    StorageSlotType::Map => {
+                        let map = match details.storage_details.find_map_details(slot_header.name())
+                        {
+                            Some(map_details) => match &map_details.entries {
+                                StorageMapEntries::AllEntries(entries) => StorageMap::with_entries(
+                                    entries.iter().map(|entry| (entry.key, entry.value)),
+                                )
+                                .map_err(|e| anyhow!("invalid storage map entries: {e:?}"))?,
+                                StorageMapEntries::EntriesWithProofs(proofs) => {
+                                    let keys = requirements.keys_for_slot(slot_header.name());
+                                    if proofs.len() != keys.len() {
+                                        return Err(anyhow!(
+                                            "slot '{}' returned {} proofs for {} keys",
+                                            slot_header.name(),
+                                            proofs.len(),
+                                            keys.len()
+                                        ));
+                                    }
+                                    let entries = keys
+                                        .iter()
+                                        .zip(proofs.iter())
+                                        .map(|(key, proof)| {
+                                            let hashed = key.hash().as_word();
+                                            let value = proof
+                                                .get(&hashed)
+                                                .unwrap_or_else(|| Word::new([Felt::ZERO; 4]));
+                                            (*key, value)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    StorageMap::with_entries(entries).map_err(|e| {
+                                        anyhow!("invalid partial storage map entries: {e:?}")
+                                    })?
+                                }
+                            },
+                            None => StorageMap::new(),
+                        };
+                        slots.push(StorageSlot::with_map(slot_header.name().clone(), map));
+                    }
+                }
+            }
+            AccountStorage::new(slots)
+                .map_err(|e| anyhow!("failed to build targeted AccountStorage: {e:?}"))
+        }
+    })
+    .await
+}
+
+/// Vault registration + placement maps for a single user.
+pub async fn fetch_vault_user_placement_storage(
+    vault_id: AccountId,
+    user_id: AccountId,
+) -> Result<AccountStorage> {
+    let user_key = StorageMapKey::new(vault_user_key(user_id));
+    // First fetch pubkey + pool assignment; then re-fetch with the authorized-pool key once
+    // known. Two small targeted reads stay O(1) in vault size.
+    let initial = fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([
+            (
+                storage_slot_name(USER_PUBKEYS_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+            (
+                storage_slot_name(USER_POOL_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+        ]),
+    )
+    .await?;
+    let pool_word = initial
+        .get_map_item(&storage_slot_name(USER_POOL_SLOT), vault_user_key(user_id))
+        .map_err(|e| anyhow!("failed to read {USER_POOL_SLOT}: {e:?}"))?;
+    if pool_word == Word::new([Felt::ZERO; 4]) {
+        return Ok(initial);
+    }
+    let pool_key = StorageMapKey::new(pool_word);
+    fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([
+            (
+                storage_slot_name(USER_PUBKEYS_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+            (
+                storage_slot_name(USER_POOL_SLOT),
+                std::slice::from_ref(&user_key),
+            ),
+            (
+                storage_slot_name(AUTHORIZED_POOLS_SLOT),
+                std::slice::from_ref(&pool_key),
+            ),
+        ]),
+    )
+    .await
+}
+
+/// Vault pubkey registration for a single user.
+pub async fn fetch_vault_user_registration_storage(
+    vault_id: AccountId,
+    user_id: AccountId,
+) -> Result<AccountStorage> {
+    let user_key = StorageMapKey::new(vault_user_key(user_id));
+    fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([(
+            storage_slot_name(USER_PUBKEYS_SLOT),
+            std::slice::from_ref(&user_key),
+        )]),
+    )
+    .await
+}
+
+/// Vault funding/redeem totals + pool cell index/value for one (asset, user).
+pub async fn fetch_user_balance_storage(
+    pool_id: AccountId,
+    vault_id: AccountId,
+    asset_id: AccountId,
+    user_id: AccountId,
+) -> Result<(AccountStorage, AccountStorage)> {
+    let asset_user = StorageMapKey::new(vault_user_asset_key(asset_id, user_id));
+    let vault_storage = fetch_targeted_account_storage(
+        vault_id,
+        AccountStorageRequirements::new([
+            (
+                storage_slot_name(USER_ASSET_TOTAL_FUNDING_SLOT),
+                std::slice::from_ref(&asset_user),
+            ),
+            (
+                storage_slot_name(USER_ASSET_TOTAL_REDEEMS_SLOT),
+                std::slice::from_ref(&asset_user),
+            ),
+            (
+                storage_slot_name(USER_ASSET_TOTAL_INITIATED_REDEEMS_SLOT),
+                std::slice::from_ref(&asset_user),
+            ),
+        ]),
+    )
+    .await?;
+    let pool_key = StorageMapKey::new(asset_user_key(asset_id, user_id));
+    let pool_storage = fetch_targeted_account_storage(
+        pool_id,
+        AccountStorageRequirements::new([(
+            storage_slot_name(CELL_INDEX_SLOT),
+            std::slice::from_ref(&pool_key),
+        )]),
+    )
+    .await?;
+    Ok((vault_storage, pool_storage))
+}
+
+/// Pool cell index entries for every asset of one user (value cells come from the header).
+pub async fn fetch_pool_user_cells_storage(
+    pool_id: AccountId,
+    user_id: AccountId,
+    asset_ids: &[AccountId],
+) -> Result<AccountStorage> {
+    let keys: Vec<StorageMapKey> = asset_ids
+        .iter()
+        .map(|asset_id| StorageMapKey::new(asset_user_key(*asset_id, user_id)))
+        .collect();
+    fetch_targeted_account_storage(
+        pool_id,
+        AccountStorageRequirements::new([(
+            storage_slot_name(CELL_INDEX_SLOT),
+            keys.iter().collect::<Vec<_>>(),
+        )]),
+    )
+    .await
 }
 
 fn serialize_u256<S>(value: &U256, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -536,12 +766,10 @@ async fn get_user_balance_details_from_pool(
     asset_id: AccountId,
     user_id: AccountId,
 ) -> Result<(u64, u64)> {
-    let vault_storage = fetch_account_storage_from_rpc(vault_id).await?;
+    let (vault_storage, pool_storage) =
+        fetch_user_balance_storage(pool_id, vault_id, asset_id, user_id).await?;
     let vault_info = vault_user_asset_info_from_storage(&vault_storage, asset_id, user_id)?;
-
-    let pool_storage = fetch_account_storage_from_rpc(pool_id).await?;
     let cell = pool_cell_from_storage(&pool_storage, asset_id, user_id)?;
-
     Ok(derive_balance_details(&vault_info, cell.bought, cell.sold))
 }
 
@@ -631,7 +859,7 @@ pub fn build_pool_component(cb: CodeBuilder, vault_id: AccountId) -> Result<Acco
     ));
 
     slots.push(StorageSlot::with_map(
-        storage_slot_name(CONSUMED_ORDERS_SLOT),
+        storage_slot_name(USER_NONCE_WINDOWS_SLOT),
         StorageMap::new(),
     ));
 
@@ -682,9 +910,13 @@ mod tests {
         assert!(
             pool.storage_slots()
                 .iter()
-                .any(|slot| slot.name().id() == storage_slot_name(CONSUMED_ORDERS_SLOT).id())
+                .any(|slot| slot.name().id() == storage_slot_name(USER_NONCE_WINDOWS_SLOT).id())
         );
-        crate::vault::build_vault_component(cb.clone(), vault_id)?;
+        crate::vault::build_vault_component(
+            cb.clone(),
+            vault_id,
+            crate::vault::DEFAULT_POOL_USER_CAPACITY,
+        )?;
 
         let vault_root = vault_trading_details_proc_root(cb.clone())?;
         let pool_root = pool_balance_details_proc_root(cb)?;

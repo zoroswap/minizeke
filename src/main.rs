@@ -27,7 +27,7 @@ use crate::{
     message_broker::message_broker::{FeeStateEvent, MessageBroker, StatsEvent},
     miden_execution::MidenExecution,
     oracle_sse::OracleSSEClient,
-    pool::{PoolState, fetch_account_storage_from_rpc},
+    pool::{PoolState, fetch_vault_user_placement_storage},
     pool_registry::PoolRegistry,
     processing::Processing,
     store::Store,
@@ -207,37 +207,34 @@ async fn main_tokio(
             .map(|asset| asset.faucet_id)
             .collect();
         let allowed_pools: HashSet<AccountId> = init_data.pools.iter().copied().collect();
-        let vault_storage = match fetch_account_storage_from_rpc(init_data.vault_id).await {
-            Ok(storage) => Some(storage),
-            Err(error) => {
-                warn!(
-                    %error,
-                    "vault storage unavailable; stale-order purge will only check assets"
-                );
-                None
-            }
-        };
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        let purged = execution_store.fail_stale_prebatch_orders(
-            |order| {
-                if order.details.asset_in == order.details.asset_out
-                    || !allowed_assets.contains(&order.details.asset_in)
-                    || !allowed_assets.contains(&order.details.asset_out)
-                {
-                    return true;
+        let vault_id = init_data.vault_id;
+        // Collect candidates first so async targeted vault reads stay outside the sync
+        // SQLite predicate, then fail any order whose user is unbound or on a removed shard.
+        let (candidates, mut stale_ids) = execution_store.list_prebatch_orders()?;
+        for order in candidates {
+            if order.details.asset_in == order.details.asset_out
+                || !allowed_assets.contains(&order.details.asset_in)
+                || !allowed_assets.contains(&order.details.asset_out)
+            {
+                stale_ids.push(order.id);
+                continue;
+            }
+            match fetch_vault_user_placement_storage(vault_id, order.user_id).await {
+                Ok(storage) => match user_pool_from_storage(&storage, order.user_id) {
+                    Ok(Some(pool_id)) if allowed_pools.contains(&pool_id) => {}
+                    Ok(Some(_)) | Ok(None) | Err(_) => stale_ids.push(order.id),
+                },
+                Err(error) => {
+                    warn!(
+                        %error,
+                        user = %order.user_id.to_hex(),
+                        "vault placement unavailable during stale-order purge; keeping order"
+                    );
                 }
-                let Some(storage) = vault_storage.as_ref() else {
-                    return false;
-                };
-                match user_pool_from_storage(storage, order.user_id) {
-                    Ok(Some(pool_id)) => !allowed_pools.contains(&pool_id),
-                    Ok(None) => true,
-                    Err(_) => true,
-                }
-            },
-            "stale_after_redeploy",
-            now,
-        )?;
+            }
+        }
+        let purged = execution_store.fail_orders_by_ids(&stale_ids, "stale_after_redeploy", now)?;
         if purged > 0 {
             info!(
                 purged,
@@ -307,6 +304,7 @@ async fn main_tokio(
         .expect("spawn processing worker");
 
     println!("[RUN] Starting Finality observer");
+    let pool_registry_for_provisioner = pool_registry.clone();
     {
         let message_broker = message_broker.clone();
         let execution_store = execution_store.clone();
@@ -342,6 +340,36 @@ async fn main_tokio(
     miden_start_tx
         .send(())
         .expect("Miden execution thread stopped during startup");
+
+    println!("[INIT] Initializing pool provisioner");
+    let deployment = minizeke::deployment::Deployment::load()?;
+    let pool_provision_store =
+        Arc::new(minizeke::pool_manager::PoolProvisionStore::open_from_env()?);
+    let (provisioner, pool_capacity_rx) = minizeke::pool_manager::PoolProvisioner::new(
+        pool_registry_for_provisioner,
+        pool_provision_store,
+        init_data.vault_id,
+        deployment.operator_account_id,
+    );
+    {
+        std::thread::Builder::new()
+            .name("pool-provisioner".to_owned())
+            .spawn(move || {
+                let runtime = Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("pool provisioner runtime");
+                runtime.block_on(async move {
+                    if let Err(error) = provisioner.start().await {
+                        eprintln!(
+                            "Critical error on pool provisioner: {error}. Exiting with status 1."
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            })
+            .expect("spawn pool provisioner");
+    }
 
     println!("[RUN] Starting volatility-fee expiry task");
     {
@@ -443,6 +471,7 @@ async fn main_tokio(
         auth_store,
         analytics_store,
         execution_store,
+        pool_capacity_rx,
     )
     .await?;
 

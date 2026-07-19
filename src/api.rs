@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::{
     analytics_store::{AnalyticsStore, Pagination},
     auth::AuthStore,
-    execution_store::{AdmitError, ExecutionStore, IntentReservation},
+    execution_store::{AdmitError, ExecutionStore, IntentReservation, NonceLease},
     faucet::{DEFAULT_FAUCET_SERVER_URL, MintRequest},
     fee_store::{FeeBatchRequest, FeeStore, FeeUpdateSource},
     history::HistoryStore,
@@ -39,7 +39,10 @@ use crate::{
     market::derive_depth,
     message_broker::message_broker::{FeeStateEvent, MessageBroker},
     order::{Order, OrderDetails, OrderType, SerializableOrder},
-    pool::{fetch_account_storage_from_rpc, pool_cell_allocation_from_storage},
+    pool::{
+        fetch_pool_user_cells_storage, fetch_vault_user_placement_storage,
+        fetch_vault_user_registration_storage, pool_cell_allocation_from_storage,
+    },
     serde::{deserialize_account_id, serialize_account_id},
     service_auth::ServiceCredentials,
     store::Store,
@@ -68,6 +71,9 @@ pub struct AppState {
     pub work_limits: WorkLimits,
     pub fee_updater_credentials: ServiceCredentials,
     pub fee_admin_credentials: ServiceCredentials,
+    /// Latest pool-capacity snapshot from the server-owned provisioner (if running).
+    pub pool_capacity:
+        tokio::sync::watch::Receiver<Option<crate::pool_manager::PoolCapacitySnapshot>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +120,7 @@ pub async fn start(
     auth_store: Arc<AuthStore>,
     analytics_store: Arc<AnalyticsStore>,
     execution_store: Arc<ExecutionStore>,
+    pool_capacity: tokio::sync::watch::Receiver<Option<crate::pool_manager::PoolCapacitySnapshot>>,
 ) -> Result<()> {
     let server_url: &'static str = env::var("SERVER_URL").unwrap().leak();
     let faucet_server_url = normalize_http_url(
@@ -149,6 +156,7 @@ pub async fn start(
         work_limits,
         fee_updater_credentials,
         fee_admin_credentials,
+        pool_capacity,
     };
     let app = create_router(state.clone());
     let admin_app = create_admin_router(state);
@@ -160,7 +168,7 @@ pub async fn start(
     println!("GET  /health /pools/info /pools/analytics /stats /candles /trades /depth");
     println!("GET  /orders /orders/{{id}} /users/{{id}}/placement /users/me/analytics /ws");
     println!("GET  /lp/operations/{{note_id}} /lp/positions/{{lp_id}}/{{faucet_id}}");
-    println!("POST /auth/challenge /auth/login /orders/new /mint /lp/deposits/note");
+    println!("POST /auth/challenge /auth/login /orders/nonce /orders/new /mint /lp/deposits/note");
 
     let admin_url = env::var("ADMIN_SERVER_URL").unwrap_or_else(|_| "127.0.0.1:7801".to_owned());
     let admin_address: SocketAddr = admin_url.parse()?;
@@ -232,6 +240,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/lp/operations/{note_id}", get(lp_operation))
         .route("/lp/positions/{lp_id}/{faucet_id}", get(lp_position))
         .route("/ws", get(websocket_handler))
+        .route("/orders/nonce", post(order_nonce))
         .route("/orders/new", post(order_new))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(ingress.request_body_bytes))
@@ -316,9 +325,10 @@ async fn auth_challenge(
         Ok(value) => value,
         Err(error) => return bad_request(format!("invalid user_id: {error}")),
     };
+    let vault_id = state.store.vault_id();
     let storage = match state
         .work_limits
-        .rpc(fetch_account_storage_from_rpc(state.store.vault_id()))
+        .rpc(fetch_vault_user_registration_storage(vault_id, user_id))
         .await
     {
         Ok(storage) => storage,
@@ -382,9 +392,10 @@ async fn auth_login(
         Some(value) => value,
         None => return bad_request("invalid signature"),
     };
+    let vault_id = state.store.vault_id();
     let storage = match state
         .work_limits
-        .rpc(fetch_account_storage_from_rpc(state.store.vault_id()))
+        .rpc(fetch_vault_user_registration_storage(vault_id, user_id))
         .await
     {
         Ok(storage) => storage,
@@ -724,13 +735,24 @@ async fn lp_position(
 
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let broker = state.message_broker.metrics();
+    let capacity = state.pool_capacity.borrow().clone();
     let response = serde_json::json!({
         "status": "healthy",
         "timestamp": Utc::now(),
         "broker": {
             "lagged_messages": broker.lagged_messages,
             "dropped_without_receivers": broker.dropped_without_receivers,
-        }
+        },
+        "pools": capacity.as_ref().map(|snapshot| serde_json::json!({
+            "active_pool": snapshot.active_pool.map(|id| id.to_hex()),
+            "user_count": snapshot.user_count,
+            "user_capacity": snapshot.user_capacity,
+            "next_cell": snapshot.next_cell,
+            "max_cells": snapshot.max_cells,
+            "pool_shard_ids": snapshot.pools.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+            "pending_attach": snapshot.pending_attach.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+            "last_provision_error": snapshot.last_provision_error,
+        })),
     });
 
     let mut headers = HeaderMap::new();
@@ -1173,9 +1195,22 @@ async fn pool_info(State(state): State<AppState>) -> Response<Body> {
             },
         }));
     }
+    let capacity = state.pool_capacity.borrow().clone();
     let response = serde_json::json!({
         "assets": assets,
         "pool_shard_ids": state.store.pools().iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+        "active_pool": capacity.as_ref().and_then(|s| s.active_pool.map(|id| id.to_hex())),
+        "user_count": capacity.as_ref().map(|s| s.user_count),
+        "user_capacity": capacity.as_ref().map(|s| s.user_capacity),
+        "next_cell": capacity.as_ref().map(|s| s.next_cell),
+        "max_cells": capacity.as_ref().map(|s| s.max_cells),
+        "pending_attach": capacity.as_ref().map(|s| {
+            s.pending_attach
+                .iter()
+                .map(|id| id.to_hex())
+                .collect::<Vec<_>>()
+        }),
+        "last_provision_error": capacity.as_ref().and_then(|s| s.last_provision_error.clone()),
     });
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1271,9 +1306,10 @@ async fn user_placement(State(state): State<AppState>, Path(id): Path<String>) -
         Ok(user_id) => user_id,
         Err(error) => return bad_request(format!("invalid user account id: {error}")),
     };
+    let vault_id = state.store.vault_id();
     let vault_storage = match state
         .work_limits
-        .rpc(fetch_account_storage_from_rpc(state.store.vault_id()))
+        .rpc(fetch_vault_user_placement_storage(vault_id, user_id))
         .await
     {
         Ok(storage) => storage,
@@ -1300,9 +1336,15 @@ async fn user_placement(State(state): State<AppState>, Path(id): Path<String>) -
             }
         }
     }
+    let asset_ids: Vec<_> = state
+        .store
+        .assets()
+        .iter()
+        .map(|asset| asset.faucet_id)
+        .collect();
     let pool_storage = match state
         .work_limits
-        .rpc(fetch_account_storage_from_rpc(pool_id))
+        .rpc(fetch_pool_user_cells_storage(pool_id, user_id, &asset_ids))
         .await
     {
         Ok(storage) => storage,
@@ -1364,6 +1406,40 @@ fn service_unavailable_retry(message: impl Into<String>) -> Response<Body> {
     response
 }
 
+#[derive(Serialize)]
+struct NonceLeaseResponse {
+    nonce: u32,
+    client_order_id: Uuid,
+}
+
+/// Allocates the next per-user order nonce and a client UUID that embeds it in limb 0.
+/// Clients must call this before signing a v3 intent and reuse the returned UUID on retry.
+async fn order_nonce(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    let user_id = match authenticated_user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let created_at = Utc::now().timestamp_millis() as u64;
+    let execution_store = state.execution_store.clone();
+    match state
+        .work_limits
+        .database(move || Ok(execution_store.allocate_nonce_lease(user_id, created_at)?))
+        .await
+    {
+        Ok(NonceLease {
+            nonce,
+            client_order_id,
+        }) => Json(ApiResponse {
+            data: NonceLeaseResponse {
+                nonce,
+                client_order_id,
+            },
+        })
+        .into_response(),
+        Err(error) => service_unavailable_retry(error.to_string()),
+    }
+}
+
 async fn order_new(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1386,17 +1462,17 @@ async fn order_new(
     if payload.version != INTENT_VERSION {
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
-            "only signed intent version 2 is accepted",
+            "only signed intent version 3 is accepted",
         ));
     }
     if payload.order_type != OrderType::Spot {
-        return Ok(bad_request("v2 currently supports only spot swap intents"));
+        return Ok(bad_request("v3 currently supports only spot swap intents"));
     }
     if env::var("AUTH_DOMAIN").unwrap_or_else(|_| "minizeke".to_owned()) != "minizeke"
         || env::var("MIDEN_NETWORK").unwrap_or_else(|_| "testnet".to_owned()) != "testnet"
     {
         return Ok(service_unavailable(
-            "v2 pool intents require AUTH_DOMAIN=minizeke and MIDEN_NETWORK=testnet",
+            "v3 pool intents require AUTH_DOMAIN=minizeke and MIDEN_NETWORK=testnet",
         ));
     }
     let now_secs = Utc::now().timestamp() as u64;
@@ -1443,9 +1519,13 @@ async fn order_new(
         Err(error) => return Ok(bad_request(format!("invalid public key: {error}"))),
     };
 
+    let vault_id = state.store.vault_id();
     let vault_storage = match state
         .work_limits
-        .rpc(fetch_account_storage_from_rpc(state.store.vault_id()))
+        .rpc(fetch_vault_user_registration_storage(
+            vault_id,
+            payload.user_id,
+        ))
         .await
     {
         Ok(storage) => storage,
@@ -1514,6 +1594,18 @@ async fn order_new(
                 || error.to_string().contains("execution queue is full")
             {
                 return Ok(service_unavailable_retry("execution queue is full"));
+            }
+            if root.downcast_ref::<AdmitError>() == Some(&AdmitError::UnknownNonceLease) {
+                return Ok(error_response(
+                    StatusCode::CONFLICT,
+                    "client_order_id was not leased; call POST /orders/nonce first",
+                ));
+            }
+            if root.downcast_ref::<AdmitError>() == Some(&AdmitError::NonceLeaseConflict) {
+                return Ok(error_response(
+                    StatusCode::CONFLICT,
+                    "client_order_id lease does not match the signed intent",
+                ));
             }
             return Ok(service_unavailable_retry(error.to_string()));
         }

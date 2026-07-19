@@ -10,13 +10,16 @@ use minizeke::{
         metrics::Metrics,
         oracle::OracleClient,
         trader::{
-            build_simulation_client, load_traders, migrate_legacy_setup_artifacts,
-            reset_setup_artifacts, run_activation_ramp, run_trader, setup_traders,
+            TraderRegistry, build_simulation_client, load_traders, migrate_legacy_setup_artifacts,
+            reset_setup_artifacts, run_activation_ramp, run_growth_loop, run_trader, setup_traders,
             validate_deployment, warm_auth_sessions,
         },
     },
 };
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinSet,
+};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -81,14 +84,30 @@ async fn main() -> Result<()> {
         )
         .await?
     };
-    let staged = traders.split_off(config.num_traders);
+
+    let need_growth = traders.len() < config.max_traders;
+    // Already-funded extras (from a previous larger cohort) activate via auth ramp.
+    let staged = if traders.len() > config.num_traders {
+        traders.split_off(config.num_traders)
+    } else {
+        Vec::new()
+    };
+    // Registry includes every funded trader so live growth continues past staged indices.
+    let registry: TraderRegistry = Arc::new(tokio::sync::Mutex::new(
+        traders
+            .iter()
+            .cloned()
+            .chain(staged.iter().cloned())
+            .collect(),
+    ));
 
     info!(
         active = traders.len(),
         staged = staged.len(),
         max_traders = config.max_traders,
+        grow = need_growth,
         interval_secs = config.trade_interval_secs,
-        "warming auth sessions (all high-frequency)"
+        "warming auth sessions for initial traders"
     );
     let sessions = warm_auth_sessions(
         &traders,
@@ -125,15 +144,34 @@ async fn main() -> Result<()> {
         info!(
             max_traders = config.max_traders,
             stage_interval_secs = 60,
-            "starting activation ramp"
+            "starting activation ramp for already-funded traders"
         );
         tasks.spawn(run_activation_ramp(
             config.clone(),
-            deployment,
+            deployment.clone(),
             api.clone(),
             oracle.clone(),
             metrics.clone(),
             staged,
+            shutdown_rx.clone(),
+        ));
+    }
+
+    if need_growth {
+        let prove_slots = Arc::new(Semaphore::new(config.setup_concurrency.max(1)));
+        info!(
+            current = registry.lock().await.len(),
+            max_traders = config.max_traders,
+            grow_interval_secs = config.grow_interval_secs,
+            "starting live trader growth"
+        );
+        tasks.spawn(run_growth_loop(
+            config.clone(),
+            api.clone(),
+            oracle.clone(),
+            metrics.clone(),
+            registry,
+            prove_slots,
             shutdown_rx.clone(),
         ));
     }

@@ -27,19 +27,21 @@ const CELL_INDEX_SLOT = word("zoropool::cell_index")
 const NEXT_CELL_SLOT = word("zoropool::next_cell")
 const VAULT_ACCOUNT_ID_SLOT = word("zoropool::vault_account_id")
 const USER_TRADING_DETAILS_PROC_ROOT_SLOT = word("zoropool::user_trading_details_proc_root")
-const CONSUMED_ORDERS_SLOT = word("zoropool::consumed_orders")
+const USER_NONCE_WINDOWS_SLOT = word("zoropool::user_nonce_windows")
 
-# Signed intent v2 constants. These must match src/intent.rs.
-const SWAP_PURPOSE_TAG = 6506385721141899776
+# Signed intent v3 constants. These must match src/intent.rs.
+const SWAP_PURPOSE_TAG = 6506385721141900032
 const INTENT_DOMAIN_TAG = 7883954021992852325
 const TESTNET_NETWORK_TAG = 8387236824952960000
+const NONCE_WINDOW_SIZE = 96
 
 # ERRORS
 const ERR_INSUFFICIENT_AVAILABLE_BALANCE = "POOL: insufficient available balance for swap"
 const ERR_MAX_POOL_CELLS_REACHED = "POOL: maximum asset-user cells reached"
-const ERR_INVALID_INTENT_DOMAIN = "POOL: invalid v2 intent domain"
+const ERR_INVALID_INTENT_DOMAIN = "POOL: invalid v3 intent domain"
 const ERR_INTENT_EXPIRED = "POOL: signed intent expired"
-const ERR_ORDER_ALREADY_CONSUMED = "POOL: signed client order UUID already consumed"
+const ERR_ORDER_ALREADY_CONSUMED = "POOL: order nonce already consumed in user window"
+const ERR_STALE_NONCE = "POOL: order nonce is below the user's sliding window"
 
 # ----------------------------------------------------------------------------------------------
 # ID HELPERS
@@ -229,13 +231,171 @@ pub proc fetch_user_trading_details
 end
 
 # ----------------------------------------------------------------------------------------------
+# PER-USER SLIDING NONCE WINDOW
+# ----------------------------------------------------------------------------------------------
+#
+# Storage: user_nonce_windows[user_key] = [base_nonce, bitmap0, bitmap1, bitmap2]
+# Bit i of the concatenated 96-bit bitmap marks nonce (base_nonce + i) as consumed.
+
+const NW_BASE_LOCAL = 0
+const NW_BM0_LOCAL = 1
+const NW_BM1_LOCAL = 2
+const NW_BM2_LOCAL = 3
+const NW_NONCE_LOCAL = 4
+const NW_SHIFT_LOCAL = 5
+const NW_TMP_LOCAL = 6
+
+#! Loads the user's window, slides if needed, and marks `nonce` consumed.
+#! Inputs:  [nonce, user_suffix, user_prefix]
+#! Outputs: [base, bm0, bm1, bm2]  (updated window word elements, base on top)
+#! Invocation: exec
+@locals(7)
+proc prepare_user_nonce_window
+    loc_store.NW_NONCE_LOCAL
+    # => [user_suffix, user_prefix]
+    push.0.0 movup.3 movup.3
+    # => [user_suffix, user_prefix, 0, 0]
+    push.USER_NONCE_WINDOWS_SLOT[0..2]
+    exec.active_account::get_map_item
+    # => [base, bm0, bm1, bm2] with base on top
+    loc_store.NW_BASE_LOCAL
+    loc_store.NW_BM0_LOCAL
+    loc_store.NW_BM1_LOCAL
+    loc_store.NW_BM2_LOCAL
+
+    # reject stale: nonce >= base.
+    # `gte` compares next with top, so load nonce then base (threshold on top).
+    loc_load.NW_NONCE_LOCAL
+    loc_load.NW_BASE_LOCAL
+    gte assert.err=ERR_STALE_NONCE
+
+    # offset = nonce - base (`sub` = next - top).
+    loc_load.NW_NONCE_LOCAL
+    loc_load.NW_BASE_LOCAL
+    sub
+    dup push.NONCE_WINDOW_SIZE lt
+    if.true
+        # offset remains on stack for the bit update below
+    else
+        # slide so nonce sits at the high end of the window
+        drop
+        loc_load.NW_NONCE_LOCAL
+        push.95 sub
+        # => [new_base]
+        dup
+        loc_load.NW_BASE_LOCAL
+        swap sub
+        # => [shift, new_base]
+        swap loc_store.NW_BASE_LOCAL
+        loc_store.NW_SHIFT_LOCAL
+
+        # Right-shift the 96-bit bitmap by `shift` bits.
+        loc_load.NW_SHIFT_LOCAL push.0 eq
+        if.true
+            # no-op
+        else
+            loc_load.NW_SHIFT_LOCAL push.NONCE_WINDOW_SIZE gte
+            if.true
+                push.0 loc_store.NW_BM0_LOCAL
+                push.0 loc_store.NW_BM1_LOCAL
+                push.0 loc_store.NW_BM2_LOCAL
+            else
+                loc_load.NW_SHIFT_LOCAL push.64 gte
+                if.true
+                    loc_load.NW_SHIFT_LOCAL push.64 sub
+                    loc_load.NW_BM2_LOCAL swap u32shr
+                    loc_store.NW_BM0_LOCAL
+                    push.0 loc_store.NW_BM1_LOCAL
+                    push.0 loc_store.NW_BM2_LOCAL
+                else
+                    loc_load.NW_SHIFT_LOCAL push.32 gte
+                    if.true
+                        loc_load.NW_SHIFT_LOCAL push.32 sub
+                        loc_store.NW_SHIFT_LOCAL
+                        push.32 loc_load.NW_SHIFT_LOCAL sub
+                        loc_store.NW_TMP_LOCAL
+                        # n0 = (b1 >> s2) | (b2 << (32-s2))
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM1_LOCAL swap u32shr
+                        loc_load.NW_TMP_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shl
+                        u32or loc_store.NW_BM0_LOCAL
+                        # n1 = b2 >> s2
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shr
+                        loc_store.NW_BM1_LOCAL
+                        push.0 loc_store.NW_BM2_LOCAL
+                    else
+                        # 0 < shift < 32
+                        push.32 loc_load.NW_SHIFT_LOCAL sub
+                        loc_store.NW_TMP_LOCAL
+                        # n0 = (b0 >> s) | (b1 << (32-s))
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM0_LOCAL swap u32shr
+                        loc_load.NW_TMP_LOCAL
+                        loc_load.NW_BM1_LOCAL swap u32shl
+                        u32or
+                        # n1 = (b1 >> s) | (b2 << (32-s))
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM1_LOCAL swap u32shr
+                        loc_load.NW_TMP_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shl
+                        u32or
+                        # n2 = b2 >> s
+                        loc_load.NW_SHIFT_LOCAL
+                        loc_load.NW_BM2_LOCAL swap u32shr
+                        # => [n2, n1, n0]
+                        loc_store.NW_BM2_LOCAL
+                        loc_store.NW_BM1_LOCAL
+                        loc_store.NW_BM0_LOCAL
+                    end
+                end
+            end
+        end
+        push.95
+    end
+
+    # Assert the selected bit is clear, then set it.
+    dup push.32 lt
+    if.true
+        push.1 swap u32shl
+        loc_load.NW_BM0_LOCAL
+        dup.1 u32and eq.0 assert.err=ERR_ORDER_ALREADY_CONSUMED
+        loc_load.NW_BM0_LOCAL u32or
+        loc_store.NW_BM0_LOCAL
+    else
+        dup push.64 lt
+        if.true
+            push.32 sub
+            push.1 swap u32shl
+            loc_load.NW_BM1_LOCAL
+            dup.1 u32and eq.0 assert.err=ERR_ORDER_ALREADY_CONSUMED
+            loc_load.NW_BM1_LOCAL u32or
+            loc_store.NW_BM1_LOCAL
+        else
+            push.64 sub
+            push.1 swap u32shl
+            loc_load.NW_BM2_LOCAL
+            dup.1 u32and eq.0 assert.err=ERR_ORDER_ALREADY_CONSUMED
+            loc_load.NW_BM2_LOCAL u32or
+            loc_store.NW_BM2_LOCAL
+        end
+    end
+
+    loc_load.NW_BM2_LOCAL
+    loc_load.NW_BM1_LOCAL
+    loc_load.NW_BM0_LOCAL
+    loc_load.NW_BASE_LOCAL
+end
+
+# ----------------------------------------------------------------------------------------------
 # SWAP
 # ----------------------------------------------------------------------------------------------
 
 #! Executes a signed, asset-agnostic swap.
 #! Inputs:  [purpose, domain, network, user_suffix, user_prefix, sell_asset_suffix,
 #!           sell_asset_prefix, sell_amount, buy_asset_suffix, buy_asset_prefix,
-#!           buy_amount, uuid0, uuid1, uuid2, uuid3, expires_at]
+#!           buy_amount, nonce, uuid1, uuid2, uuid3, expires_at]
 #! Advice:  [PK[9], SIG[17], ...]
 #! Outputs: []
 #! Invocation: call
@@ -257,28 +417,32 @@ const SW_USER_SUFFIX_LOCAL = 32
 const SW_USER_PREFIX_LOCAL = 33
 const SW_BUY_ASSET_SUFFIX_LOCAL = 34
 const SW_BUY_ASSET_PREFIX_LOCAL = 35
-const SW_UUID0_LOCAL = 36
+const SW_NONCE_LOCAL = 36
 const SW_UUID1_LOCAL = 37
 const SW_UUID2_LOCAL = 38
 const SW_UUID3_LOCAL = 39
 const SW_EXPIRES_AT_LOCAL = 40
 const SW_SELL_ASSET_SUFFIX_LOCAL = 41
 const SW_SELL_ASSET_PREFIX_LOCAL = 42
-@locals(43)
+const SW_WIN_BASE_LOCAL = 43
+const SW_WIN_BM0_LOCAL = 44
+const SW_WIN_BM1_LOCAL = 45
+const SW_WIN_BM2_LOCAL = 46
+@locals(47)
 pub proc execute_swap
     loc_storew_be.SW_INTENT0_LOCAL dropw
     loc_storew_be.SW_INTENT1_LOCAL dropw
     loc_storew_be.SW_INTENT2_LOCAL dropw
     loc_storew_be.SW_INTENT3_LOCAL dropw
 
-    # Assert the purpose/domain/network fixed by this freshly deployed v2 pool.
+    # Assert the purpose/domain/network fixed by this freshly deployed v3 pool.
     loc_loadw_be.SW_INTENT0_LOCAL
     push.SWAP_PURPOSE_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
     push.INTENT_DOMAIN_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
     push.TESTNET_NETWORK_TAG eq assert.err=ERR_INVALID_INTENT_DOMAIN
     loc_store.SW_USER_SUFFIX_LOCAL
 
-    # Cache all business fields and the client UUID.
+    # Cache all business fields and the client UUID (limb0 = order nonce).
     loc_loadw_be.SW_INTENT1_LOCAL
     loc_store.SW_USER_PREFIX_LOCAL
     loc_store.SW_SELL_ASSET_SUFFIX_LOCAL
@@ -288,7 +452,7 @@ pub proc execute_swap
     loc_store.SW_BUY_ASSET_SUFFIX_LOCAL
     loc_store.SW_BUY_ASSET_PREFIX_LOCAL
     loc_store.SW_BUY_AMOUNT_LOCAL
-    loc_store.SW_UUID0_LOCAL
+    loc_store.SW_NONCE_LOCAL
     loc_loadw_be.SW_INTENT3_LOCAL
     loc_store.SW_UUID1_LOCAL
     loc_store.SW_UUID2_LOCAL
@@ -303,15 +467,16 @@ pub proc execute_swap
     # block_timestamp < expires_at. Equality is expired, matching API/Processing.
     swap lt assert.err=ERR_INTENT_EXPIRED
 
-    # The authenticated consumed-orders map makes UUID replay impossible, including
-    # a duplicate later in this same transaction.
-    loc_load.SW_UUID3_LOCAL
-    loc_load.SW_UUID2_LOCAL
-    loc_load.SW_UUID1_LOCAL
-    loc_load.SW_UUID0_LOCAL
-    push.CONSUMED_ORDERS_SLOT[0..2]
-    exec.active_account::get_map_item
-    exec.is_zero_word assert.err=ERR_ORDER_ALREADY_CONSUMED
+    # Prepare the per-user sliding nonce window. The updated word is cached in locals
+    # and written only after every fallible swap check/update below.
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    loc_load.SW_NONCE_LOCAL
+    exec.prepare_user_nonce_window
+    loc_store.SW_WIN_BASE_LOCAL
+    loc_store.SW_WIN_BM0_LOCAL
+    loc_store.SW_WIN_BM1_LOCAL
+    loc_store.SW_WIN_BM2_LOCAL
 
     # Fetch fresh vault values for the full sell asset + user key.
     loc_load.SW_USER_PREFIX_LOCAL
@@ -325,7 +490,7 @@ pub proc execute_swap
     loc_store.SW_PENDING_LOCAL
     loc_storew_be.SW_PK_LOCAL dropw
 
-    # Verify the canonical sixteen-felt v2 intent against the vault-registered key.
+    # Verify the canonical sixteen-felt v3 intent against the vault-registered key.
     padw loc_loadw_be.SW_PK_LOCAL
     padw loc_loadw_be.SW_INTENT3_LOCAL
     padw loc_loadw_be.SW_INTENT2_LOCAL
@@ -375,14 +540,15 @@ pub proc execute_swap
     loc_load.SW_BUY_SLOT_LOCAL
     exec.add_to_bought
 
-    # Consume only after every fallible swap check/update; transaction atomicity still
-    # rolls this write back if a later account/kernel assertion fails.
-    push.0.0.0.1
-    loc_load.SW_UUID3_LOCAL
-    loc_load.SW_UUID2_LOCAL
-    loc_load.SW_UUID1_LOCAL
-    loc_load.SW_UUID0_LOCAL
-    push.CONSUMED_ORDERS_SLOT[0..2]
+    # Persist the prepared nonce window only after every fallible swap check/update.
+    loc_load.SW_WIN_BM2_LOCAL
+    loc_load.SW_WIN_BM1_LOCAL
+    loc_load.SW_WIN_BM0_LOCAL
+    loc_load.SW_WIN_BASE_LOCAL
+    push.0.0
+    loc_load.SW_USER_PREFIX_LOCAL
+    loc_load.SW_USER_SUFFIX_LOCAL
+    push.USER_NONCE_WINDOWS_SLOT[0..2]
     exec.native_account::set_map_item dropw
 
     exec.sys::truncate_stack

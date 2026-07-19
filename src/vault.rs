@@ -33,20 +33,30 @@ pub const USER_PUBKEYS_SLOT: &str = "zorovault::user_pubkeys";
 pub const AUTHORIZED_POOLS_SLOT: &str = "zorovault::authorized_pools";
 pub const USER_POOL_SLOT: &str = "zorovault::user_pool";
 pub const ACTIVE_POOL_SLOT: &str = "zorovault::active_pool";
+pub const POOL_USER_CAPACITY_SLOT: &str = "zorovault::pool_user_capacity";
+pub const POOL_USER_COUNTS_SLOT: &str = "zorovault::pool_user_counts";
 pub const OPERATOR_ACCOUNT_ID_SLOT: &str = "zorovault::operator_account_id";
 pub const USER_POOL_BALANCE_DETAILS_PROC_ROOT_SLOT: &str =
     "zorovault::user_pool_balance_details_proc_root";
 pub const LP_ENTITLEMENTS_SLOT: &str = "zorovault::lp_entitlements";
 pub const LP_WITHDRAWN_SLOT: &str = "zorovault::lp_withdrawn";
 
+/// Default registered-users-per-shard budget. Paired with [`DEFAULT_ASSET_CAPACITY`] so
+/// worst-case cells (`users * assets`) stay under the pool's 247-cell limit.
+pub const DEFAULT_POOL_USER_CAPACITY: u32 = 16;
+/// Default asset budget used when sizing `pool_user_capacity`.
+pub const DEFAULT_ASSET_CAPACITY: u32 = 15;
+
 pub async fn deploy_vault(
     client: &mut Client<FilesystemKeyStore>,
     operator_id: AccountId,
+    pool_user_capacity: u32,
 ) -> Result<Account> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
-    let vault_component = build_vault_component(client.code_builder(), operator_id)?;
+    let vault_component =
+        build_vault_component(client.code_builder(), operator_id, pool_user_capacity)?;
     let allowed_note_roots: BTreeSet<NoteScriptRoot> = NoteKind::NETWORK_KINDS
         .iter()
         .map(|kind| ZekeNote::get_note_script(client.code_builder(), kind.masm_name()))
@@ -85,7 +95,11 @@ pub async fn deploy_vault(
     Ok(vault_contract)
 }
 
-pub fn build_vault_component(cb: CodeBuilder, operator_id: AccountId) -> Result<AccountComponent> {
+pub fn build_vault_component(
+    cb: CodeBuilder,
+    operator_id: AccountId,
+    pool_user_capacity: u32,
+) -> Result<AccountComponent> {
     // storage-less pool build just to extract the FPI proc root (breaks the circular
     // vault <-> pool dependency; MAST roots do not depend on storage)
     let pool_proc_root = pool_balance_details_proc_root(cb.clone())?;
@@ -94,6 +108,8 @@ pub fn build_vault_component(cb: CodeBuilder, operator_id: AccountId) -> Result<
     print_library_exports(lib.as_library());
 
     let zero_word = Word::new([Felt::ZERO; 4]);
+    let capacity_felt = Felt::new(u64::from(pool_user_capacity))
+        .map_err(|error| anyhow!("invalid pool_user_capacity {pool_user_capacity}: {error:?}"))?;
 
     let component = AccountComponent::new(
         lib,
@@ -105,6 +121,11 @@ pub fn build_vault_component(cb: CodeBuilder, operator_id: AccountId) -> Result<
             StorageSlot::with_empty_map(storage_slot_name(AUTHORIZED_POOLS_SLOT)),
             StorageSlot::with_empty_map(storage_slot_name(USER_POOL_SLOT)),
             StorageSlot::with_value(storage_slot_name(ACTIVE_POOL_SLOT), zero_word),
+            StorageSlot::with_value(
+                storage_slot_name(POOL_USER_CAPACITY_SLOT),
+                Word::from([capacity_felt, Felt::ZERO, Felt::ZERO, Felt::ZERO]),
+            ),
+            StorageSlot::with_empty_map(storage_slot_name(POOL_USER_COUNTS_SLOT)),
             StorageSlot::with_value(
                 storage_slot_name(OPERATOR_ACCOUNT_ID_SLOT),
                 Word::from([
@@ -182,6 +203,53 @@ pub fn vault_user_registration(
         return Ok(None);
     }
     Ok(Some(pubkey))
+}
+
+/// Pool key word for map lookups: `[pool_suffix, pool_prefix, 0, 0]`.
+pub fn vault_pool_key(pool_id: AccountId) -> Word {
+    Word::from([
+        pool_id.suffix(),
+        pool_id.prefix().as_felt(),
+        Felt::ZERO,
+        Felt::ZERO,
+    ])
+}
+
+/// Reads the vault's configured per-pool registration capacity from a storage snapshot.
+pub fn pool_user_capacity_from_storage(storage: &AccountStorage) -> Result<u32> {
+    let word = storage
+        .get_item(&storage_slot_name(POOL_USER_CAPACITY_SLOT))
+        .map_err(|e| anyhow!("failed to read {POOL_USER_CAPACITY_SLOT}: {e:?}"))?;
+    let capacity = word[0].as_canonical_u64();
+    u32::try_from(capacity)
+        .map_err(|_| anyhow!("{POOL_USER_CAPACITY_SLOT} value {capacity} does not fit in u32"))
+}
+
+/// Reads how many users are registered against `pool_id`.
+pub fn pool_user_count_from_storage(storage: &AccountStorage, pool_id: AccountId) -> Result<u32> {
+    let word = storage
+        .get_map_item(
+            &storage_slot_name(POOL_USER_COUNTS_SLOT),
+            vault_pool_key(pool_id),
+        )
+        .map_err(|e| anyhow!("failed to read {POOL_USER_COUNTS_SLOT}: {e:?}"))?;
+    let count = word[0].as_canonical_u64();
+    u32::try_from(count)
+        .map_err(|_| anyhow!("{POOL_USER_COUNTS_SLOT} value {count} does not fit in u32"))
+}
+
+/// Reads the vault's current active pool for new registrations, if set.
+pub fn active_pool_from_storage(storage: &AccountStorage) -> Result<Option<AccountId>> {
+    let pool = storage
+        .get_item(&storage_slot_name(ACTIVE_POOL_SLOT))
+        .map_err(|e| anyhow!("failed to read {ACTIVE_POOL_SLOT}: {e:?}"))?;
+    if pool == Word::new([Felt::ZERO; 4]) {
+        return Ok(None);
+    }
+    Ok(Some(
+        AccountId::try_from_elements(pool[0], pool[1])
+            .map_err(|e| anyhow!("invalid pool account id in {ACTIVE_POOL_SLOT}: {e:?}"))?,
+    ))
 }
 
 /// Reads the authorized pool bound to a user from an already-fetched vault storage snapshot.
@@ -399,7 +467,11 @@ mod tests {
 
         let account = AccountBuilder::new([7; 32])
             .account_type(AccountType::Public)
-            .with_component(build_vault_component(code_builder, operator_id)?)
+            .with_component(build_vault_component(
+                code_builder,
+                operator_id,
+                DEFAULT_POOL_USER_CAPACITY,
+            )?)
             .with_auth_component(AuthNetworkAccount::with_allowed_notes(roots.clone())?)
             .with_component(BasicWallet)
             .build()?;

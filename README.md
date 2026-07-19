@@ -37,7 +37,7 @@ minizeke is a Miden spot-swap prototype. A public network vault holds assets and
 3. Register a user and fund the vault with public network notes.
 4. Authenticate with the vault-registered trading key, then submit a signed order with its Bearer session.
 5. The server quotes the order and assigns it to the user's shard.
-6. The pool verifies the sixteen-felt v2 intent, expiry, and unused client UUID, reads fresh vault totals by FPI, and updates both swap legs in one transaction.
+6. The pool verifies the sixteen-felt v3 intent, expiry, and per-user sliding nonce window, reads fresh vault totals by FPI, and updates both swap legs in one transaction.
 7. Redeem in two notes: initiate the redeem, then consume the redeem note to receive a P2ID payout.
 
 ## Prerequisites
@@ -105,15 +105,19 @@ Optional values:
 - `ASSETS_FILE`: deploy-time asset config. Default: `assets.toml`.
 
 `simulate_traders` takes two numbers: `START` and `MAX` (defaults `20` `100`).
-It pre-stages all `MAX` traders, starts `START`, then activates about eight equal
-stages at one-minute intervals. Every trader submits every 10 seconds with 20%
-jitter and tracks up to two unsettled orders over one persistent WebSocket. The
-server default supports 256 same-host trader connections; set
-`WS_PER_IP_CONNECTION_CAP` only when testing a larger `MAX`.
+It fully funds `START` traders, begins trading immediately, then live-onboards the
+rest in the background until `MAX`. It is an HTTP/client only: pool shards are
+created by the server provisioner when registration capacity runs low. Registration
+retries on `VAULT: active pool user capacity reached` until a spare shard is
+activated. Every trader submits every 10 seconds with 20% jitter and tracks up to
+two unsettled orders over one persistent WebSocket. The server default supports 256
+same-host trader connections; set `WS_PER_IP_CONNECTION_CAP` only when testing a
+larger `MAX`.
 
-Completed cohorts are reused on later runs when the network, vault, and requested
-`MAX` match. Simulator state, keys, and SQLite stores live under
-`simulation_stores/`; delete that directory to intentionally create a fresh cohort.
+Completed cohorts are reused on later runs when the network and vault match.
+Partial cohorts resume and keep growing toward `MAX`. Simulator state, keys, and
+SQLite stores live under `simulation_stores/`; delete that directory to
+intentionally create a fresh cohort.
 
 ```sh
 cargo run --bin simulate_traders -- 20 100
@@ -121,7 +125,9 @@ cargo run --bin simulate_traders -- 20 100
 
 ## Deploy
 
-`spawn` creates the operator, configured faucets, vault, first pool shard, authorization note, and schema-v3 deployment file:
+`spawn` creates the operator, configured faucets, vault (with on-chain
+`pool_user_capacity`), first pool shard, authorization note, and schema-5
+deployment file:
 
 ```sh
 cargo run --bin spawn
@@ -132,6 +138,26 @@ It refuses to overwrite an existing deployment file. To replace it:
 ```sh
 SPAWN_FORCE=1 cargo run --bin spawn
 ```
+
+`SPAWN_FORCE` only redeploys on-chain accounts and overwrites `deployment.*.json`. Local
+SQLite state still points at the previous faucets/vault, so wipe it before restarting:
+
+```sh
+rm -f lp.testnet.sqlite3 execution.testnet.sqlite3 history.testnet.sqlite3 \
+  auth.testnet.sqlite3 fees.testnet.sqlite3 analytics.testnet.sqlite3 \
+  pool_provision.testnet.sqlite3
+```
+
+Adjust filenames if `MIDEN_NETWORK` or `*_DB_PATH` overrides differ. Skipping this leaves
+applied LP journal rows for dead faucet IDs and the server panics on init.
+
+Pool/vault account **code** lives on-chain. Changes to `masm/accounts/pool.masm` or
+`masm/accounts/vault.masm` (nonce windows, registration capacity) change account code
+roots, so existing deployments keep the old program until you `SPAWN_FORCE` redeploy,
+re-seed with `deposit_pools`, wipe local SQLite as above, and restart the server.
+
+Optional spawn knobs: `POOL_USER_CAPACITY` (default 16) and `ASSET_CAPACITY` (default 15).
+They must satisfy `pool_user_capacity * asset_capacity <= 247`.
 
 Assets are defined in `assets.toml`. `ASSETS_FILE` can point to another file. The default config deploys BTC, ETH, and USDC:
 
@@ -217,24 +243,29 @@ Add the asset to `assets.toml` first. `add_asset` reads its decimals and max sup
 
 The deposit is skipped when the deployment has no `lp_account_id`.
 
-Deploy and authorize another pool shard:
+The running server automatically provisions additional pool shards when the active
+shard's registration count approaches capacity (see `POOL_PROVISION_RESERVE_USERS`,
+default 4). For a manual admin deploy:
 
 ```sh
 cargo run --bin spawn_pool
 ```
 
-This shard becomes the vault's active pool for later registrations. Existing users keep their recorded shard.
+That publishes the shard into `deployment.json` and sets it as the vault's active
+pool for later registrations. Existing users keep their recorded shard.
 
 ## Deployment file
 
-Schema version 2 has this shape:
+Schema version 5 has this shape:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 5,
   "network": "testnet",
   "operator_account_id": "0x...",
   "vault_id": "0x...",
+  "pool_user_capacity": 16,
+  "asset_capacity": 15,
   "assets": [
     {
       "faucet_id": "0x...",
@@ -255,7 +286,7 @@ Schema version 2 has this shape:
 }
 ```
 
-- `schema_version`: must be `3`.
+- `schema_version`: must be `4`.
 - `network`: must equal the active `MIDEN_NETWORK`.
 - `operator_account_id`: account allowed to authorize pools and checkpoint LP entitlements.
 - `vault_id`: public network account holding assets and custody counters.
@@ -286,7 +317,8 @@ The main server exposes:
 - `GET /users/{id}/placement`: the user's vault-assigned shard and allocated asset cells.
 - `GET /depth`: derived depth for hex `base` and `quote` faucet IDs.
 - `GET /ws`: order, pool, oracle, user, and stats events.
-- `POST /orders/new`: submit a v2 signed intent, base64 signature, and base64 public key.
+- `POST /orders/nonce`: authenticated lease of the next per-user order nonce and client UUID.
+- `POST /orders/new`: submit a v3 signed intent, base64 signature, and base64 public key.
 - `POST /mint`: proxy a mint request to the faucet process.
 - `POST /lp/deposits/note`: quote and build a self-custodial DEPOSIT note. The response
   contains a base64-encoded public note for the LP to submit from its own account.

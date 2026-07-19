@@ -43,6 +43,8 @@ const USER_PUBKEYS_SLOT = word("zorovault::user_pubkeys")
 const AUTHORIZED_POOLS_SLOT = word("zorovault::authorized_pools")
 const USER_POOL_SLOT = word("zorovault::user_pool")
 const ACTIVE_POOL_SLOT = word("zorovault::active_pool")
+const POOL_USER_CAPACITY_SLOT = word("zorovault::pool_user_capacity")
+const POOL_USER_COUNTS_SLOT = word("zorovault::pool_user_counts")
 const LP_ENTITLEMENTS_SLOT = word("zorovault::lp_entitlements")
 const LP_WITHDRAWN_SLOT = word("zorovault::lp_withdrawn")
 const OPERATOR_ACCOUNT_ID_SLOT = word("zorovault::operator_account_id")
@@ -58,6 +60,7 @@ const ERR_USER_NOT_REGISTERED = "VAULT: user is not registered"
 const ERR_USER_ALREADY_REGISTERED = "VAULT: user is already registered"
 const ERR_UNAUTHORIZED_POOL = "VAULT: pool is not authorized"
 const ERR_UNAUTHORIZED_OPERATOR = "VAULT: note sender is not the configured operator"
+const ERR_POOL_USER_CAPACITY_REACHED = "VAULT: active pool user capacity reached"
 
 # ----------------------------------------------------------------------------------------------
 # ID / KEY HELPERS
@@ -155,7 +158,8 @@ end
 #! Inputs:  [PK_COMM, user_suffix, user_prefix]
 #! Outputs: []
 #!
-#! Panics if the user is already registered or the active pool is not authorized.
+#! Panics if the user is already registered, the active pool is not authorized, or the
+#! active pool has already reached `pool_user_capacity` registered users.
 const RU_PK_LOCAL = 0
 const RU_USER_KEY_LOCAL = 4
 const RU_POOL_KEY_LOCAL = 8
@@ -178,6 +182,30 @@ pub proc register_user
     # => [POOL_KEY]
     dupw exec.assert_authorized_pool
     loc_storew_be.RU_POOL_KEY_LOCAL dropw
+    # => []
+
+    # Enforce per-pool registration capacity before binding the user.
+    # Load count, keep a copy, then load capacity; `lt` = next < top => count < capacity.
+    padw loc_loadw_be.RU_POOL_KEY_LOCAL
+    push.POOL_USER_COUNTS_SLOT[0..2]
+    exec.active_account::get_map_item
+    movdn.3 drop drop drop
+    # => [count]
+    dup
+    push.POOL_USER_CAPACITY_SLOT[0..2]
+    exec.active_account::get_item
+    movdn.3 drop drop drop
+    # => [capacity, count, count]
+    lt assert.err=ERR_POOL_USER_CAPACITY_REACHED
+    # => [count]
+
+    # POOL_USER_COUNTS[POOL_KEY] = count + 1
+    push.1 add
+    push.0.0.0 movup.3
+    # => [COUNT_WORD] = [new_count, 0, 0, 0] with new_count on top
+    padw loc_loadw_be.RU_POOL_KEY_LOCAL
+    push.POOL_USER_COUNTS_SLOT[0..2]
+    exec.native_account::set_map_item dropw
     # => []
 
     # USER_POOL[USER_KEY] = POOL_KEY

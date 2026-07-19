@@ -26,14 +26,12 @@ use tokio::{
     task::JoinSet,
 };
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::{
     deployment::{AssetInfo, Deployment},
     intent::Intent,
     miden_env::{MidenNetwork, miden_debug_mode_enabled},
     order::OrderDetails,
-    pool::deploy_pool,
     simulate::{
         api::{OrderOutcome, Session, SimulationApi},
         config::{Config, TraderTier},
@@ -42,11 +40,10 @@ use crate::{
         ws::{self, TerminalOrderStatus},
     },
     test_utils::{
-        consume_all_notes_for, consume_all_notes_for_setup, fund_user_on_vault, get_client,
-        get_pool_client_for, init_redeem_on_vault, redeem_on_vault,
-        register_and_fund_user_on_vault,
+        consume_all_notes_for, consume_all_notes_for_setup, fund_user_on_vault,
+        init_redeem_on_vault, redeem_on_vault, register_and_fund_user_on_vault,
     },
-    vault::{add_pool_to_vault, get_vault_user_asset_info},
+    vault::get_vault_user_asset_info,
 };
 
 /// Shared registry of live traders (growth + vault cycles).
@@ -106,10 +103,42 @@ struct SetupJob {
     assets: Vec<AssetInfo>,
     fund_amount: u64,
     metrics: Metrics,
-    /// Pool-assignment wave; worker waits until the coordinator activates this wave.
-    shard_wave: usize,
-    shard_wave_rx: watch::Receiver<Option<usize>>,
-    shard_done_tx: mpsc::Sender<usize>,
+}
+
+const CAPACITY_RETRY_ATTEMPTS: usize = 60;
+const CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+fn is_pool_capacity_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("active pool user capacity reached")
+}
+
+/// REGISTER binds the user to the vault's current ACTIVE_POOL. When that shard is full the
+/// server provisioner rotates ACTIVE_POOL; retry until capacity appears.
+async fn register_and_fund_with_capacity_retry(
+    client: &mut Client<FilesystemKeyStore>,
+    vault_id: AccountId,
+    user_id: AccountId,
+    pubkey: Word,
+    fund_assets: &[FungibleAsset],
+    trader_index: usize,
+) -> Result<()> {
+    for attempt in 1..=CAPACITY_RETRY_ATTEMPTS {
+        match register_and_fund_user_on_vault(client, vault_id, user_id, pubkey, fund_assets).await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if is_pool_capacity_error(&error) && attempt < CAPACITY_RETRY_ATTEMPTS => {
+                warn!(
+                    trader = trader_index,
+                    attempt, "active pool at registration capacity; waiting for server provisioner"
+                );
+                tokio::time::sleep(CAPACITY_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(anyhow!(
+        "trader {trader_index} exhausted registration capacity retries"
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -289,12 +318,16 @@ pub async fn setup_traders(
     client: &mut Client<FilesystemKeyStore>,
     keystore: &FilesystemKeyStore,
 ) -> Result<Vec<Trader>> {
-    let tiers = config.tier_assignments();
-    info!(traders = config.max_traders, "creating trader wallets");
+    // Only fund START up front so trading can begin; MAX - START live-onboard later.
+    let initial = config.num_traders;
+    let tiers = vec![TraderTier::HighFrequency; initial];
+    info!(
+        traders = initial,
+        max_traders = config.max_traders,
+        "creating initial trader wallets"
+    );
 
-    ensure_pool_shards(config, deployment, config.max_traders).await?;
-
-    let mut traders = Vec::with_capacity(config.max_traders);
+    let mut traders = Vec::with_capacity(initial);
     for (index, tier) in tiers.into_iter().enumerate() {
         let wallet = create_wallet(client, keystore).await?;
         debug!(
@@ -315,10 +348,6 @@ pub async fn setup_traders(
     // Workers must add_account (and thus track note tags) *before* mint notes are
     // committed. Fresh stores created after mint sync at tip with notes=0 forever.
     let concurrency = config.setup_concurrency.min(traders.len()).max(1);
-    let max_users = config.max_users_per_pool;
-    let num_waves = traders.len().div_ceil(max_users);
-    let (shard_wave_tx, shard_wave_rx) = watch::channel(None::<usize>);
-    let (shard_done_tx, mut shard_done_rx) = mpsc::channel(traders.len());
     let mut jobs = Vec::with_capacity(traders.len());
     for trader in &traders {
         let account = client
@@ -337,20 +366,12 @@ pub async fn setup_traders(
             assets: deployment.assets.clone(),
             fund_amount: config.fund_amount,
             metrics: metrics.clone(),
-            shard_wave: trader.index / max_users,
-            shard_wave_rx: shard_wave_rx.clone(),
-            shard_done_tx: shard_done_tx.clone(),
         });
     }
-    drop(shard_done_tx);
 
     info!(
         traders = traders.len(),
-        concurrency,
-        pools = deployment.pools.len(),
-        max_users_per_pool = max_users,
-        waves = num_waves,
-        "preparing worker clients before mint"
+        concurrency, "preparing worker clients before mint (server owns pool topology)"
     );
     let (mint_done_tx, mint_done_rx) = watch::channel(false);
     let (ready_tx, mut ready_rx) = mpsc::channel(traders.len());
@@ -389,109 +410,13 @@ pub async fn setup_traders(
         .send(true)
         .map_err(|_| anyhow!("no setup workers waiting for mint"))?;
 
-    for wave in 0..num_waves {
-        activate_pool_wave(deployment, wave).await?;
-        shard_wave_tx
-            .send(Some(wave))
-            .map_err(|_| anyhow!("no setup workers waiting for shard wave {wave}"))?;
-        let wave_size = traders
-            .iter()
-            .filter(|trader| trader.index / max_users == wave)
-            .count();
-        for completed in 1..=wave_size {
-            shard_done_rx
-                .recv()
-                .await
-                .ok_or_else(|| anyhow!("setup worker exited before finishing shard wave {wave}"))?;
-            if completed == wave_size || completed % 5 == 0 {
-                info!(wave, completed, wave_size, "shard wave register progress");
-            }
-        }
-    }
-
     while let Some(joined) = set.join_next().await {
         joined.map_err(|error| anyhow!("setup worker join failed: {error}"))??;
     }
 
     save_state(config, deployment, &traders, true)?;
-    info!(
-        traders = traders.len(),
-        pools = deployment.pools.len(),
-        "parallel trader setup complete"
-    );
+    info!(traders = traders.len(), "parallel trader setup complete");
     Ok(traders)
-}
-
-/// Ensure `ceil(trader_count / max_users_per_pool)` pools exist and are listed in deployment.
-async fn ensure_pool_shards(
-    config: &Config,
-    deployment: &mut Deployment,
-    trader_count: usize,
-) -> Result<()> {
-    let needed = trader_count.div_ceil(config.max_users_per_pool).max(1);
-    let pools_before = deployment.pools.len();
-    while deployment.pools.len() < needed {
-        let pool_index = deployment.pools.len();
-        info!(
-            pool_index,
-            needed, "deploying additional pool shard for user cap"
-        );
-        let mut deploy_client = crate::test_utils::get_pool_client().await?;
-        deploy_client.ensure_genesis_in_place().await?;
-        deploy_client.sync_state().await?;
-        let pool_id = deploy_pool(&mut deploy_client, deployment.vault_id)
-            .await?
-            .id();
-        let mut operator = get_client().await?;
-        operator.ensure_genesis_in_place().await?;
-        operator.sync_state().await?;
-        add_pool_to_vault(
-            &mut operator,
-            deployment.operator_account_id,
-            deployment.vault_id,
-            pool_id,
-        )
-        .await?;
-        // Warm the per-pool execution store so the server can attach later.
-        let mut shard_client = get_pool_client_for(pool_id).await?;
-        shard_client.ensure_genesis_in_place().await?;
-        shard_client.import_account_by_id(pool_id).await?;
-        shard_client.sync_state().await?;
-        deployment.pools.push(pool_id);
-        deployment.save()?;
-        info!(pool = %pool_id.to_hex(), pools = deployment.pools.len(), "pool shard added");
-    }
-    if deployment.pools.len() > pools_before {
-        let pools = deployment.pools.len();
-        warn!(
-            pools,
-            "deployment now has {pools} pools — restart the API server before trading (or rely on hot-attach)"
-        );
-        eprintln!(
-            "WARNING: deployment now has {pools} pools — restart the API server before trading"
-        );
-    }
-    Ok(())
-}
-
-/// Re-assert ACTIVE_POOL for this registration wave (safe if already authorized).
-async fn activate_pool_wave(deployment: &Deployment, wave: usize) -> Result<()> {
-    let pool_id = *deployment
-        .pools
-        .get(wave)
-        .ok_or_else(|| anyhow!("missing pool for shard wave {wave}"))?;
-    let mut operator = get_client().await?;
-    operator.ensure_genesis_in_place().await?;
-    operator.sync_state().await?;
-    add_pool_to_vault(
-        &mut operator,
-        deployment.operator_account_id,
-        deployment.vault_id,
-        pool_id,
-    )
-    .await?;
-    info!(wave, pool = %pool_id.to_hex(), "activated pool for registration wave");
-    Ok(())
 }
 
 /// Fire concurrent faucet mints for every (trader, asset). Consumption happens in workers.
@@ -580,9 +505,6 @@ async fn onboard_trader(
         assets,
         fund_amount,
         metrics,
-        shard_wave,
-        mut shard_wave_rx,
-        shard_done_tx,
     } = job;
 
     let prepare_slot = prepare_slots
@@ -632,34 +554,29 @@ async fn onboard_trader(
         .to_commitment()
         .into();
 
-    // Do not hold prove slots while waiting for the coordinator to activate this wave.
-    shard_wave_rx
-        .wait_for(|wave| matches!(wave, Some(w) if *w >= shard_wave))
-        .await
-        .map_err(|_| anyhow!("shard wave signal closed before trader {index} registered"))?;
-
     let started = Instant::now();
     {
         let _prove_slot = prove_slots
             .acquire()
             .await
             .map_err(|_| anyhow!("prove slot closed for trader {index} register"))?;
-        register_and_fund_user_on_vault(&mut client, vault_id, user_id, pubkey, &fund_assets)
-            .await
-            .with_context(|| format!("register/fund trader {index} on vault"))?;
+        register_and_fund_with_capacity_retry(
+            &mut client,
+            vault_id,
+            user_id,
+            pubkey,
+            &fund_assets,
+            index,
+        )
+        .await
+        .with_context(|| format!("register/fund trader {index} on vault"))?;
     }
     let elapsed = started.elapsed();
     metrics.record_setup(index, tier, SetupPhase::Register, elapsed);
     metrics.record_setup(index, tier, SetupPhase::Fund, elapsed);
 
-    shard_done_tx
-        .send(index)
-        .await
-        .map_err(|_| anyhow!("setup coordinator dropped after trader {index} registered"))?;
-
     debug!(
         trader = index,
-        shard_wave,
         user = %user_id.to_hex(),
         elapsed_ms = elapsed.as_millis(),
         "trader setup complete"
@@ -836,17 +753,19 @@ pub async fn load_traders(
     if !state.setup_complete && !legacy_setup_looks_complete(config, state.traders.len()) {
         bail!("saved trader setup did not complete");
     }
-    if state.traders.len() < config.max_traders {
-        bail!(
-            "state file contains {} traders, but {} were requested",
-            state.traders.len(),
-            config.max_traders
+    if state.traders.is_empty() {
+        bail!("state file contains no traders");
+    }
+    if state.traders.len() > config.max_traders {
+        warn!(
+            saved = state.traders.len(),
+            max = config.max_traders,
+            "state file has more traders than MAX; using the first MAX"
         );
     }
 
-    let tiers = config.tier_assignments();
-    let mut traders = Vec::with_capacity(config.max_traders);
-    for (tier, saved) in tiers.into_iter().zip(state.traders.into_iter()) {
+    let mut traders = Vec::with_capacity(state.traders.len().min(config.max_traders));
+    for saved in state.traders.into_iter().take(config.max_traders) {
         let user_id = AccountId::from_hex(&saved.user_id)
             .map_err(|error| anyhow!("invalid trader user id: {error}"))?;
         let keys = keystore
@@ -861,7 +780,7 @@ pub async fn load_traders(
             .ok_or_else(|| anyhow!("trader {} key is missing from the keystore", saved.index))?;
         traders.push(Trader {
             index: saved.index,
-            tier,
+            tier: TraderTier::HighFrequency,
             user_id,
             key,
         });
@@ -870,14 +789,14 @@ pub async fn load_traders(
 }
 
 fn legacy_setup_looks_complete(config: &Config, trader_count: usize) -> bool {
-    if trader_count < config.max_traders {
+    if trader_count == 0 {
         return false;
     }
     let Ok(state_modified) = std::fs::metadata(&config.state_file).and_then(|meta| meta.modified())
     else {
         return false;
     };
-    (0..config.max_traders).all(|index| {
+    (0..trader_count).all(|index| {
         let path = worker_store_path(&config.store_path, index);
         std::fs::metadata(path)
             .and_then(|meta| meta.modified())
@@ -1028,7 +947,10 @@ async fn trade_once(
         tracker.update_token(token).await;
     }
 
-    let client_order_id = Uuid::new_v4();
+    let (_nonce, client_order_id) = api
+        .reserve_order_nonce(&current_session)
+        .await
+        .context("reserve server-issued order nonce")?;
     let expires_at = now.saturating_add(config.intent_ttl_secs);
     let intent = Intent::new_swap(
         trader.user_id,
@@ -1247,7 +1169,7 @@ pub async fn run_growth_loop(
     }
     let mut grow = tokio::time::interval(Duration::from_secs(config.grow_interval_secs));
     grow.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    grow.tick().await;
+    // Keep the first immediate tick so growth starts as soon as trading begins.
 
     let mut next_index = {
         let guard = registry.lock().await;
@@ -1341,6 +1263,7 @@ pub async fn run_growth_loop(
                                         continue;
                                     }
                                 };
+                                metrics.set_active_traders(registry.lock().await.len());
                                 child_tasks.spawn(run_trader(
                                     trader,
                                     config.clone(),
@@ -1501,22 +1424,7 @@ async fn onboard_live_trader(
     prove_slots: &Arc<Semaphore>,
     index: usize,
 ) -> Result<Trader> {
-    let wave = index / config.max_users_per_pool;
-    // Pool deploy / ACTIVE_POOL / deployment.save all use the shared operator store.
-    // Reload under the lock so concurrent onboards see each other's new pools.
-    let deployment = {
-        let _shared = LIVE_ONBOARD_SHARED.lock().await;
-        let mut deployment = Deployment::load().context("load deployment for live onboard")?;
-        info!(trader = index, "live onboard: ensuring pool shards");
-        ensure_pool_shards(config, &mut deployment, index + 1)
-            .await
-            .with_context(|| format!("ensure pool shards for live trader {index}"))?;
-        info!(trader = index, wave, "live onboard: activating pool wave");
-        activate_pool_wave(&deployment, wave)
-            .await
-            .with_context(|| format!("activate pool wave {wave} for live trader {index}"))?;
-        deployment
-    };
+    let deployment = Deployment::load().context("load deployment for live onboard")?;
 
     // Isolated worker store only — never open the shared main sim store (it accumulates every
     // prior trader and can hang/fail note sync under the NTL tag cap).
@@ -1606,12 +1514,13 @@ async fn onboard_live_trader(
             .acquire()
             .await
             .map_err(|_| anyhow!("prove slot closed for live trader {index}"))?;
-        register_and_fund_user_on_vault(
+        register_and_fund_with_capacity_retry(
             &mut worker,
             deployment.vault_id,
             trader.user_id,
             pubkey,
             &fund_assets,
+            index,
         )
         .await
         .with_context(|| format!("register/fund live trader {index} on vault"))?;
@@ -1930,13 +1839,24 @@ mod load_tests {
 
     use tokio::sync::Semaphore;
 
-    use super::{MAX_IN_FLIGHT_PER_TRADER, SimulationState, activation_stage_size};
+    use super::{
+        MAX_IN_FLIGHT_PER_TRADER, SimulationState, activation_stage_size, is_pool_capacity_error,
+    };
 
     #[test]
     fn derives_eight_stable_activation_stages() {
         assert_eq!(activation_stage_size(20, 100), 10);
         assert_eq!(activation_stage_size(20, 21), 1);
         assert_eq!(activation_stage_size(100, 100), 1);
+    }
+
+    #[test]
+    fn detects_vault_capacity_errors_for_retry() {
+        let error = anyhow::anyhow!("note failed: VAULT: active pool user capacity reached");
+        assert!(is_pool_capacity_error(&error));
+        assert!(!is_pool_capacity_error(&anyhow::anyhow!(
+            "insufficient balance"
+        )));
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ deployment or network:
 cargo fmt --check
 cargo check --all-targets
 cargo test --lib
-cargo test intent::tests::masm_v2_hash_matches_rust_golden --lib -- --nocapture
+cargo test intent::tests::masm_v3_hash_matches_rust_golden --lib -- --nocapture
 cargo test --test remediation_harness -- --list
 ```
 
@@ -24,11 +24,20 @@ MIDEN_NETWORK=localhost cargo test --test swap -- --nocapture
 The remote suites submit transactions and consume funded notes. Use a disposable deployment,
 run one suite at a time, and preserve its logs and deployment schema version.
 
+Pool/vault MASM changes (nonce windows, registration capacity) and deployment schema
+bumps require a fresh deploy: `SPAWN_FORCE=1 cargo run --bin spawn`,
+`cargo run --bin deposit_pools`, wipe local SQLite (`lp` / `execution` /
+`pool_provision` / related `*.sqlite3`), and a server restart.
+
+The server-owned pool provisioner journals work in `pool_provision.*.sqlite3`. After
+restart it resumes in-flight provisions and never lets clients mutate topology.
+`simulate_traders` must not call `spawn_pool` or rewrite `deployment.json`.
+
 ## Orders per second
 
-Prepare an array of independently signed, unexpired v2 order requests. Every entry needs a
-unique `client_order_id`; repeating an entry measures idempotent replay throughput rather than
-new-order admission throughput.
+Prepare an array of independently signed, unexpired v3 order requests. Every entry needs a
+server-leased `client_order_id`; repeating an entry measures idempotent replay throughput rather
+than new-order admission throughput.
 
 ```sh
 LOAD_BASE_URL=http://127.0.0.1:7799 \

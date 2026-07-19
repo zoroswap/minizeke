@@ -15,7 +15,7 @@ use crate::{
     oracle_sse::OraclePricing,
     order::{Created, Order, OrderExecutionResult, OrderFailureReason, OrderUpdate, Orders},
     pool::{
-        LpLedger, PoolBalances, PoolState, fetch_account_storage_from_rpc,
+        LpLedger, PoolBalances, PoolState, fetch_vault_user_placement_storage,
         get_user_available_balance_from_pool,
     },
     pool_registry::PoolRegistry,
@@ -181,7 +181,7 @@ impl Processing {
         if let Some(pool_id) = self.user_pools.get(&user_id) {
             return Ok(*pool_id);
         }
-        let storage = fetch_account_storage_from_rpc(self.vault_id).await?;
+        let storage = fetch_vault_user_placement_storage(self.vault_id, user_id).await?;
         let pool_id = user_pool_from_storage(&storage, user_id)?
             .ok_or_else(|| anyhow!("user {} has no assigned pool", user_id.to_hex()))?;
         if !self.pool_registry.contains(&pool_id)

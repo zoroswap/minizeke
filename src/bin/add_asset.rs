@@ -4,7 +4,7 @@
 //! ASSET_SYMBOL=USDC cargo run --bin add_asset
 //! ```
 
-use std::{env, fs};
+use std::env;
 
 use anyhow::{Context, Result, bail};
 use dotenv::dotenv;
@@ -23,22 +23,6 @@ fn required_env(name: &str) -> Result<String> {
         bail!("{name} must not be empty");
     }
     Ok(value.to_string())
-}
-
-fn save_atomically(deployment: &Deployment) -> Result<()> {
-    let path = Deployment::path();
-    let temp_path = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("json")
-    ));
-    let contents = serde_json::to_string_pretty(deployment)?;
-    fs::write(&temp_path, contents)
-        .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    fs::rename(&temp_path, &path)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
 }
 
 #[tokio::main]
@@ -69,6 +53,13 @@ async fn main() -> Result<()> {
         .unwrap_or(initial_liquidity_base_units(&config)?);
 
     let mut deployment = Deployment::load()?;
+    if deployment.assets.len() as u32 >= deployment.asset_capacity {
+        bail!(
+            "cannot add asset: deployment already has {} assets (asset_capacity={})",
+            deployment.assets.len(),
+            deployment.asset_capacity
+        );
+    }
     if deployment
         .assets
         .iter()
@@ -123,7 +114,7 @@ async fn main() -> Result<()> {
     if let Some(deposit) = deposit {
         deployment.deposits.push(deposit);
     }
-    save_atomically(&deployment)?;
+    deployment.save()?;
 
     println!(
         "[ADD_ASSET] added {} to {}",

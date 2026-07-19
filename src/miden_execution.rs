@@ -29,7 +29,10 @@ use crate::{
     miden_env::MidenNetwork,
     oracle_sse::{fetch_price_feeds, oracle_base_url, validate_asset_feeds},
     order::{Order, OrderFailureReason, OrderUpdate, Orders, Processed},
-    pool::{PoolBalances, PoolMetadata, PoolSettings, PoolState, fetch_account_storage_from_rpc},
+    pool::{
+        PoolBalances, PoolMetadata, PoolSettings, PoolState, fetch_vault_user_placement_storage,
+        fetch_vault_user_registration_storage,
+    },
     pool_registry::PoolRegistry,
     test_utils::{get_pool_client_for, vault_foreign_account},
     vault::{user_pool_from_storage, vault_user_registration},
@@ -218,13 +221,16 @@ impl MidenExecution {
         })
     }
 
-    /// Import + sync a pool client when the shard is listed in deployment but was
-    /// missing at process start (sim spawned an extra pool after the server booted).
+    /// Import + sync a pool client when the shard is listed but not yet attached locally.
     async fn ensure_pool_attached(&mut self, pool_id: AccountId) -> Result<()> {
         if self.pool_clients.contains_key(&pool_id) {
+            self.pool_registry
+                .acknowledge(pool_id, crate::pool_registry::PoolWorker::Execution);
             return Ok(());
         }
-        if !self.pool_registry.ensure_from_deployment(pool_id)? {
+        if !self.pool_registry.contains(&pool_id)
+            && !self.pool_registry.ensure_from_deployment(pool_id)?
+        {
             return Err(anyhow!(
                 "user is assigned to unlisted pool {}",
                 pool_id.to_hex()
@@ -236,11 +242,25 @@ impl MidenExecution {
         client.import_account_by_id(pool_id).await?;
         client.sync_state().await?;
         self.pool_clients.insert(pool_id, client);
+        self.pool_registry
+            .acknowledge(pool_id, crate::pool_registry::PoolWorker::Execution);
         info!(
             pool = %pool_id.to_hex(),
-            "attached pool client for hot-loaded shard"
+            "attached pool client for published shard"
         );
         Ok(())
+    }
+
+    async fn attach_pending_pools(&mut self) {
+        for pool_id in self.pool_registry.pending_attach() {
+            if let Err(error) = self.ensure_pool_attached(pool_id).await {
+                warn!(
+                    pool = %pool_id.to_hex(),
+                    %error,
+                    "failed to attach published pool shard"
+                );
+            }
+        }
     }
 
     /// Resolves a trader's vault-assigned pool shard, caching the answer.
@@ -248,7 +268,7 @@ impl MidenExecution {
         if let Some(pool_id) = self.user_pools.get(&user_id) {
             return Ok(*pool_id);
         }
-        let storage = fetch_account_storage_from_rpc(self.vault_id).await?;
+        let storage = fetch_vault_user_placement_storage(self.vault_id, user_id).await?;
         vault_user_registration(&storage, user_id)?
             .ok_or_else(|| anyhow!("user {} is not registered on the vault", user_id.to_hex()))?;
         let pool_id = user_pool_from_storage(&storage, user_id)?
@@ -276,12 +296,20 @@ impl MidenExecution {
         let mut orders_rx = self.message_broker.subscribe_order_updates();
         let mut pool_state_rx = self.message_broker.subscribe_pool_state();
         let mut processed_rx = self.message_broker.subscribe_processed_batch();
+        let mut registry_rx = self.pool_registry.subscribe();
         let mut durable_poll = tokio::time::interval(Duration::from_millis(250));
 
         loop {
             tokio::select! {
                 _ = durable_poll.tick() => {
                     self.poll_durable_work().await;
+                    self.attach_pending_pools().await;
+                }
+                changed = registry_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    self.attach_pending_pools().await;
                 }
                 batch = processed_rx.recv() => {
                     match batch {
@@ -885,8 +913,8 @@ async fn execute_shard_on_client(
 
     let fpi_probe_ms = if execute_fpi_probe_enabled() {
         let probe_started = Instant::now();
-        // Proxy for vault FPI RPC cost (full account details fetch).
-        let _ = fetch_account_storage_from_rpc(vault_id).await;
+        // Proxy for vault FPI RPC cost (targeted registration read).
+        let _ = fetch_vault_user_registration_storage(vault_id, orders[0].user_id()).await;
         Some(probe_started.elapsed().as_millis())
     } else {
         None

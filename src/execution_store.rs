@@ -9,11 +9,13 @@ use std::{
 use alloy_primitives::{I256, U256};
 use anyhow::{Context, Result, anyhow};
 use miden_client::account::AccountId;
+use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     analytics_store::FinalizedSwap,
+    nonce_window::{client_order_id_for_nonce, nonce_from_client_order_id},
     order::{DurableOrder, Order, Processed},
     pool::{PoolBalances, PoolMetadata, PoolSettings, PoolState},
 };
@@ -43,21 +45,36 @@ pub fn max_admitted_age_ms() -> u64 {
         .max(1)
 }
 
-/// Typed admit rejection (mapped to HTTP 503 by the API).
+/// Typed admit rejection (mapped to HTTP 503/409 by the API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmitError {
     QueueFull,
+    UnknownNonceLease,
+    NonceLeaseConflict,
 }
 
 impl std::fmt::Display for AdmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::QueueFull => write!(f, "execution queue is full"),
+            Self::UnknownNonceLease => {
+                write!(f, "client_order_id was not leased by this service")
+            }
+            Self::NonceLeaseConflict => {
+                write!(f, "client_order_id lease does not match the signed intent")
+            }
         }
     }
 }
 
 impl std::error::Error for AdmitError {}
+
+/// Server-issued order nonce + client UUID lease returned before signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceLease {
+    pub nonce: u32,
+    pub client_order_id: uuid::Uuid,
+}
 
 #[derive(Debug, Clone)]
 pub struct ProposedSwap {
@@ -205,9 +222,23 @@ impl ExecutionStore {
                 order_id TEXT NOT NULL UNIQUE,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_nonce_allocators (
+                user_id TEXT PRIMARY KEY,
+                next_nonce INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS nonce_leases (
+                client_order_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                nonce INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, nonce)
+            );
+            CREATE INDEX IF NOT EXISTS idx_nonce_leases_user
+                ON nonce_leases(user_id, nonce);
             CREATE TABLE IF NOT EXISTS durable_orders (
                 order_id TEXT PRIMARY KEY,
                 client_order_id TEXT NOT NULL UNIQUE,
+                order_nonce INTEGER,
                 payload TEXT NOT NULL,
                 state TEXT NOT NULL,
                 claim_owner TEXT,
@@ -286,6 +317,12 @@ impl ExecutionStore {
                 [],
             )?;
         }
+        if !column_exists(&connection, "durable_orders", "order_nonce")? {
+            connection.execute(
+                "ALTER TABLE durable_orders ADD COLUMN order_nonce INTEGER",
+                [],
+            )?;
+        }
         // Upgrade: split the combined active-batch unique index so pending and claimed
         // each allow at most one row (a claimed batch no longer blocks a new pending).
         connection.execute_batch(
@@ -316,6 +353,48 @@ impl ExecutionStore {
         self.connection
             .lock()
             .map_err(|_| anyhow!("execution database lock poisoned"))
+    }
+
+    /// Atomically allocates the next per-user order nonce and a client UUID whose first
+    /// limb encodes that nonce. Unused leases are permanent gaps and are safe.
+    pub fn allocate_nonce_lease(&self, user_id: AccountId, created_at: u64) -> Result<NonceLease> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let user_hex = user_id.to_hex();
+        tx.execute(
+            "INSERT INTO user_nonce_allocators (user_id, next_nonce)
+             VALUES (?1, 0)
+             ON CONFLICT(user_id) DO NOTHING",
+            [&user_hex],
+        )?;
+        let next_nonce: i64 = tx.query_row(
+            "SELECT next_nonce FROM user_nonce_allocators WHERE user_id = ?1",
+            [&user_hex],
+            |row| row.get(0),
+        )?;
+        let nonce = u32::try_from(next_nonce).context("nonce allocator overflowed u32")?;
+        let mut random = [0_u8; 12];
+        rand::rng().fill_bytes(&mut random);
+        let client_order_id = client_order_id_for_nonce(nonce, random);
+        tx.execute(
+            "UPDATE user_nonce_allocators SET next_nonce = ?2 WHERE user_id = ?1",
+            params![user_hex, i64::from(nonce) + 1],
+        )?;
+        tx.execute(
+            "INSERT INTO nonce_leases (client_order_id, user_id, nonce, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                client_order_id.to_string(),
+                user_id.to_hex(),
+                i64::from(nonce),
+                to_i64(created_at)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(NonceLease {
+            nonce,
+            client_order_id,
+        })
     }
 
     /// Atomically reserves a signed client UUID before an order is published. The
@@ -367,9 +446,9 @@ impl ExecutionStore {
         })
     }
 
-    /// Atomically reserves the v2 nonce, commits the complete order, appends its first
-    /// lifecycle event, and creates a durable wakeup. Returning `New` means all four
-    /// records are committed.
+    /// Atomically validates the durable nonce lease, reserves the client UUID,
+    /// commits the complete order, appends its first lifecycle event, and creates a
+    /// durable wakeup. Returning `New` means all records are committed.
     pub fn admit_order(
         &self,
         client_order_id: uuid::Uuid,
@@ -396,6 +475,7 @@ impl ExecutionStore {
     ) -> Result<IntentReservation> {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let order_nonce = validate_nonce_lease(&tx, client_order_id, order.user_id())?;
         let existing = tx
             .query_row(
                 "SELECT intent_commitment, order_id FROM intent_reservations
@@ -416,11 +496,12 @@ impl ExecutionStore {
                 durable.id = order_id;
                 tx.execute(
                     "INSERT INTO durable_orders
-                     (order_id, client_order_id, payload, state, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'admitted', ?4, ?4)",
+                     (order_id, client_order_id, order_nonce, payload, state, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'admitted', ?5, ?5)",
                     params![
                         order_id.to_string(),
                         client_order_id.to_string(),
+                        i64::from(order_nonce),
                         serde_json::to_string(&durable)?,
                         to_i64(created_at)?
                     ],
@@ -469,11 +550,12 @@ impl ExecutionStore {
         )?;
         tx.execute(
             "INSERT INTO durable_orders
-             (order_id, client_order_id, payload, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'admitted', ?4, ?4)",
+             (order_id, client_order_id, order_nonce, payload, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'admitted', ?5, ?5)",
             params![
                 order_id.to_string(),
                 client_order_id.to_string(),
+                i64::from(order_nonce),
                 serde_json::to_string(&order.durable())?,
                 to_i64(created_at)?
             ],
@@ -617,6 +699,70 @@ impl ExecutionStore {
         Ok(changed == 1)
     }
 
+    /// Lists admitted / processing_claimed orders for deployment compatibility checks.
+    /// Unreadable payloads are returned only as their order ids in the second vector.
+    pub fn list_prebatch_orders(&self) -> Result<(Vec<DurableOrder>, Vec<uuid::Uuid>)> {
+        let connection = self.connection()?;
+        let mut stmt = connection.prepare(
+            "SELECT order_id, payload FROM durable_orders
+             WHERE state IN ('admitted', 'processing_claimed')",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut orders = Vec::with_capacity(rows.len());
+        let mut unreadable = Vec::new();
+        for (order_id, payload) in rows {
+            match serde_json::from_str::<DurableOrder>(&payload) {
+                Ok(order) => orders.push(order),
+                Err(_) => {
+                    if let Ok(id) = uuid::Uuid::parse_str(&order_id) {
+                        unreadable.push(id);
+                    }
+                }
+            }
+        }
+        Ok((orders, unreadable))
+    }
+
+    /// Fails the given admitted / processing_claimed order ids with `reason`.
+    pub fn fail_orders_by_ids(
+        &self,
+        order_ids: &[uuid::Uuid],
+        reason: &str,
+        now: u64,
+    ) -> Result<usize> {
+        if order_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut failed = 0usize;
+        for order_id in order_ids {
+            let changed = tx.execute(
+                "UPDATE durable_orders SET state = 'failed', terminal_error = ?2,
+                    claim_owner = NULL, claim_until = NULL, updated_at = ?3
+                 WHERE order_id = ?1 AND state IN ('admitted', 'processing_claimed')",
+                params![order_id.to_string(), reason, to_i64(now)?],
+            )?;
+            if changed == 1 {
+                append_event(
+                    &tx,
+                    *order_id,
+                    "failed",
+                    Some(reason),
+                    &format!("order:{order_id}:terminal"),
+                    now,
+                )?;
+                failed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(failed)
+    }
+
     /// Fails admitted / processing_claimed orders that are incompatible with the
     /// current deployment (wrong assets, unlisted pool, or unregistered user).
     pub fn fail_stale_prebatch_orders<F>(
@@ -628,63 +774,14 @@ impl ExecutionStore {
     where
         F: FnMut(&DurableOrder) -> bool,
     {
-        let mut connection = self.connection()?;
-        let rows = {
-            let mut stmt = connection.prepare(
-                "SELECT order_id, payload FROM durable_orders
-                 WHERE state IN ('admitted', 'processing_claimed')",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-
-        let mut stale_ids = Vec::new();
-        for (order_id, payload) in rows {
-            let order: DurableOrder = match serde_json::from_str(&payload) {
-                Ok(order) => order,
-                Err(_) => {
-                    // Unreadable payloads from a prior schema cannot be settled; drop them.
-                    if let Ok(id) = uuid::Uuid::parse_str(&order_id) {
-                        stale_ids.push(id);
-                    }
-                    continue;
-                }
-            };
-            if is_stale(&order) {
-                stale_ids.push(order.id);
-            }
-        }
-        if stale_ids.is_empty() {
-            return Ok(0);
-        }
-
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut failed = 0usize;
-        for order_id in stale_ids {
-            let changed = tx.execute(
-                "UPDATE durable_orders SET state = 'failed', terminal_error = ?2,
-                    claim_owner = NULL, claim_until = NULL, updated_at = ?3
-                 WHERE order_id = ?1 AND state IN ('admitted', 'processing_claimed')",
-                params![order_id.to_string(), reason, to_i64(now)?],
-            )?;
-            if changed == 1 {
-                append_event(
-                    &tx,
-                    order_id,
-                    "failed",
-                    Some(reason),
-                    &format!("order:{order_id}:terminal"),
-                    now,
-                )?;
-                failed += 1;
-            }
-        }
-        tx.commit()?;
-        Ok(failed)
+        let (orders, mut stale_ids) = self.list_prebatch_orders()?;
+        stale_ids.extend(
+            orders
+                .into_iter()
+                .filter(|order| is_stale(order))
+                .map(|order| order.id),
+        );
+        self.fail_orders_by_ids(&stale_ids, reason, now)
     }
 
     /// Commits all proposed accounting rows and the executable batch in one transaction.
@@ -1793,6 +1890,28 @@ fn upsert_pool_state(
     Ok(())
 }
 
+fn validate_nonce_lease(
+    tx: &Transaction<'_>,
+    client_order_id: uuid::Uuid,
+    user_id: AccountId,
+) -> Result<u32> {
+    let row = tx
+        .query_row(
+            "SELECT user_id, nonce FROM nonce_leases WHERE client_order_id = ?1",
+            [client_order_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((lease_user, lease_nonce)) = row else {
+        return Err(AdmitError::UnknownNonceLease.into());
+    };
+    let nonce = u32::try_from(lease_nonce).context("stored nonce lease overflowed u32")?;
+    if lease_user != user_id.to_hex() || nonce != nonce_from_client_order_id(client_order_id) {
+        return Err(AdmitError::NonceLeaseConflict.into());
+    }
+    Ok(nonce)
+}
+
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).context("value exceeds sqlite INTEGER")
 }
@@ -1821,9 +1940,13 @@ mod tests {
     use miden_client::auth::AuthSecretKey;
     use miden_core::Word;
 
+    fn test_user() -> AccountId {
+        AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap()
+    }
+
     fn test_order(client_order_id: uuid::Uuid) -> Order<crate::order::Created> {
         let key = AuthSecretKey::new_ecdsa_k256_keccak();
-        let user = AccountId::from_hex("0x5a17d92af11620613414ead24f1fce").unwrap();
+        let user = test_user();
         let asset_in = AccountId::from_hex("0x57a179f33b726c315fcfd5e0ff3309").unwrap();
         let asset_out = AccountId::from_hex("0x1e7e8af77fc5f2f1631d5c5ce35471").unwrap();
         let intent = crate::intent::Intent::new_swap(
@@ -1842,6 +1965,11 @@ mod tests {
             key.public_key(),
             intent,
         )
+    }
+
+    fn leased_order(store: &ExecutionStore, created_at: u64) -> Order<crate::order::Created> {
+        let lease = store.allocate_nonce_lease(test_user(), created_at).unwrap();
+        test_order(lease.client_order_id)
     }
 
     fn proposed(order: &Order<Processed>) -> ProposedSwap {
@@ -2076,11 +2204,25 @@ mod tests {
     }
 
     #[test]
+    fn nonce_leases_advance_and_tolerate_gaps() {
+        let store = ExecutionStore::open(":memory:").unwrap();
+        let first = store.allocate_nonce_lease(test_user(), 1).unwrap();
+        let second = store.allocate_nonce_lease(test_user(), 2).unwrap();
+        assert_eq!(first.nonce, 0);
+        assert_eq!(second.nonce, 1);
+        assert_eq!(nonce_from_client_order_id(first.client_order_id), 0);
+        assert_ne!(first.client_order_id, second.client_order_id);
+        // Abandoning `second` leaves a permanent gap; the next lease continues.
+        let third = store.allocate_nonce_lease(test_user(), 3).unwrap();
+        assert_eq!(third.nonce, 2);
+    }
+
+    #[test]
     fn admit_rejects_when_pre_execution_queue_is_full() {
         let store = ExecutionStore::open(":memory:").unwrap();
-        let first = test_order(uuid::Uuid::new_v4());
-        let second = test_order(uuid::Uuid::new_v4());
-        let third = test_order(uuid::Uuid::new_v4());
+        let first = leased_order(&store, 1);
+        let second = leased_order(&store, 2);
+        let third = leased_order(&store, 3);
         assert!(matches!(
             store
                 .admit_order_with_limit(first.client_order_id(), "c1", &first, 1, 2)
@@ -2117,7 +2259,7 @@ mod tests {
                 .fail_claimed_order(claimed[0].id, "processing", "stale_queue", 6)
                 .unwrap()
         );
-        let fourth = test_order(uuid::Uuid::new_v4());
+        let fourth = leased_order(&store, 7);
         assert!(matches!(
             store
                 .admit_order_with_limit(fourth.client_order_id(), "c4", &fourth, 7, 2)
@@ -2129,8 +2271,8 @@ mod tests {
     #[test]
     fn admission_is_idempotent_and_enqueues_one_wakeup() {
         let store = ExecutionStore::open(":memory:").unwrap();
-        let client_id = uuid::Uuid::new_v4();
-        let order = test_order(client_id);
+        let order = leased_order(&store, 1);
+        let client_id = order.client_order_id();
         assert_eq!(
             store
                 .admit_order(client_id, "commitment", &order, 1)
@@ -2155,14 +2297,27 @@ mod tests {
     }
 
     #[test]
+    fn admit_rejects_unknown_nonce_lease() {
+        let store = ExecutionStore::open(":memory:").unwrap();
+        let order = test_order(uuid::Uuid::new_v4());
+        let err = store
+            .admit_order(order.client_order_id(), "commitment", &order, 1)
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<AdmitError>(),
+            Some(&AdmitError::UnknownNonceLease)
+        );
+    }
+
+    #[test]
     fn crash_after_admit_recovers_from_reopened_database() {
         let path =
             std::env::temp_dir().join(format!("minizeke-admit-{}.sqlite3", uuid::Uuid::new_v4()));
-        let client_id = uuid::Uuid::new_v4();
         let expected_id;
         {
             let store = ExecutionStore::open(&path).unwrap();
-            let order = test_order(client_id);
+            let order = leased_order(&store, 1);
+            let client_id = order.client_order_id();
             expected_id = order.id;
             store
                 .admit_order(client_id, "commitment", &order, 1)
@@ -2182,8 +2337,8 @@ mod tests {
     #[test]
     fn stale_processing_claim_is_reclaimed() {
         let store = ExecutionStore::open(":memory:").unwrap();
-        let client_id = uuid::Uuid::new_v4();
-        let order = test_order(client_id);
+        let order = leased_order(&store, 1);
+        let client_id = order.client_order_id();
         store
             .admit_order(client_id, "commitment", &order, 1)
             .unwrap();
@@ -2208,8 +2363,8 @@ mod tests {
     #[test]
     fn pending_batch_recovers_and_gate_releases_only_after_terminal_commit() {
         let store = ExecutionStore::open(":memory:").unwrap();
-        let first_client = uuid::Uuid::new_v4();
-        let first = test_order(first_client);
+        let first = leased_order(&store, 1);
+        let first_client = first.client_order_id();
         store.admit_order(first_client, "first", &first, 1).unwrap();
         let claimed = store
             .claim_admitted_orders("processing", 2, 100, 10)
@@ -2229,8 +2384,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let second_client = uuid::Uuid::new_v4();
-        let second = test_order(second_client);
+        let second = leased_order(&store, 4);
+        let second_client = second.client_order_id();
         store
             .admit_order(second_client, "second", &second, 4)
             .unwrap();
@@ -2316,8 +2471,8 @@ mod tests {
         let (batch_a, processed_a) = create_claimed_test_batch(&store, "processing");
 
         // While A is still claimed, Processing may create a successor pending batch.
-        let second_client = uuid::Uuid::new_v4();
-        let second = test_order(second_client);
+        let second = leased_order(&store, 10);
+        let second_client = second.client_order_id();
         store
             .admit_order(second_client, "second", &second, 10)
             .unwrap();
@@ -2382,8 +2537,8 @@ mod tests {
         let store = ExecutionStore::open(":memory:").unwrap();
         let (batch_a, processed_a) = create_claimed_test_batch(&store, "processing");
 
-        let second_client = uuid::Uuid::new_v4();
-        let second = test_order(second_client);
+        let second = leased_order(&store, 10);
+        let second_client = second.client_order_id();
         store
             .admit_order(second_client, "second", &second, 10)
             .unwrap();
@@ -2440,8 +2595,8 @@ mod tests {
         store: &ExecutionStore,
         worker: &str,
     ) -> (uuid::Uuid, Order<Processed>) {
-        let client_id = uuid::Uuid::new_v4();
-        let order = test_order(client_id);
+        let order = leased_order(&store, 1);
+        let client_id = order.client_order_id();
         store
             .admit_order(client_id, "commitment", &order, 1)
             .unwrap();
@@ -2498,8 +2653,8 @@ mod tests {
             Some("submitted")
         );
         // Claimed (prove/submit): admit gate does not block — only pending does.
-        let next_client = uuid::Uuid::new_v4();
-        let next = test_order(next_client);
+        let next = leased_order(&store, 7);
+        let next_client = next.client_order_id();
         store.admit_order(next_client, "next", &next, 7).unwrap();
         assert_eq!(
             store
@@ -2511,8 +2666,8 @@ mod tests {
 
         assert!(store.begin_reconciliation(batch_id, "executor", 6).unwrap());
         // Reconciling: further admitted orders may still be claimed (overlap with finality).
-        let third_client = uuid::Uuid::new_v4();
-        let third = test_order(third_client);
+        let third = leased_order(&store, 9);
+        let third_client = third.client_order_id();
         store.admit_order(third_client, "third", &third, 9).unwrap();
         assert_eq!(
             store

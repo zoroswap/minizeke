@@ -80,11 +80,19 @@ impl FinalityObserver {
 
     pub async fn start(&mut self) -> Result<()> {
         let mut amm_rx = self.message_broker.subscribe_amm();
+        let mut registry_rx = self.pool_registry.subscribe();
         let mut durable_poll = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
                 _ = durable_poll.tick() => {
+                    self.attach_pending_pools().await;
                     self.poll_once().await;
+                }
+                changed = registry_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    self.attach_pending_pools().await;
                 }
                 event = amm_rx.recv() => {
                     match event {
@@ -148,9 +156,13 @@ impl FinalityObserver {
 
     async fn ensure_pool_attached(&mut self, pool_id: AccountId) -> Result<()> {
         if self.pool_clients.contains_key(&pool_id) {
+            self.pool_registry
+                .acknowledge(pool_id, crate::pool_registry::PoolWorker::Finality);
             return Ok(());
         }
-        if !self.pool_registry.ensure_from_deployment(pool_id)? {
+        if !self.pool_registry.contains(&pool_id)
+            && !self.pool_registry.ensure_from_deployment(pool_id)?
+        {
             return Err(anyhow!(
                 "submission references unlisted pool {}",
                 pool_id.to_hex()
@@ -158,12 +170,27 @@ impl FinalityObserver {
         }
         self.pool_clients
             .insert(pool_id, attach_finality_client(pool_id).await?);
+        self.pool_registry
+            .acknowledge(pool_id, crate::pool_registry::PoolWorker::Finality);
         info!(
             pool = %pool_id.to_hex(),
             observer = "finality",
-            "attached finality client for hot-loaded shard"
+            "attached finality client for published shard"
         );
         Ok(())
+    }
+
+    async fn attach_pending_pools(&mut self) {
+        for pool_id in self.pool_registry.pending_attach() {
+            if let Err(error) = self.ensure_pool_attached(pool_id).await {
+                warn!(
+                    pool = %pool_id.to_hex(),
+                    %error,
+                    observer = "finality",
+                    "failed to attach published pool shard"
+                );
+            }
+        }
     }
 
     /// Observe chain commitment for submitted txs.
