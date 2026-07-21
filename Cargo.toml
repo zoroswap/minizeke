@@ -6,7 +6,9 @@ edition = "2024"
 default-run = "minizeke"
 
 [dependencies]
-alloy-primitives = { version = "1.5.7", default-features = false, features = ["std"] }
+alloy-primitives = { version = "1.5.7", default-features = false, features = [
+  "std"
+] }
 anyhow = "1.0.102"
 axum = { version = "0.8.4", features = ["macros", "tokio", "ws"] }
 base64 = "0.22"
@@ -59,11 +61,28 @@ tower = { version = "0.5", features = ["util"] }
 incremental = true
 codegen-units = 256
 
+[profile.dev.package.miden-assembly]
+opt-level = 3
+debug-assertions = false
+
 [profile.dev.package.miden-client]
 opt-level = 3
 debug-assertions = false
 
 [profile.dev.package.miden-client-sqlite-store]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.miden-core]
+opt-level = 3
+debug-assertions = false
+
+# VM stack: dominate local execute_transaction cost in debug builds.
+[profile.dev.package.miden-processor]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.miden-protocol]
 opt-level = 3
 debug-assertions = false
 
@@ -74,27 +93,6 @@ debug-assertions = false
 [profile.dev.package.miden-tx]
 opt-level = 3
 debug-assertions = false
-
-# VM stack: dominate local execute_transaction cost in debug builds.
-[profile.dev.package.miden-processor]
-opt-level = 3
-debug-assertions = false
-
-[profile.dev.package.miden-core]
-opt-level = 3
-debug-assertions = false
-
-[profile.dev.package.miden-protocol]
-opt-level = 3
-debug-assertions = false
-
-[profile.dev.package.miden-assembly]
-opt-level = 3
-debug-assertions = false
-
-[[bin]]
-name = "demo_storage_map_key_limit"
-path = "demo/storage_map_key_limit/main.rs"
 
 [profile.release]
 lto = true
