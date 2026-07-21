@@ -53,6 +53,7 @@ uuid = { version = "1.0", features = ["serde", "v4"] }
 [dev-dependencies]
 miden-core-lib = "0.23"
 miden-processor = "0.23"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]
 incremental = true
@@ -90,6 +91,10 @@ debug-assertions = false
 [profile.dev.package.miden-assembly]
 opt-level = 3
 debug-assertions = false
+
+[[bin]]
+name = "demo_storage_map_key_limit"
+path = "demo/storage_map_key_limit/main.rs"
 
 [profile.release]
 lto = true

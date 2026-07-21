@@ -4,8 +4,8 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
-    middleware,
+    http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -253,6 +253,8 @@ pub fn create_router(state: AppState) -> Router {
             crate::ingress::enforce,
         ))
         .layer(cors_layer(&ingress))
+        // Outermost: stamp every response (handlers, ingress 4xx, CORS preflight).
+        .layer(middleware::from_fn(no_store_cache))
         .with_state(state)
 }
 
@@ -269,7 +271,18 @@ pub fn create_admin_router(state: AppState) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             ingress.request_timeout,
         ))
+        .layer(middleware::from_fn(no_store_cache))
         .with_state(state)
+}
+
+/// CDN/browser-safe default: never store API responses (auth, orders, mutations, errors).
+async fn no_store_cache(request: Request<Body>, next: Next) -> Response<Body> {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 fn cors_layer(config: &IngressConfig) -> CorsLayer {
@@ -755,9 +768,7 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
         })),
     });
 
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    (headers, Json(response))
+    Json(response)
 }
 
 /// Proxies mint requests to the separately-run faucet service. This boundary keeps the
@@ -836,9 +847,7 @@ async fn stats(State(state): State<AppState>) -> Response<Body> {
         "timestamp": timestamp,
     });
 
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    (headers, Json(response)).into_response()
+    Json(response).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1212,9 +1221,7 @@ async fn pool_info(State(state): State<AppState>) -> Response<Body> {
         }),
         "last_provision_error": capacity.as_ref().and_then(|s| s.last_provision_error.clone()),
     });
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    (headers, Json(response)).into_response()
+    Json(response).into_response()
 }
 
 async fn apply_automatic_fee_batch(
@@ -1640,24 +1647,100 @@ async fn order_new(
     }
 
     let serialized_order: SerializableOrder = order.into();
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("max-age=1, must-revalidate"),
-    );
-
-    Ok((
-        headers,
-        Json(ApiResponse {
-            data: serialized_order,
-        }),
-    )
-        .into_response())
+    Ok(Json(ApiResponse {
+        data: serialized_order,
+    })
+    .into_response())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NewOrderRequest, ensure_loopback_url, normalize_http_url};
+    use super::{
+        NewOrderRequest, ensure_loopback_url, no_store_cache, normalize_http_url,
+    };
+    use axum::{
+        Json, Router,
+        body::Body,
+        http::{HeaderValue, Method, Request, StatusCode, header},
+        middleware,
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    use tower::ServiceExt;
+
+    fn cache_control(response: &axum::http::Response<Body>) -> Option<&str> {
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    /// Mirrors the public router's outermost cache policy around representative stubs.
+    fn cache_policy_router() -> Router {
+        Router::new()
+            .route("/orders", get(|| async { StatusCode::UNAUTHORIZED }))
+            .route(
+                "/users/me/analytics",
+                get(|| async { StatusCode::UNAUTHORIZED }),
+            )
+            .route(
+                "/auth/login",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "data": {
+                            "access_token": "secret",
+                            "token_type": "Bearer",
+                            "expires_at": 1,
+                            "user_id": "0x1",
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/orders/new",
+                post(|| async {
+                    // Simulate the old handler mistakenly advertising freshness.
+                    let mut response = Json(serde_json::json!({
+                        "data": { "id": "order" }
+                    }))
+                    .into_response();
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("max-age=1, must-revalidate"),
+                    );
+                    response
+                }),
+            )
+            .route(
+                "/health",
+                get(|| async {
+                    let mut response = Json(serde_json::json!({"status": "healthy"})).into_response();
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("no-cache"),
+                    );
+                    response
+                }),
+            )
+            .layer(middleware::from_fn(no_store_cache))
+    }
+
+    async fn get_cache_control(path: &str, method: Method) -> (StatusCode, Option<String>) {
+        let app = cache_policy_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let header = cache_control(&response).map(ToOwned::to_owned);
+        (status, header)
+    }
 
     #[test]
     fn faucet_bind_address_becomes_an_http_url() {
@@ -1694,5 +1777,35 @@ mod tests {
             "pubkey": "legacy"
         });
         assert!(serde_json::from_value::<NewOrderRequest>(legacy).is_err());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_orders_and_user_routes_are_not_storeable() {
+        for path in ["/orders", "/users/me/analytics"] {
+            let (status, header) = get_cache_control(path, Method::GET).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(header.as_deref(), Some("no-store"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_login_success_is_not_storeable() {
+        let (status, header) = get_cache_control("/auth/login", Method::POST).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header.as_deref(), Some("no-store"));
+    }
+
+    #[tokio::test]
+    async fn orders_new_overwrites_max_age_with_no_store() {
+        let (status, header) = get_cache_control("/orders/new", Method::POST).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header.as_deref(), Some("no-store"));
+    }
+
+    #[tokio::test]
+    async fn weaker_handler_cache_control_is_overwritten() {
+        let (status, header) = get_cache_control("/health", Method::GET).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header.as_deref(), Some("no-store"));
     }
 }

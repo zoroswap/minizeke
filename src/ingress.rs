@@ -50,7 +50,7 @@ impl IngressConfig {
         Self {
             allowed_origins: csv(
                 "CORS_ALLOWED_ORIGINS",
-                "http://localhost:3000,http://localhost:5173",
+                "http://localhost:3000,http://localhost:5173,https://minizeke.b-cdn.net",
             )
             .into(),
             request_body_bytes: number("HTTP_MAX_BODY_BYTES", 1_048_576),

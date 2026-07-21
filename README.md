@@ -2,8 +2,8 @@
 
 The server applies the same exact-match origin allowlist to HTTP and WebSocket
 requests. Configure it with `CORS_ALLOWED_ORIGINS` (default:
-`http://localhost:3000,http://localhost:5173`). Requests without an `Origin`
-header remain valid for non-browser clients.
+`http://localhost:3000,http://localhost:5173,https://minizeke.b-cdn.net`).
+Requests without an `Origin` header remain valid for non-browser clients.
 
 Client IPs come from the TCP peer by default. `X-Forwarded-For` is accepted only
 when both `TRUST_PROXY_HEADERS=true` and
